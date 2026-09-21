@@ -730,3 +730,12 @@ config AXIADO_EVK
     default y
     depends on TCG && ARM
     select AXIADO_SOC
+
+config CLARION_QY8
+    bool
+    default y
+    depends on TCG && ARM
+    select ARM_GIC
+    select UNIMP
+    select CLARION_DU
+    select CLARION_HPBDMA
