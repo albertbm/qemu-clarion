@@ -35,6 +35,7 @@
 #include "hw/arm/boot.h"
 #include "hw/intc/arm_gic.h"
 #include "hw/display/clarion_du.h"
+#include "hw/misc/clarion_micom.h"
 #include "hw/dma/clarion_hpbdma.h"
 #include "hw/misc/unimp.h"
 #include "system/system.h"
@@ -62,6 +63,34 @@
 #define QY8_SRAM0_SIZE      (8 * MiB)
 #define QY8_SRAM1_BASE      0x18800000
 #define QY8_SRAM1_SIZE      (8 * MiB)
+
+/*
+ * Головне вікно DDR.
+ *
+ * reset-stage @PA 0x17e0 пише в DBCONF0 (DBSC3 + 0x24; ім'я взято з таблиці
+ * монітора самого eboot, флеш 0x24088) значення 0x0f030a02. OAL @0x88011ef0
+ * читає той самий регістр і за полем [28:24] обирає гілку: 0x0d -> 256 МБ,
+ * 0x0e -> 512 МБ, інакше -> 1024 МБ. Решта полів (rows 15, banks 8, cols 10,
+ * шина 32 біт) дає рівно 1 ГіБ, тож гілка 1024 узгоджена сама з собою.
+ *
+ * У контролера є лише один DBCONF0 і один DBRNK0 -> одна безперервна область.
+ * Три вікна, які OAL роздає як extension DRAM у гілці 1024 (0x44000000 +64 МБ,
+ * 0x58000000 +128 МБ, 0x60000000 +480 МБ), разом займають [0x44000000,
+ * 0x7e000000); єдине природно вирівняне вікно на 1 ГіБ, що їх вміщує,
+ * починається з 0x40000000. Самотест завантажувача (DIPSW=4, CTP_DramBank)
+ * незалежно перевіряє 0x40000000 і 0x58000000 як банки DRAM.
+ *
+ * ⚠️ Це ще не остаточна модель плати. qy8.ddr0 (PA 0x08000000) і qy8.ddr1
+ * (PA 0x10000000) лишаються тут окремою пам'яттю, хоча на залізі вони,
+ * найпевніше, alias цієї ж DDR: діра 0x48000000..0x58000000 розміром рівно
+ * 256 МБ виключена з обох гілок і точно дорівнює тим 256 МБ, які
+ * OEMAddressTable ядра відображає низько. Але цей зв'язок лише виведено, а
+ * не доведено, тож поки що гість бачить більше пам'яті, ніж є на платі.
+ */
+#define QY8_DDR_BASE        0x40000000
+#define QY8_DDR_SIZE        (1 * GiB)
+/* Перемикач для контрольного A/B: 0 — вікно не створюється взагалі. */
+#define QY8_DDR_ENABLED     1
 
 /* eboot виконується звідси (VA 0x97C00000 -> PA 0x17C00000) */
 #define QY8_EBOOT_PA        0x17C00000
@@ -96,6 +125,9 @@
  * чіпляємо саме до SCIF3, решту — до наступних за порядком.
  */
 #define QY8_SCIF_DEBUG      3
+
+/* SCIF4 — лінк до супутнього МК плати (docs/20, «M3b»), не консоль. */
+#define QY8_SCIF_MICOM      4
 
 /* serial@ffe4n000 interrupts = <GIC_SPI 70+n> (r8a7778.dtsi) */
 #define QY8_SCIF_SPI0       70
@@ -157,6 +189,7 @@ typedef struct Qy8Scif {
     CharFrontend chr;
     qemu_irq irq;
     DeviceState *dmac;          /* кому віддавати прийняті байти */
+    DeviceState *micom;         /* супутній МК на тому ж дроті, якщо є */
     hwaddr base;                /* фізична база — щоб назвати SCFRDR для DMA */
     uint16_t scsmr, scscr, scfcr;
     uint8_t fifo[QY8_SCIF_FIFO];
@@ -301,6 +334,16 @@ static void qy8_scif_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case SCIF_SCFTDR:
         ch = val & 0xff;
+        /*
+         * Якщо до цього SCIF під'єднано супутній МК, байт іде йому — це той
+         * самий дріт, а не додатковий канал. Відповіді micom лягають у FIFO
+         * приймача через qy8_micom_sink() нижче, тобто тим самим шляхом, що
+         * й байти від -serial: DMA і прапорець DR працюють як є.
+         */
+        if (s->micom) {
+            clarion_micom_rx_byte(s->micom, ch);
+            break;
+        }
         /* синхронний вивід: без нього ранні рядки буту губляться */
         qemu_chr_fe_write_all(&s->chr, &ch, 1);
         break;
@@ -358,6 +401,385 @@ static void qy8_scif_receive(void *opaque, const uint8_t *buf, int size)
     qy8_scif_rx_pump(s);
     timer_mod(s->idle, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                        QY8_SCIF_IDLE_NS);
+}
+
+/* --- HSCIF0 (високошвидкісний SCIF) @0xFFE48000 ----------------------- */
+
+/*
+ * Окремий блок, а не сьомий SCIF. У r8a7778.dtsi це власний вузол:
+ *
+ *     hscif0: serial@ffe48000 {
+ *             compatible = "renesas,hscif-r8a7778",
+ *                          "renesas,rcar-gen1-hscif", "renesas,hscif";
+ *             reg = <0xffe48000 96>;
+ *             interrupts = <GIC_SPI 118 IRQ_TYPE_LEVEL_HIGH>;
+ *     };
+ *
+ * тобто база поза вікном SCIF0..SCIF5 (0xFFE40000..0xFFE45FFF), розмір 0x60
+ * і власна лінія. Донедавна ці 96 байтів потрапляли у широкий qy8.periph
+ * (prio −1000), який на читання віддає нулі.
+ *
+ * Навіщо це знадобилося. При ввімкненому вікні extension DDR ядро піднімає
+ * ДРУГИЙ екземпляр serial_scif.dll із базою PA 0xFFE48000. Його
+ * HWSetCommState @VA 0xefa48158 починає з очікування кінця передачі:
+ *
+ *     0xefa48190  ldr  r0, [r5, #0x10]   ; VA SCFSR
+ *     0xefa48194  bl   READ_REGISTER_USHORT
+ *     0xefa48198  uxth r3, r0
+ *     0xefa4819c  tst  r3, #0x40         ; TEND
+ *     0xefa481a0  bne  0xefa481a8        ; вихід — далі SetBaudRate тощо
+ *     0xefa481a4  b    0xefa48190        ; інакше назад, без Sleep
+ *
+ * Це spin без виходу з планувальника, а потік має пріоритет 50. Нуль від
+ * qy8.periph означає TEND = 0 назавжди: 11 754 863 читання 0xFFE48010 за
+ * 30 с, менеджер пристроїв голодує, ActivateDeviceEx("Drivers\BuiltIn") не
+ * повертається (docs/04-journal.md, запис від 2026-09-23).
+ *
+ * Регістрова мапа — SCIx_HSCIF_REGTYPE з drivers/tty/serial/sh-sci.c:
+ * SCSMR 0x00/16, SCBRR 0x04/8, SCSCR 0x08/16, SCxTDR 0x0c/8, SCxSR 0x10/16,
+ * SCxRDR 0x14/8, SCFCR 0x18/16, SCFDR 0x1c/16, SCSPTR 0x20/16, SCLSR 0x24/16,
+ * SCDL 0x30/16, SCCKS 0x34/16, HSSRR 0x40/16, HSRTRGR 0x54/16, HSTTRGR 0x58/16;
+ * там же fifosize = 128 (у SCIF — 16).
+ *
+ * ⚠ TEND і TDFE тут НЕ сталі: вони рахуються з наповненості передавального
+ * FIFO. Після скидання FIFO порожній, тож TEND = 1 одразу — саме цього
+ * драйверові й бракувало. Але щойно гість покладе байти у SCFTDR, TEND
+ * зійде, доки модель їх не віддасть. Так зупинка на TEND лишається
+ * спостережуваною, а не замаскованою константою 0x40.
+ *
+ * Виміряно на живому буті (увесь бут — 55 звернень замість 11 754 864):
+ *
+ *     r 0x20                 ; SCSPTR — одноразовий зонд, як і раніше
+ *     r 0x10                 ; SCFSR: TEND = 1 -> spin виходить з ПЕРШОГО читання
+ *     w 0x08 = 0             ; SCSCR: вимкнути TE/RE
+ *     w 0x18 = 0x6           ; SCFCR: RFRST|TFRST
+ *     r/w 0x10 = 0           ; погасити прапорці
+ *     r/w 0x24 = 0           ; SCLSR: погасити ORER
+ *     w 0x40 = 0x800f        ; HSSRR = SRE | SRCYC — суто HSCIF-ний регістр
+ *     w 0x34 = 0             ; SCCKS
+ *     w 0x30 = 0x30          ; SCDL — подільник
+ *     w 0x50 = 0x64          ; поза мапою sh-sci.c (див. нижче)
+ *     w 0x54 = 0x40          ; HSRTRGR = 64 — рівно sci_port rx_trigger HSCIF
+ *     w 0x58 = 0             ; HSTTRGR = 0 — рівень передавача
+ *     w 0x08 = 0x2e, 0x3e    ; TE|RE|REIE|CKE1; ні RIE, ні TIE
+ *     w 0x0c ×6              ; 10 02 23 10 03 30 — один кадр у лінію
+ *
+ * Звідси три речі, які модель НЕ вгадує, а бере з цього заміру:
+ *  - HSSRR @0x40 із SRE — підтверджує, що це справді HSCIF, а не сьомий SCIF;
+ *  - HSTTRGR = 0, тобто TDFE = «FIFO передавача порожній» — саме так його й
+ *    рахує qy8_hscif_tdfe();
+ *  - гість НЕ вмикає ні RIE, ні TIE, тож відсутність переривання передавача
+ *    тут нічого не ламає.
+ *
+ * ⚠ offset 0x50 (значення 0x64 = 100) у мапі sh-sci.c немає; гість пише його
+ * один раз і ніколи не читає. Тому він свідомо лишається НЕзмодельованим і
+ * падає в LOG_UNIMP під іменем qy8.hscif0 — вигадувати йому семантику не
+ * було б на чому. Якщо колись знадобиться — це єдине місце, куди дивитися.
+ *
+ * Чого тут НЕМАЄ і чому:
+ *  - каналу DMA: HPB-DMAC обслуговує SCIF4 (лінк до micom); жодного доказу,
+ *    що цей порт озброює DMA, немає, а вигадувати slave-id не можна;
+ *  - переривання передавача: як і в моделі SCIF, лінію піднімає тільки
+ *    приймач і тільки при RIE (див. застереження про шторм вище);
+ *  - будь-яких ненульових reset-значень: усі регістри-сховища стартують з 0,
+ *    а все, що поза мапою, іде в LOG_UNIMP під власним іменем — щоб
+ *    наступний блокер було видно поіменно, а не серед шуму qy8.periph.
+ */
+
+#define QY8_HSCIF_BASE      0xFFE48000
+#define QY8_HSCIF_SIZE      0x60        /* reg = <0xffe48000 96> */
+#define QY8_HSCIF_SPI       118         /* interrupts = <GIC_SPI 118> */
+
+#define HSCIF_SCSMR     0x00
+#define HSCIF_SCBRR     0x04
+#define HSCIF_SCSCR     0x08
+#define HSCIF_SCFTDR    0x0C
+#define HSCIF_SCFSR     0x10
+#define HSCIF_SCFRDR    0x14
+#define HSCIF_SCFCR     0x18
+#define HSCIF_SCFDR     0x1C
+#define HSCIF_SCSPTR    0x20
+#define HSCIF_SCLSR     0x24
+#define HSCIF_SCDL      0x30
+#define HSCIF_SCCKS     0x34
+#define HSCIF_HSSRR     0x40
+#define HSCIF_HSRTRGR   0x54
+#define HSCIF_HSTTRGR   0x58
+
+/* SCFCR: скидання FIFO передавача/приймача (та сама мапа, що в SCIF) */
+#define SCFCR_TFRST     0x0004
+
+#define QY8_HSCIF_FIFO  128             /* sh-sci.c: fifosize = 128 */
+
+/*
+ * Скільки віртуального часу «летить» один байт. Швидкість вивести нізвідки:
+ * гість програмує подільник уже після цього очікування, а SCBRR при
+ * такій самій послідовності на SCIF отримує 0. Тому, як і з
+ * QY8_SCIF_IDLE_NS, береться стала: важлива не її точність, а те, що
+ * передавач має ненульовий час зайнятості й TEND випливає зі стану.
+ */
+#define QY8_HSCIF_TX_NS     10000
+
+typedef struct Qy8Hscif {
+    MemoryRegion mr;
+    CharFrontend chr;
+    qemu_irq irq;
+    QEMUTimer *tx;              /* злив передавального FIFO */
+    QEMUTimer *idle;            /* пауза в лінії -> DR, як у SCIF */
+    uint16_t scsmr, scscr, scfcr, scsptr, scdl, sccks, hssrr;
+    uint16_t hsrtrgr, hsttrgr, sclsr;
+    uint8_t scbrr;
+    uint8_t rx[QY8_HSCIF_FIFO];
+    unsigned rx_len;
+    unsigned tx_len;            /* байти в передавальному FIFO */
+    bool dr;
+} Qy8Hscif;
+
+/* RTRG[7:6] у SCFCR; для HSCIF рівень може приходити і з HSRTRGR */
+static unsigned qy8_hscif_rtrg(Qy8Hscif *h)
+{
+    static const unsigned lvl[4] = { 1, 4, 8, 14 };
+
+    /* sh-sci.c бере рівень приймача з HSRTRGR, коли той запрограмований */
+    if (h->hsrtrgr) {
+        return MIN(h->hsrtrgr, QY8_HSCIF_FIFO);
+    }
+    return lvl[(h->scfcr >> 6) & 3];
+}
+
+static bool qy8_hscif_rdf(Qy8Hscif *h)
+{
+    return h->rx_len >= qy8_hscif_rtrg(h);
+}
+
+/* TEND — передавач порожній: ні у FIFO, ні «в дроті» нічого немає */
+static bool qy8_hscif_tend(Qy8Hscif *h)
+{
+    return h->tx_len == 0;
+}
+
+/*
+ * TDFE — «у передавальному FIFO даних не більше за рівень запуску».
+ * Рівень беремо з HSTTRGR; після скидання він 0, тобто TDFE = FIFO порожній.
+ * Це строгіше за залізо (там рівень програмований), зате не вимагає
+ * вигаданого reset-значення й ніколи не дозволить запис у повний FIFO.
+ */
+static bool qy8_hscif_tdfe(Qy8Hscif *h)
+{
+    return h->tx_len <= MIN(h->hsttrgr, QY8_HSCIF_FIFO - 1);
+}
+
+static void qy8_hscif_update_irq(Qy8Hscif *h)
+{
+    /* Тільки приймач і тільки при RIE — див. застереження в моделі SCIF. */
+    qemu_set_irq(h->irq, (qy8_hscif_rdf(h) || h->dr) && (h->scscr & SCSCR_RIE));
+}
+
+static void qy8_hscif_tx_expire(void *opaque)
+{
+    Qy8Hscif *h = opaque;
+
+    if (h->tx_len) {
+        h->tx_len--;
+    }
+    if (h->tx_len) {
+        timer_mod(h->tx, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                         QY8_HSCIF_TX_NS);
+    }
+}
+
+static void qy8_hscif_idle_expire(void *opaque)
+{
+    Qy8Hscif *h = opaque;
+
+    if (h->rx_len) {
+        h->dr = true;
+        qy8_hscif_update_irq(h);
+    }
+}
+
+static uint64_t qy8_hscif_read(void *opaque, hwaddr addr, unsigned size)
+{
+    Qy8Hscif *h = opaque;
+
+    switch (addr) {
+    case HSCIF_SCSMR:
+        return h->scsmr;
+    case HSCIF_SCBRR:
+        return h->scbrr;
+    case HSCIF_SCSCR:
+        return h->scscr;
+    case HSCIF_SCFSR:
+        return (qy8_hscif_tdfe(h) ? SCFSR_TDFE : 0) |
+               (qy8_hscif_tend(h) ? SCFSR_TEND : 0) |
+               (qy8_hscif_rdf(h) ? SCFSR_RDF : 0) |
+               (h->dr ? SCFSR_DR : 0);
+    case HSCIF_SCFRDR: {
+        uint8_t v = h->rx_len ? h->rx[0] : 0;
+
+        if (h->rx_len) {
+            memmove(h->rx, h->rx + 1, --h->rx_len);
+        }
+        if (!h->rx_len) {
+            h->dr = false;
+        }
+        qy8_hscif_update_irq(h);
+        return v;
+    }
+    case HSCIF_SCFCR:
+        return h->scfcr;
+    case HSCIF_SCFDR:
+        /* старший байт — заповненість FIFO передавача, молодший — приймача */
+        return ((h->tx_len & 0xff) << 8) | (h->rx_len & 0xff);
+    case HSCIF_SCSPTR:
+        return h->scsptr;
+    case HSCIF_SCLSR:
+        return h->sclsr;
+    case HSCIF_SCDL:
+        return h->scdl;
+    case HSCIF_SCCKS:
+        return h->sccks;
+    case HSCIF_HSSRR:
+        return h->hssrr;
+    case HSCIF_HSRTRGR:
+        return h->hsrtrgr;
+    case HSCIF_HSTTRGR:
+        return h->hsttrgr;
+    default:
+        qemu_log_mask(LOG_UNIMP, "qy8.hscif0: читання поза мапою %#" HWADDR_PRIx
+                      " (%u Б)\n", addr, size);
+        return 0;
+    }
+}
+
+static void qy8_hscif_write(void *opaque, hwaddr addr, uint64_t val,
+                            unsigned size)
+{
+    Qy8Hscif *h = opaque;
+    uint8_t ch;
+
+    switch (addr) {
+    case HSCIF_SCSMR:
+        h->scsmr = val;
+        break;
+    case HSCIF_SCBRR:
+        h->scbrr = val;
+        break;
+    case HSCIF_SCSCR:
+        h->scscr = val;
+        qy8_hscif_update_irq(h);
+        break;
+    case HSCIF_SCFTDR:
+        ch = val & 0xff;
+        if (h->tx_len < QY8_HSCIF_FIFO) {
+            if (!h->tx_len) {
+                timer_mod(h->tx, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                                 QY8_HSCIF_TX_NS);
+            }
+            h->tx_len++;
+        }
+        /*
+         * Вивід синхронний — як у моделі SCIF; у FIFO лишається тільки
+         * лічильник зайнятості, з якого й випливають TEND/TDFE.
+         */
+        qemu_chr_fe_write_all(&h->chr, &ch, 1);
+        break;
+    case HSCIF_SCFCR:
+        h->scfcr = val;
+        if (val & SCFCR_RFRST) {
+            h->rx_len = 0;
+            h->dr = false;
+        }
+        if (val & SCFCR_TFRST) {
+            h->tx_len = 0;
+            timer_del(h->tx);
+        }
+        qy8_hscif_update_irq(h);
+        break;
+    case HSCIF_SCFSR:
+        /* прапорці гасяться записом нуля у відповідний біт */
+        if (!(val & SCFSR_DR)) {
+            h->dr = false;
+        }
+        qy8_hscif_update_irq(h);
+        break;
+    case HSCIF_SCLSR:
+        h->sclsr &= val;        /* ORER гаситься записом нуля */
+        break;
+    case HSCIF_SCSPTR:
+        h->scsptr = val;
+        break;
+    case HSCIF_SCDL:
+        h->scdl = val;
+        break;
+    case HSCIF_SCCKS:
+        h->sccks = val;
+        break;
+    case HSCIF_HSSRR:
+        h->hssrr = val;
+        break;
+    case HSCIF_HSRTRGR:
+        h->hsrtrgr = val;
+        qy8_hscif_update_irq(h);
+        break;
+    case HSCIF_HSTTRGR:
+        h->hsttrgr = val;
+        break;
+    default:
+        qemu_log_mask(LOG_UNIMP, "qy8.hscif0: запис поза мапою %#" HWADDR_PRIx
+                      " = %#" PRIx64 " (%u Б)\n", addr, val, size);
+        break;
+    }
+}
+
+static const MemoryRegionOps qy8_hscif_ops = {
+    .read = qy8_hscif_read,
+    .write = qy8_hscif_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 4,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
+static int qy8_hscif_can_receive(void *opaque)
+{
+    Qy8Hscif *h = opaque;
+    return QY8_HSCIF_FIFO - h->rx_len;
+}
+
+static void qy8_hscif_receive(void *opaque, const uint8_t *buf, int size)
+{
+    Qy8Hscif *h = opaque;
+    int i;
+
+    for (i = 0; i < size && h->rx_len < QY8_HSCIF_FIFO; i++) {
+        h->rx[h->rx_len++] = buf[i];
+    }
+    h->dr = false;
+    qy8_hscif_update_irq(h);
+    timer_mod(h->idle, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                       QY8_SCIF_IDLE_NS);
+}
+
+/*
+ * Куди micom кладе свої байти. Повертаємо, скільки прийнято: FIFO приймача
+ * на 16 байтів, а кадр «набір команд» — 68 байтів разом із обгорткою, тож
+ * решту micom досилає, коли DMA звільнить місце.
+ */
+static int qy8_micom_sink(void *opaque, const uint8_t *buf, int len)
+{
+    Qy8Scif *s = opaque;
+    int room = qy8_scif_can_receive(s);
+
+    if (room <= 0 || len <= 0) {
+        return 0;
+    }
+    if (len > room) {
+        len = room;
+    }
+    qy8_scif_receive(s, buf, len);
+    return len;
 }
 
 /* --- TMU (таймери Renesas, регістрова мапа як у SH TMU) --------------- */
@@ -806,6 +1228,67 @@ static const uint32_t qy8_gpio_in_level[QY8_GPIO_BANKS] = {
     [1] = 0x00000000,
 };
 
+/* --- DBSC3 (DDR3 SDRAM Controller) @0xFE800000 ----------------------- */
+
+/*
+ * Контролер DDR3. Перша стадія буту (reset-stage, PC 0x17e0) записує
+ * конфігурацію DDR-фізичного рівня; одне зі слів — 0x0f030a02 у регістр
+ * DBPDCNT3 (offset 0x24). Пізніше OAL (PC 0x88011f04) перечитує ту саму
+ * адресу й очікує збережене значення. Без цього регістра запис ішов у
+ * широкий qy8.periph (-1000), який його відкидав.
+ *
+ * Решта регістрів поки не потрібна — логуємо через LOG_UNIMP.
+ */
+#define QY8_DBSC3_BASE      0xFE800000
+#define QY8_DBSC3_SIZE      0x10000
+
+#define DBSC3_DBPDCNT3      0x24        /* PHY control register 3 */
+
+typedef struct Qy8Dbsc3 {
+    MemoryRegion mr;
+    uint32_t dbpdcnt3;          /* offset 0x24 */
+} Qy8Dbsc3;
+
+static uint64_t qy8_dbsc3_read(void *opaque, hwaddr addr, unsigned size)
+{
+    Qy8Dbsc3 *d = opaque;
+
+    switch (addr) {
+    case DBSC3_DBPDCNT3:
+        return d->dbpdcnt3;
+    default:
+        qemu_log_mask(LOG_UNIMP, "qy8.dbsc3: read  offset %#" HWADDR_PRIx
+                      " (%u B)\n", addr, size);
+        return 0;
+    }
+}
+
+static void qy8_dbsc3_write(void *opaque, hwaddr addr, uint64_t val,
+                             unsigned size)
+{
+    Qy8Dbsc3 *d = opaque;
+
+    switch (addr) {
+    case DBSC3_DBPDCNT3:
+        d->dbpdcnt3 = val;
+        break;
+    default:
+        qemu_log_mask(LOG_UNIMP, "qy8.dbsc3: write offset %#" HWADDR_PRIx
+                      " = %#" PRIx64 "\n", addr, val);
+        break;
+    }
+}
+
+static const MemoryRegionOps qy8_dbsc3_ops = {
+    .read = qy8_dbsc3_read,
+    .write = qy8_dbsc3_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl.min_access_size = 4,
+    .impl.max_access_size = 4,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
 /* --- машина ----------------------------------------------------------- */
 
 #define TYPE_QY8_MACHINE MACHINE_TYPE_NAME("clarion-qy8")
@@ -819,16 +1302,20 @@ struct Qy8MachineState {
     DeviceState *du;
     DeviceState *dmac;
     Qy8Scif scif[QY8_NUM_SCIF];
+    Qy8Hscif hscif0;
+    DeviceState *micom;
     Qy8Tmu tmu;
     Qy8Gpio gpio[QY8_GPIO_BANKS];
     Qy8Bctl bctl;
     Qy8UsbPhy usbphy;
+    Qy8Dbsc3 dbsc3;
     MemoryRegion voidmr;
 
     uint8_t dipsw;              /* режим буту, властивість машини */
+    bool micom_on;              /* вбудований супутній МК на SCIF4 */
 
     MemoryRegion flash;
-    MemoryRegion ddr0, ddr1;
+    MemoryRegion ddr, ddr0, ddr1;
     MemoryRegion sram0, sram1;
     MemoryRegion ddr1_shadow;
 };
@@ -866,6 +1353,9 @@ static void qy8_init(MachineState *machine)
                            QY8_FLASH_SIZE, &error_fatal);
     memory_region_add_subregion(sysmem, QY8_FLASH_BASE, &s->flash);
 
+#if QY8_DDR_ENABLED
+    qy8_add_ram(sysmem, &s->ddr, "qy8.ddr", QY8_DDR_BASE, QY8_DDR_SIZE);
+#endif
     qy8_add_ram(sysmem, &s->ddr0, "qy8.ddr0", QY8_DDR0_BASE, QY8_DDR0_SIZE);
     qy8_add_ram(sysmem, &s->ddr1, "qy8.ddr1", QY8_DDR1_BASE, QY8_DDR1_SIZE);
     qy8_add_ram(sysmem, &s->sram0, "qy8.sram0", QY8_SRAM0_BASE, QY8_SRAM0_SIZE);
@@ -956,6 +1446,20 @@ static void qy8_init(MachineState *machine)
                                             CLARION_HPBDMA_IRQ_BASE_SPI + i));
     }
 
+    /*
+     * --- Супутній МК (micom) на SCIF4 ---
+     *
+     * На платі це окрема мікросхема, тож типово вона є. Без неї ядро WinCE
+     * не проходить ініціалізацію лінку й бут не доходить до GWES. Вимкнути —
+     * `-M clarion-qy8,micom=off`: тоді SCIF4 поводиться як звичайний порт і
+     * до нього можна причепити зовнішній відповідач через -serial
+     * (tools/qy8_micom.py), щоб гратися з нерозібраними командами.
+     */
+    if (s->micom_on) {
+        s->micom = qdev_new(TYPE_CLARION_MICOM);
+        qdev_realize_and_unref(s->micom, NULL, &error_fatal);
+    }
+
     /* --- SCIF --- */
     for (i = 0; i < QY8_NUM_SCIF; i++) {
         Qy8Scif *sc = &s->scif[i];
@@ -966,6 +1470,10 @@ static void qy8_init(MachineState *machine)
         sc->idle = timer_new_ns(QEMU_CLOCK_VIRTUAL, qy8_scif_idle_expire, sc);
         sc->dmac = s->dmac;
         sc->irq = qdev_get_gpio_in(s->gic, QY8_SCIF_SPI0 + i);
+        if (i == QY8_SCIF_MICOM && s->micom) {
+            sc->micom = s->micom;
+            clarion_micom_set_sink(s->micom, qy8_micom_sink, sc);
+        }
         memory_region_init_io(&sc->mr, NULL, &qy8_scif_ops, sc, name, 0x100);
         memory_region_add_subregion(sysmem,
                                     QY8_SCIF_BASE + i * QY8_SCIF_STRIDE,
@@ -978,6 +1486,31 @@ static void qy8_init(MachineState *machine)
                                      sc, NULL, true);
         }
         g_free(name);
+    }
+
+    /* --- HSCIF0 --- */
+    /*
+     * Вузьке вікно 0x60 з пріоритетом 1: перекриває широкий qy8.periph
+     * (-1000), але нічого іншого не зачіпає — між SCIF5 (0xFFE45FFF) і
+     * HSCIF0 лежать три незайняті кілобайти. Сьомий -serial (індекс 6,
+     * після шести SCIF) чіпляється сюди, якщо його задали; без нього порт
+     * просто не має співрозмовника, як непідключений роз'єм на платі.
+     */
+    s->hscif0.tx = timer_new_ns(QEMU_CLOCK_VIRTUAL, qy8_hscif_tx_expire,
+                                &s->hscif0);
+    s->hscif0.idle = timer_new_ns(QEMU_CLOCK_VIRTUAL, qy8_hscif_idle_expire,
+                                  &s->hscif0);
+    s->hscif0.irq = qdev_get_gpio_in(s->gic, QY8_HSCIF_SPI);
+    memory_region_init_io(&s->hscif0.mr, NULL, &qy8_hscif_ops, &s->hscif0,
+                          "qy8.hscif0", QY8_HSCIF_SIZE);
+    memory_region_add_subregion_overlap(sysmem, QY8_HSCIF_BASE,
+                                        &s->hscif0.mr, 1);
+    if (serial_hd(QY8_NUM_SCIF)) {
+        qemu_chr_fe_init(&s->hscif0.chr, serial_hd(QY8_NUM_SCIF),
+                         &error_abort);
+        qemu_chr_fe_set_handlers(&s->hscif0.chr, qy8_hscif_can_receive,
+                                 qy8_hscif_receive, NULL, NULL,
+                                 &s->hscif0, NULL, true);
     }
 
     /* --- TMU --- */
@@ -1034,13 +1567,28 @@ static void qy8_init(MachineState *machine)
     /* --- решта периферії: поки лише лог доступів (-d unimp) --- */
     create_unimplemented_device("qy8.cs1",   QY8_CS1_BASE, QY8_CS1_SIZE);
     create_unimplemented_device("qy8.l2c",   QY8_L2C_BASE, 0x1000);
-    create_unimplemented_device("qy8.dbsc3", 0xFE800000, 0x10000);  /* DDR */
+    /* --- DBSC3: DDR3 controller, пріоритет вищий за qy8.periph (-1000) --- */
+    s->dbsc3.dbpdcnt3 = 0;      /* reset: offset 0x24 читається нулем */
+    memory_region_init_io(&s->dbsc3.mr, NULL, &qy8_dbsc3_ops, &s->dbsc3,
+                          "qy8.dbsc3", QY8_DBSC3_SIZE);
+    memory_region_add_subregion_overlap(sysmem, QY8_DBSC3_BASE,
+                                        &s->dbsc3.mr, 1);
     create_unimplemented_device("qy8.intc2", 0xFE780000, 0x1000);
     create_unimplemented_device("qy8.cpg",   0xFFC80000, 0x1000);
     create_unimplemented_device("qy8.pfc",   0xFFFC0000, 0x1000);
     create_unimplemented_device("qy8.rst",   0xFFCC0000, 0x1000);
     /* широкий перехоплювач: усе інше згори 0xF0000000 логується */
     create_unimplemented_device("qy8.periph", 0xF0000000, 0x10000000);
+}
+
+static bool qy8_micom_get(Object *obj, Error **errp)
+{
+    return QY8_MACHINE(obj)->micom_on;
+}
+
+static void qy8_micom_set(Object *obj, bool value, Error **errp)
+{
+    QY8_MACHINE(obj)->micom_on = value;
 }
 
 static void qy8_machine_instance_init(Object *obj)
@@ -1057,6 +1605,16 @@ static void qy8_machine_instance_init(Object *obj)
                                   OBJ_PROP_FLAG_READWRITE);
     object_property_set_description(obj, "dipsw",
         "режим буту з DIPSW контролера плати, 0..7 (5 = NORM(RES) з логом)");
+
+    /*
+     * Супутній МК плати. Типово ввімкнений: на залізі він розпаяний, і без
+     * відповіді від нього ядро не проходить ініціалізацію лінку.
+     */
+    s->micom_on = true;
+    object_property_add_bool(obj, "micom", qy8_micom_get, qy8_micom_set);
+    object_property_set_description(obj, "micom",
+        "вбудований супутній МК на SCIF4 (off — щоб причепити свій "
+        "відповідач через -serial)");
 }
 
 static void qy8_machine_class_init(ObjectClass *oc, const void *data)

@@ -264,3 +264,6 @@ config K230_DECOMP_GZIP
     bool
 
 source macio/Kconfig
+
+config CLARION_MICOM
+    bool

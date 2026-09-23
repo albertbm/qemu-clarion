@@ -82,7 +82,10 @@
 
 /* DSTPR / DSTSR */
 #define DSTPR_DMSTP     (1u << 0)
+#define DSTSR_NDP1      (1u << 6)
+#define DSTSR_NDP0      (1u << 5)
 #define DSTSR_DQSTS     (1u << 2)
+#define DSTSR_DRSTS     (1u << 1)
 #define DSTSR_DMSTS     (1u << 0)
 
 /* DCR (include/linux/platform_data/dma-rcar-hpbdma.h) */
@@ -114,6 +117,7 @@ typedef struct ClarionHpbChan {
     uint32_t dptr, dcr, dstsr;
     uint32_t left;                      /* скільки одиниць лишилося */
     unsigned plane;                     /* яка площина зараз */
+    bool next_requested;                /* DNXT: наступна площина поставлена */
     bool active;
 } ClarionHpbChan;
 
@@ -143,6 +147,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(ClarionHpbDmaState, CLARION_HPBDMA)
  * рівно IRQ 123 та 126. 126 належить SDHI за таблицею вище, отже 123 —
  * це канали 4/6, тобто найнижча з п'яти ліній.
  *
+ * Канали 16/17 — HSCIF0 (база 0xFFE48000). Лінію для них теж виведено, а не
+ * вгадано, і саме з поведінки гостя:
+ *   - у масці DINTMR0 він пропускає рівно канали 4, 16, 17;
+ *   - із п'яти ліній DMAC вмикає в GIC рівно IRQ 123, 125, 126;
+ *   - 123 за міркуванням вище належить каналам 4/6 (micom), 126 — 21/22 (SDHI);
+ *   - отже 125 (лінія 2) лишається єдиною незайнятою, а 16/17 — єдиними
+ *     каналами без лінії.
+ * Доказ від протилежного знято дослідом: доки 17 віддавав лінію 0, обробник
+ * SPI 91 не знаходив «свого» каналу, не писав DINTCR0, і рівень лишався
+ * піднятим назавжди — шторм ~4100 IRQ/с, усе інше голодувало (docs/04-journal).
+ *
  * Для решти каналів джерела немає; віддаємо лінію 0 і кажемо про це в лог.
  */
 static int hpb_chan_irq_line(ClarionHpbDmaState *s, int ch)
@@ -155,6 +170,9 @@ static int hpb_chan_irq_line(ClarionHpbDmaState *s, int ch)
     }
     if (ch >= 28 && ch <= 36) {
         return 4;                       /* 0x7f = IRQ 127 */
+    }
+    if (ch == 16 || ch == 17) {
+        return 2;                       /* IRQ 125 — HSCIF0, див. вище */
     }
     if (ch != 4 && ch != 6) {
         qemu_log_mask(LOG_UNIMP,
@@ -240,6 +258,21 @@ static void hpb_chan_load_plane(ClarionHpbDmaState *s, int ch, unsigned plane)
     c->dtcsr = c->left;
 }
 
+static uint32_t hpb_chan_status(const ClarionHpbChan *c)
+{
+    uint32_t status = c->dstsr & DSTSR_DQSTS;
+    unsigned next_plane = (c->dcr & DCR_DIP) && c->active ? c->plane ^ 1 : 0;
+
+    status |= next_plane ? DSTSR_NDP1 : DSTSR_NDP0;
+    if (c->next_requested) {
+        status |= DSTSR_DRSTS;
+    }
+    if (c->active) {
+        status |= DSTSR_DMSTS;
+    }
+    return status;
+}
+
 /* ТИМЧАСОВО: журнал роботи каналів під QY8_DMA_LOG (знести після досліду) */
 static bool hpb_dbg(void)
 {
@@ -255,6 +288,10 @@ static void hpb_chan_start(ClarionHpbDmaState *s, int ch, bool next)
     ClarionHpbChan *c = &s->ch[ch];
     unsigned plane = 0;
 
+    /* DMEN активує idle channel; повторний DMEN не перезапускає transfer. */
+    if (c->active) {
+        return;
+    }
     if ((c->dcr & DCR_DIP) && next) {
         plane = c->plane ^ 1;
     }
@@ -264,7 +301,6 @@ static void hpb_chan_start(ClarionHpbDmaState *s, int ch, bool next)
         fprintf(stderr, "[dma] start ch%d plane%u dcr=%08x dar=%08x tcr=%u\n",
                 ch, plane, c->dcr, c->ddasr, c->left);
     }
-    c->dstsr |= DSTSR_DMSTS;
 
     if ((c->dcr & DCR_SMDL) && !(c->dcr & DCR_DMDL)) {
         /*
@@ -301,7 +337,8 @@ bool clarion_hpbdma_feed(DeviceState *dev, hwaddr periph_addr, uint8_t val)
     for (ch = 0; ch < CLARION_HPBDMA_NUM_CHAN; ch++) {
         ClarionHpbChan *c = &s->ch[ch];
 
-        if (!c->active || !(c->dcr & DCR_SMDL) || c->dsasr != periph_addr) {
+        if (!c->active || !c->left || !(c->dcr & DCR_SMDL) ||
+            c->dsasr != periph_addr) {
             continue;
         }
         address_space_write(&address_space_memory, c->ddasr,
@@ -317,12 +354,18 @@ bool clarion_hpbdma_feed(DeviceState *dev, hwaddr periph_addr, uint8_t val)
             }
             hpb_chan_complete(s, ch);
             if (c->dcr & DCR_CT) {
-                /* Безперервний режим: одразу наступна площина. */
-                hpb_chan_load_plane(s, ch,
-                                    (c->dcr & DCR_DIP) ? c->plane ^ 1 : 0);
+                /*
+                 * CT не означає безумовне автоперемикання. Наступний set
+                 * запускається лише якщо software уже подало DNXT; інакше
+                 * канал лишається active у command-wait state.
+                 */
+                if (c->next_requested) {
+                    c->next_requested = false;
+                    hpb_chan_load_plane(s, ch,
+                                        (c->dcr & DCR_DIP) ? c->plane ^ 1 : 0);
+                }
             } else {
                 c->active = false;
-                c->dstsr &= ~DSTSR_DMSTS;
             }
         }
         return true;
@@ -344,8 +387,10 @@ static uint64_t hpb_chan_read(void *opaque, hwaddr addr, unsigned size)
 
     if (hpb_dbg() && ch == 4 &&
         (off == HPB_DDASR || off == HPB_DTCSR || off == HPB_DSTSR)) {
-        fprintf(stderr, "[dma] ЧИТАННЯ ch4 +%02x (ddasr=%08x left=%u)\n",
-                (unsigned)off, s->ch[ch].ddasr, s->ch[ch].left);
+        fprintf(stderr, "[dma] ЧИТАННЯ ch4 +%02x "
+                "(plane%u dstsr=%08x ddasr=%08x left=%u)\n",
+                (unsigned)off, s->ch[ch].plane, hpb_chan_status(&s->ch[ch]),
+                s->ch[ch].ddasr, s->ch[ch].left);
     }
     switch (off) {
     case HPB_DSAR0: return s->ch[ch].sar[0];
@@ -361,7 +406,7 @@ static uint64_t hpb_chan_read(void *opaque, hwaddr addr, unsigned size)
     case HPB_DCR:   return s->ch[ch].dcr;
     case HPB_DCMDR: return 0;           /* команда, читається нулем */
     case HPB_DSTPR: return 0;
-    case HPB_DSTSR: return s->ch[ch].dstsr;
+    case HPB_DSTSR: return hpb_chan_status(&s->ch[ch]);
     default:        return 0;
     }
 }
@@ -388,19 +433,35 @@ static void hpb_chan_write(void *opaque, hwaddr addr, uint64_t val,
     case HPB_DCR:   s->ch[ch].dcr = val; break;
 
     case HPB_DCMDR:
+        if (hpb_dbg() && (ch == 4 || ch == 6)) {
+            fprintf(stderr, "[dma] DCMDR ch%d <- %08" PRIx64
+                    " (active=%d plane%u left=%u)\n",
+                    ch, val, s->ch[ch].active, s->ch[ch].plane,
+                    s->ch[ch].left);
+        }
         if (val & DCMDR_DMEN) {
             hpb_chan_start(s, ch, !!(val & DCMDR_DNXT));
         }
+        if ((val & DCMDR_DNXT) && (s->ch[ch].dcr & DCR_CT)) {
+            ClarionHpbChan *c = &s->ch[ch];
+
+            c->next_requested = true;
+            if (c->active && !c->left) {
+                c->next_requested = false;
+                hpb_chan_load_plane(s, ch,
+                                    (c->dcr & DCR_DIP) ? c->plane ^ 1 : 0);
+            }
+        }
         if (val & (DCMDR_DQEND | DCMDR_DQSPD | DCMDR_DMSPD)) {
             s->ch[ch].active = false;
-            s->ch[ch].dstsr &= ~DSTSR_DMSTS;
+            s->ch[ch].next_requested = false;
         }
         break;
 
     case HPB_DSTPR:
         if (val & DSTPR_DMSTP) {
             s->ch[ch].active = false;
-            s->ch[ch].dstsr &= ~DSTSR_DMSTS;
+            s->ch[ch].next_requested = false;
         }
         break;
 

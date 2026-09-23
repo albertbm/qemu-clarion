@@ -739,3 +739,4 @@ config CLARION_QY8
     select UNIMP
     select CLARION_DU
     select CLARION_HPBDMA
+    select CLARION_MICOM
