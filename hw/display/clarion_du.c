@@ -42,10 +42,15 @@
 #include "qemu/log.h"
 #include "hw/core/sysbus.h"
 #include "hw/display/clarion_du.h"
+#include "qemu/timer.h"
+#include "trace.h"
+#include "hw/core/cpu.h"
 #include "ui/console.h"
 #include "ui/pixel_ops.h"
 #include "system/address-spaces.h"
 #include "qom/object.h"
+#include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
 
 /* --- регістри (імена й зсуви — з rcar_du_regs.h) ---------------------- */
 
@@ -60,6 +65,19 @@
 #define DSSR                0x00008     /* статус, тільки читання */
 #define DSRCR               0x0000c     /* скидання бітів статусу */
 #define DIER                0x00010     /* дозвіл переривань */
+
+/*
+ * Біт 11 у DSSR/DIER — кадрова синхронізація (vertical blanking).
+ * Іменування й номер біта — з rcar_du_regs.h (`DSSR_VBK`, `DIER_VBE`);
+ * підтверджено з обох боків: драйвер HU пише в DIER рівно 0x800, а його
+ * потік обробки переривання (ddi_ncg.dll+0x12e78) читає DSSR, перевіряє
+ * `tst r3, #0x800` і скидає біт записом 0x800 у DSRCR.
+ */
+#define DSSR_VBK            (1 << 11)
+#define DIER_VBE            (1 << 11)
+
+#define HCR                 0x00050     /* повна ширина кадру - 1 */
+#define VCR                 0x00058     /* повна висота кадру - 1 */
 
 #define DPPR                0x00018     /* пріоритети й вибір площин */
 /*
@@ -141,6 +159,10 @@ struct ClarionDuState {
     uint32_t *reg;              /* увесь блок як масив слів */
     int cols, rows;
     bool invalidate;
+
+    qemu_irq irq;               /* GIC_SPI 31 */
+    QEMUTimer *vbk;             /* кадровий такт */
+    uint32_t dotclk;            /* точкова частота, Гц (властивість) */
 
     /* щоб не засмічувати лог однаковими скаргами */
     bool warned_chan1;
@@ -537,7 +559,120 @@ static uint64_t clarion_du_read(void *opaque, hwaddr addr, unsigned size)
      * лічильника кадрів, ні лінії переривання модель не має. Відкрите
      * питання до M3b: чи чекає на VBK користувацька частина.
      */
+    if ((addr & 0xffff) == DSSR) {
+        /*
+         * Лічильник читань статусу кадру. Потрібен, щоб відрізнити «драйвер
+         * узагалі не цікавиться кадровою синхронізацією» від «драйвер її
+         * чекає, а модель мовчить». DIER=VBK завантажувач вмикає на 917 мс.
+         */
+        static uint32_t dssr_reads;
+        trace_clarion_du_dssr_read(
+            (uint32_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / SCALE_MS),
+            (uint32_t)addr, ++dssr_reads);
+    }
+
     return s->reg[addr / 4];
+}
+
+/*
+ * Ім'я регістра для журналу. Площини (`P1DSA0R` тощо) складаються на льоту:
+ * площина n живе за group + n * PLANE_OFF, тож номер відновлюється діленням.
+ */
+static const char *du_reg_name(hwaddr addr)
+{
+    static char buf[16];
+    hwaddr off = addr & 0xffff;
+
+    switch (off) {
+    case DSYSR:   return "DSYSR";
+    case DSSR:    return "DSSR";
+    case DSRCR:   return "DSRCR";
+    case DIER:    return "DIER";
+    case DPPR:    return "DPPR";
+    case DOOR:    return "DOOR";
+    case BPOR:    return "BPOR";
+    case HDSR:    return "HDSR";
+    case HDER:    return "HDER";
+    case VDSR:    return "VDSR";
+    case VDER:    return "VDER";
+    case DORCR:   return "DORCR";
+    case DPTSR:   return "DPTSR";
+    case DS1PR:   return "DS1PR";
+    case DS2PR:   return "DS2PR";
+    default:      break;
+    }
+
+    if (off >= PLANE_OFF && off < (DU_NUM_PLANES + 1) * PLANE_OFF) {
+        int plane = off / PLANE_OFF;
+        hwaddr po = off % PLANE_OFF;
+        const char *r = NULL;
+
+        switch (po) {
+        case PnMR:     r = "MR";     break;
+        case PnMWR:    r = "MWR";    break;
+        case PnDSXR:   r = "DSXR";   break;
+        case PnDSYR:   r = "DSYR";   break;
+        case PnDPXR:   r = "DPXR";   break;
+        case PnDPYR:   r = "DPYR";   break;
+        case PnDSA0R:  r = "DSA0R";  break;
+        case PnSPXR:   r = "SPXR";   break;
+        case PnSPYR:   r = "SPYR";   break;
+        case PnSWAPR:  r = "SWAPR";  break;
+        case PnDDCR4:  r = "DDCR4";  break;
+        default:       break;
+        }
+        if (r) {
+            snprintf(buf, sizeof(buf), "P%d%s", plane, r);
+            return buf;
+        }
+    }
+
+    snprintf(buf, sizeof(buf), "?%05x", (unsigned)off);
+    return buf;
+}
+
+/* --- кадрова синхронізація (VBK) -------------------------------------- */
+
+/*
+ * Лінія переривання зведена, поки є хоч один дозволений і незнятий біт
+ * статусу. Обробник у драйвері знімає біт записом у DSRCR — і лінія падає
+ * сама, без окремого «ack» від моделі.
+ */
+static void du_irq_update(ClarionDuState *s)
+{
+    qemu_set_irq(s->irq, !!(du_rd(s, DSSR) & du_rd(s, DIER)));
+}
+
+/*
+ * Період кадру береться з РЕГІСТРІВ, які запрограмував сам гість:
+ * повний кадр = (HCR + 1) x (VCR + 1) точок. На HU це 1056 x 525.
+ *
+ * Єдине число, якого немає в регістрах, — сама точкова частота: ESCR02
+ * лишається 0, тобто DCLKSEL = DCLKIN, зовнішній такт від TCON
+ * (PA 0xFFF18000). Його джерела ми не знаємо, тому це ВЛАСТИВІСТЬ машини
+ * `dotclk` зі значенням за замовчуванням 33 333 333 Гц — опорний EXTAL
+ * плат R-Car M1A. Для кадру 1056 x 525 це дає 60.1 Гц.
+ */
+static void du_vbk_resched(ClarionDuState *s)
+{
+    uint64_t total = (uint64_t)(du_rd(s, HCR) + 1) * (du_rd(s, VCR) + 1);
+    bool on = (du_rd(s, DSYSR) & DSYSR_DEN) && (du_rd(s, DIER) & DIER_VBE);
+
+    if (!on || total < 2 || !s->dotclk) {
+        timer_del(s->vbk);
+        return;
+    }
+    timer_mod_ns(s->vbk, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                 muldiv64(total, NANOSECONDS_PER_SECOND, s->dotclk));
+}
+
+static void du_vbk_tick(void *opaque)
+{
+    ClarionDuState *s = opaque;
+
+    s->reg[DSSR / 4] |= DSSR_VBK;
+    du_irq_update(s);
+    du_vbk_resched(s);
 }
 
 static void clarion_du_write(void *opaque, hwaddr addr, uint64_t val,
@@ -546,15 +681,55 @@ static void clarion_du_write(void *opaque, hwaddr addr, uint64_t val,
     ClarionDuState *s = opaque;
     hwaddr off = addr & 0xffff;
 
+    /*
+     * Журнал іде ПЕРЕД обробкою DSSR/DSRCR: інакше записи в DSRCR (скидання
+     * бітів статусу — саме те, що робить обробник переривання) губилися б у
+     * ранньому `return` і виглядали б як «їх не було».
+     */
+    if (off == DSSR || off == DSRCR || s->reg[addr / 4] != (uint32_t)val) {
+        /*
+         * Журнал змін регістрів — щоб бачити, КОЛИ саме змінюється картинка
+         * і який саме регістр за це відповідає. Пишемо лише справжні зміни:
+         * драйвер переписує ті самі значення щокадру, і без фільтра трас
+         * тоне в повторах. Час — віртуальний, у мілісекундах, той самий, за
+         * яким мітить рядки консоль гостя.
+         */
+        CPUState *cs = current_cpu;
+        uint64_t pc = 0;
+
+        /*
+         * PC гостя. У TCG він оновлюється на межах блоків трансляції, тож
+         * це адреса З ТОЧНІСТЮ ДО БЛОКУ, а не сама інструкція `str`. Для
+         * відповіді «який модуль пише» цього досить: бази модулів XIP
+         * рознесені на десятки кілобайтів.
+         */
+        if (cs) {
+            pc = CPU_GET_CLASS(cs)->get_pc(cs);
+        }
+        trace_clarion_du_reg_write(
+            (uint32_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / SCALE_MS),
+            du_reg_name(addr), (uint32_t)addr,
+            s->reg[addr / 4], (uint32_t)val, pc);
+    }
+
     if (off == DSSR) {
         return;                 /* статус — тільки читання */
     }
     if (off == DSRCR) {
         s->reg[DSSR / 4] &= ~(uint32_t)val;
+        du_irq_update(s);
         return;
     }
 
     s->reg[addr / 4] = val;
+
+    /* Усе, від чого залежить кадровий такт каналу 0. */
+    if (addr == DSYSR || addr == DIER || addr == HCR || addr == VCR) {
+        du_vbk_resched(s);
+        if (addr == DIER) {
+            du_irq_update(s);
+        }
+    }
 
     if (addr == DU1_REG_OFFSET + DSYSR && (val & DSYSR_DEN) &&
         !s->warned_chan1) {
@@ -584,6 +759,10 @@ static void clarion_du_reset_hold(Object *obj, ResetType type)
     s->cols = 0;
     s->rows = 0;
     s->invalidate = true;
+    if (s->vbk) {
+        timer_del(s->vbk);
+    }
+    qemu_set_irq(s->irq, 0);
 }
 
 static void clarion_du_realize(DeviceState *dev, Error **errp)
@@ -594,9 +773,31 @@ static void clarion_du_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->iomem, OBJECT(dev), &clarion_du_ops, s,
                           "clarion-du", CLARION_DU_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
+    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
+    s->vbk = timer_new_ns(QEMU_CLOCK_VIRTUAL, du_vbk_tick, s);
 
     s->con = qemu_graphic_console_create(dev, 0, &clarion_du_gfx_ops, s);
 }
+
+static const Property clarion_du_props[] = {
+    /*
+     * Точкова частота DCLKIN у герцах — період кадру = (HCR+1)*(VCR+1)/dotclk.
+     * У регістрах DU її немає: ESCR02 = 0, тобто такт зовнішній, від TCON
+     * (PA 0xFFF18000).
+     *
+     * ⚠ Типово 0 — кадрове переривання НЕ генерується. Не тому, що модель
+     * неправильна, а тому, що НЕ ВСТАНОВЛЕНО, якою лінією GIC воно доходить
+     * до цієї прошивки: драйвер бере SYSINTR = 37 з власної константи, а
+     * перебір усіх 17 ліній, які OAL узагалі вмикає, не розбудив його
+     * потік обробки (docs/04-journal.md, 24.09). Поки лінія не відома,
+     * генерувати переривання означало б стукати в чужі двері.
+     *
+     * Коли лінію знайдуть: `-global clarion-du.dotclk=33333333` (опорний
+     * EXTAL плат R-Car M1A; з кадром 1056 x 525 це 60.1 Гц) разом із
+     * `-M clarion-qy8,du-spi=<номер>`.
+     */
+    DEFINE_PROP_UINT32("dotclk", ClarionDuState, dotclk, 0),
+};
 
 static void clarion_du_class_init(ObjectClass *klass, const void *data)
 {
@@ -605,6 +806,7 @@ static void clarion_du_class_init(ObjectClass *klass, const void *data)
 
     dc->realize = clarion_du_realize;
     dc->desc = "Renesas R-Car Display Unit (Gen1)";
+    device_class_set_props(dc, clarion_du_props);
     rc->phases.hold = clarion_du_reset_hold;
 }
 

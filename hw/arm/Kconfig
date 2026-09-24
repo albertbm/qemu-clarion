@@ -740,3 +740,4 @@ config CLARION_QY8
     select CLARION_DU
     select CLARION_HPBDMA
     select CLARION_MICOM
+    select RENESAS_SDHI

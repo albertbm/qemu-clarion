@@ -227,3 +227,8 @@ apple_gfx_iosfc_unmap_memory(void *a, void *b, void *c, void *d, void *e, void *
 apple_gfx_iosfc_unmap_memory_region(void* mem, void *region) "unmapping @ %p from memory region %p"
 apple_gfx_iosfc_raise_irq(uint32_t vector) "vector=0x%x"
 
+
+# clarion_du.c
+clarion_du_reg_write(uint32_t ms, const char *name, uint32_t off, uint32_t old, uint32_t val, uint64_t pc) "%6u ms  %-10s +0x%05x  %08x -> %08x  PC=%08" PRIx64
+clarion_du_frame(uint32_t ms, const char *what, uint32_t a, uint32_t b) "%6u ms  КАДР %s %08x %08x"
+clarion_du_dssr_read(uint32_t ms, uint32_t off, uint32_t n) "%6u ms  DSSR +0x%05x читання #%u"

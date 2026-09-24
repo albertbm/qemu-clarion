@@ -53,3 +53,8 @@ k230_gsdma_read(uint64_t addr, unsigned int size, uint64_t data) "K230 GSDMA rea
 k230_gsdma_write(uint64_t addr, unsigned int size, uint64_t data) "K230 GSDMA write: [0x%"PRIx64"] size %u <- 0x%"PRIx64
 k230_gsdma_read_sdma_llt(uint64_t addr, uint32_t cfg, uint32_t src_addr, uint32_t line_size, uint32_t line_cfg, uint32_t dst_addr, uint32_t next_llt_addr) "K230 GSDMA read SDMA LLT: addr=0x%"PRIx64" cfg=0x%"PRIx32" src=0x%"PRIx32" line_size=0x%"PRIx32" line_cfg=0x%"PRIx32" dst=0x%"PRIx32" next=0x%"PRIx32
 k230_gsdma_read_sdma_llt_failed(uint64_t addr) "K230 GSDMA read SDMA LLT failed: addr=0x%"PRIx64
+
+# clarion_hpbdma.c
+clarion_hpbdma_chan_write(int ch, uint32_t off, uint64_t val) "ch%d +0x%02x <- 0x%08" PRIx64
+clarion_hpbdma_start(int ch, unsigned plane, uint32_t dcr, uint32_t sar, uint32_t dar, uint32_t left) "ch%d plane%u DCR=%08x SAR=%08x DAR=%08x N=%u"
+clarion_hpbdma_module_service(int ch, uint32_t addr, uint32_t dar, uint32_t left) "ch%d модуль 0x%08x -> 0x%08x, лишилося %u од."

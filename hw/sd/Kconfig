@@ -27,3 +27,9 @@ config CADENCE_SDHCI
 config AXIADO_SDHCI
     bool
     select SDHCI
+
+config RENESAS_SDHI
+    bool
+    select SD
+    # передача даних іде через HPB-DMAC плати (див. renesas_sdhi.c)
+    select CLARION_HPBDMA

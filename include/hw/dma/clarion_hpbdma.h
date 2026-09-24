@@ -37,4 +37,32 @@
  */
 bool clarion_hpbdma_feed(DeviceState *dev, hwaddr periph_addr, uint8_t val);
 
+/*
+ * --- Модуль, який сам тримає дані (SDHI) -------------------------------
+ *
+ * SCIF байт за байтом ВІДДАЄ прийняте через clarion_hpbdma_feed(). SDHI так
+ * не може: блок він отримує цілком, і на живій платі порядок такий (траса
+ * docs/qy8-sdhi-dma-blocker-20260924.log у репозиторії nissan-can-explore):
+ *
+ *     DCR/DSAR/DDAR/DTCR каналу 21  ->  CMD17  ->  DCMDR.DMEN
+ *
+ * тобто дані в контролері з'являються РАНІШЕ, ніж канал озброєно. Отже
+ * напрямок тут зворотний: DMAC САМ ЧИТАЄ регістр модуля, поки той каже, що
+ * дані ще є. Саме так поводиться залізо — DMAC обслуговує піднятий запит,
+ * коли його ввімкнули.
+ *
+ * `ready` — це і є запит DMA від модуля: «в буфері просто зараз є що
+ * віддати». DMAC питає його перед КОЖНОЮ одиницею передачі, тож модель не
+ * має жодного лічильника, який треба тримати в синхроні, і не може
+ * вигадати даних, яких у модуля немає.
+ *
+ * clarion_hpbdma_module_attach() модуль кличе один раз (при realize),
+ * clarion_hpbdma_module_poke() — коли дані з'явилися вже після DMEN.
+ */
+typedef bool (*ClarionHpbModuleReady)(void *opaque);
+
+void clarion_hpbdma_module_attach(DeviceState *dev, hwaddr periph_addr,
+                                  ClarionHpbModuleReady ready, void *opaque);
+void clarion_hpbdma_module_poke(DeviceState *dev, hwaddr periph_addr);
+
 #endif

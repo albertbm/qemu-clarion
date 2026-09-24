@@ -25,6 +25,12 @@
  * мікроконтролера плати (у прошивці є cpucom.dll і ціла родина
  * *MicomUpdate.exe), а не налагоджувальна консоль.
  *
+ * Модульний бік каналу адресується ПРИВ'ЯЗКОЮ КАНАЛУ (таблиця
+ * hpb_chan_module нижче), а не тим, що гість записав у DSAR/DDAR. Раніше
+ * модель порівнювала DSAR з адресою периферії; для SCIF це працювало
+ * випадково, для SDHI не спрацювало б ніколи. Докладно — у коментарі до
+ * таблиці.
+ *
  * ⚠ Межа чесності. Напрямок «пам'ять -> модуль» виконується одразу:
  * наш SCIF завжди готовий приймати, тож миттєва передача — це не
  * спрощення, а точний опис цієї моделі. Напрямок «модуль -> пам'ять»
@@ -49,6 +55,8 @@
 #include "hw/dma/clarion_hpbdma.h"
 #include "system/address-spaces.h"
 #include "qom/object.h"
+#include "trace.h"
+#include "hw/core/cpu.h"
 
 /* --- канальні регістри (зсуви з rcar-hpbdma.c) ------------------------ */
 
@@ -121,6 +129,18 @@ typedef struct ClarionHpbChan {
     bool active;
 } ClarionHpbChan;
 
+/*
+ * Модуль, який сам тримає дані і піднімає запит DMA (див. заголовок).
+ * Таких на цій платі рівно два — SDHI0 і SDHI1; чотири з запасом.
+ */
+#define HPB_MAX_MODULE  4
+
+typedef struct ClarionHpbModule {
+    hwaddr addr;                        /* регістр даних модуля */
+    ClarionHpbModuleReady ready;        /* «дані є просто зараз?» */
+    void *opaque;
+} ClarionHpbModule;
+
 struct ClarionHpbDmaState {
     SysBusDevice parent_obj;
 
@@ -132,6 +152,10 @@ struct ClarionHpbDmaState {
     uint32_t dintsr[2];                 /* стан переривань */
     uint32_t dintmr[2];                 /* маски */
     uint32_t dtimr;
+
+    ClarionHpbModule module[HPB_MAX_MODULE];
+    unsigned n_module;
+    bool servicing;                     /* захист від повторного входу */
 };
 
 OBJECT_DECLARE_SIMPLE_TYPE(ClarionHpbDmaState, CLARION_HPBDMA)
@@ -207,6 +231,68 @@ static void hpb_chan_complete(ClarionHpbDmaState *s, int ch)
     hpb_update_irq(s);
 }
 
+/*
+ * --- Прив'язка каналу до периферії ------------------------------------
+ *
+ * У HPB-DMAC периферійний («модульний») бік каналу задає САМЕ КАНАЛ, а не
+ * адреса в DSAR/DDAR. Гість оголошує цю прив'язку окремими регістрами —
+ * ASYNCRSTR (0xFFC00300) і ASYNCMDR (0xFFC00400), де кожному каналу
+ * належить свій біт.
+ *
+ * Чому модель більше не порівнює DSAR з адресою периферії. Раніше
+ * clarion_hpbdma_feed() шукав канал за збігом `dsasr == periph_addr`. Для
+ * SCIF це працювало ВИПАДКОВО: EdaDrv кладе туди фізичну адресу регістра.
+ * SDHC.dll кладе в DSAR ВІРТУАЛЬНУ адресу SD_BUF0 — і це не його збій:
+ * доведено (docs/qy8-sdhi-dma-addr-20260924.txt у репозиторії
+ * nissan-can-explore), що механізм VA->PA у драйвера є, працює й
+ * застосований до буфера в пам'яті, а на модульний бік не застосовується
+ * навмисно. Тож збіг за адресою для SDHI не настав би ніколи.
+ *
+ * ⚠ Що саме залізо робить із записаним у модульний бік DSAR/DDAR, ми НЕ
+ * знаємо (розділу про це в наших джерелах немає). Тому модель нічого про
+ * це не припускає: для відомих каналів вона бере адресу регістра з цієї
+ * таблиці, а записане гостем значення не тлумачить узагалі.
+ *
+ * Джерела прив'язки — для кожного рядка своє:
+ *
+ *   4, 6    SCIF4   — з поведінки самого гостя: DSAR0=0xFFE44014 (SCFRDR)
+ *                     на каналі 4 і DDAR0=0xFFE4400C (SCFTDR) на каналі 6;
+ *                     розбір лінка — docs/20-qemu-board.md, «M3b».
+ *   16, 17  HSCIF0  — так само з гостя: 0xFFE48014 / 0xFFE4800C.
+ *   21, 22  SDHI0   — подвійне джерело. setup-r8a7778.c (v4.0):
+ *                     SDHI0_TX .dma_ch=21, SDHI0_RX .dma_ch=22, обидва
+ *                     .addr = 0xffe4c000 + 0x30. І сам гість: SDHC.dll
+ *                     пише ASYNCRSTR біт 1 (ASRST21) та ASYNCMDR
+ *                     ASMD21=MULTI — ті самі біти, що Linux позначає
+ *                     коментарем "SDHI0".
+ *   14, 15  USB-функція — лише з setup-r8a7778.c; ця прошивка їх не чіпає,
+ *                     тож рядки не перевірені живим гостем.
+ *
+ * Напрямок каналом НЕ задається: його визначають DCR.SMDL/DMDL. Гість
+ * користується каналом 21 для читання (SMDL), хоча в Linux 21 — це TX.
+ */
+#define HPB_NO_MODULE   0
+
+static const hwaddr hpb_chan_module[CLARION_HPBDMA_NUM_CHAN] = {
+    [4]  = 0xFFE44014,      /* SCIF4  SCFRDR  — з гостя                 */
+    [6]  = 0xFFE4400C,      /* SCIF4  SCFTDR  — з гостя                 */
+    [14] = 0xFFE60018,      /* USB-функція D0 — Linux, не перевірено    */
+    [15] = 0xFFE6001C,      /* USB-функція D1 — Linux, не перевірено    */
+    [16] = 0xFFE48014,      /* HSCIF0 HSRDR   — з гостя                 */
+    [17] = 0xFFE4800C,      /* HSCIF0 HSTDR   — з гостя                 */
+    [21] = 0xFFE4C030,      /* SDHI0  SD_BUF0 — Linux + ASYNCMDR гостя  */
+    [22] = 0xFFE4C030,      /* SDHI0  SD_BUF0 — Linux                   */
+};
+
+/*
+ * Адреса модульного боку каналу. Для невідомого каналу повертає
+ * HPB_NO_MODULE: прив'язки ми не знаємо, і вигадувати її не будемо.
+ */
+static hwaddr hpb_module_addr(int ch)
+{
+    return hpb_chan_module[ch];
+}
+
 /* Розмір одиниці передачі: SPDS/DPDS, 0=8 біт, 1=16, 2=32. */
 static unsigned hpb_unit(ClarionHpbDmaState *s, int ch)
 {
@@ -230,11 +316,30 @@ static void hpb_move_one(ClarionHpbDmaState *s, int ch)
 {
     ClarionHpbChan *c = &s->ch[ch];
     unsigned unit = hpb_unit(s, ch);
+    hwaddr mod = hpb_module_addr(ch);
+    hwaddr src = c->dsasr, dst = c->ddasr;
     uint8_t buf[4];
 
-    address_space_read(&address_space_memory, c->dsasr,
+    /*
+     * Бік, позначений MDL, адресується прив'язкою каналу. Записане гостем
+     * значення для цього боку не використовуємо: воно не зобов'язане бути
+     * адресою (див. коментар до hpb_chan_module).
+     */
+    if ((c->dcr & DCR_SMDL) && mod != HPB_NO_MODULE) {
+        src = mod;
+    }
+    if ((c->dcr & DCR_DMDL) && mod != HPB_NO_MODULE) {
+        dst = mod;
+    }
+    if ((c->dcr & (DCR_SMDL | DCR_DMDL)) && mod == HPB_NO_MODULE) {
+        qemu_log_mask(LOG_UNIMP, "clarion-hpbdma: канал %d ходить у модуль, "
+                      "але його прив'язки ми не знаємо — беремо адресу з "
+                      "регістра, як було\n", ch);
+    }
+
+    address_space_read(&address_space_memory, src,
                        MEMTXATTRS_UNSPECIFIED, buf, unit);
-    address_space_write(&address_space_memory, c->ddasr,
+    address_space_write(&address_space_memory, dst,
                         MEMTXATTRS_UNSPECIFIED, buf, unit);
 
     if (!(c->dcr & DCR_SMDL)) {
@@ -258,6 +363,32 @@ static void hpb_chan_load_plane(ClarionHpbDmaState *s, int ch, unsigned plane)
     c->dtcsr = c->left;
 }
 
+/*
+ * Лічильник добіг. Спільна кінцівка для всіх напрямків: подія переривання,
+ * а далі — або наступна площина (CT, якщо software уже подало DNXT), або
+ * канал стає неактивним.
+ */
+static void hpb_chan_finish(ClarionHpbDmaState *s, int ch)
+{
+    ClarionHpbChan *c = &s->ch[ch];
+
+    hpb_chan_complete(s, ch);
+    if (c->dcr & DCR_CT) {
+        /*
+         * CT не означає безумовне автоперемикання. Наступний set
+         * запускається лише якщо software уже подало DNXT; інакше канал
+         * лишається active у command-wait state.
+         */
+        if (c->next_requested) {
+            c->next_requested = false;
+            hpb_chan_load_plane(s, ch, (c->dcr & DCR_DIP) ? c->plane ^ 1 : 0);
+        }
+    } else {
+        c->active = false;
+        c->dstsr &= ~DSTSR_DMSTS;
+    }
+}
+
 static uint32_t hpb_chan_status(const ClarionHpbChan *c)
 {
     uint32_t status = c->dstsr & DSTSR_DQSTS;
@@ -273,6 +404,16 @@ static uint32_t hpb_chan_status(const ClarionHpbChan *c)
     return status;
 }
 
+/* ТИМЧАСОВО: зонд «а чи це віртуальна адреса?» під QY8_DMA_VA_PROBE */
+static bool hpb_va_probe(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("QY8_DMA_VA_PROBE") != NULL;
+    }
+    return on;
+}
+
 /* ТИМЧАСОВО: журнал роботи каналів під QY8_DMA_LOG (знести після досліду) */
 static bool hpb_dbg(void)
 {
@@ -281,6 +422,117 @@ static bool hpb_dbg(void)
         on = getenv("QY8_DMA_LOG") != NULL;
     }
     return on;
+}
+
+/*
+ * ТИМЧАСОВО (QY8_DMA_LOG, знести разом з рештою зондів).
+ *
+ * Показати, що лягло в ГОСТЬОВУ пам'ять за адресою призначення. Читаємо
+ * саме з пам'яті, а не з того, що щойно писали: інакше зонд підтверджував
+ * би сам себе. Саме цими рядками доведено перше читання блоку SD
+ * (docs/qy8-sdhi-dma-read-20260924.log у репозиторії nissan-can-explore).
+ */
+static void hpb_dbg_dest(int ch, hwaddr addr, uint32_t dar,
+                         uint32_t moved, uint32_t asked)
+{
+    uint8_t back[16];
+    unsigned k;
+
+    if (!hpb_dbg()) {
+        return;
+    }
+    address_space_read(&address_space_memory, dar, MEMTXATTRS_UNSPECIFIED,
+                       back, sizeof(back));
+    fprintf(stderr, "[dma] ch%d модуль %08x -> %08x: перенесено %u од. з %u, "
+            "у пам'яті:", ch, (unsigned)addr, dar, moved, asked);
+    for (k = 0; k < sizeof(back); k++) {
+        fprintf(stderr, " %02x", back[k]);
+    }
+    fprintf(stderr, "\n");
+}
+
+/* --- модуль, який сам тримає дані (SDHI) ------------------------------ */
+
+static ClarionHpbModule *hpb_module_find(ClarionHpbDmaState *s, hwaddr addr)
+{
+    unsigned i;
+
+    for (i = 0; i < s->n_module; i++) {
+        if (s->module[i].addr == addr) {
+            return &s->module[i];
+        }
+    }
+    return NULL;
+}
+
+/*
+ * Перекачати в пам'ять усе, що модуль за адресою addr готовий віддати
+ * просто зараз. Дані беруться ЧИТАННЯМ його регістра (hpb_move_one), тож
+ * модель нічого не вигадує: скільки модуль віддасть, стільки й піде.
+ *
+ * Питання «чи є ще дані» ставиться перед кожною одиницею передачі —
+ * модуль може дозаправити свій буфер просто всередині нашого читання
+ * (так робить SDHI на багатоблоковому читанні), і цикл це підхопить.
+ */
+static void hpb_service_module(ClarionHpbDmaState *s, hwaddr addr)
+{
+    ClarionHpbModule *m = hpb_module_find(s, addr);
+    int ch;
+
+    if (!m || s->servicing) {
+        return;
+    }
+    s->servicing = true;
+
+    for (ch = 0; ch < CLARION_HPBDMA_NUM_CHAN; ch++) {
+        ClarionHpbChan *c = &s->ch[ch];
+        uint32_t dar0, n0;
+
+        /* лише озброєний канал «модуль -> пам'ять», прив'язаний до addr */
+        if (!c->active || !c->left || hpb_module_addr(ch) != addr) {
+            continue;
+        }
+        if (!(c->dcr & DCR_SMDL) || (c->dcr & DCR_DMDL)) {
+            continue;
+        }
+
+        dar0 = c->ddasr;
+        n0 = c->left;
+        trace_clarion_hpbdma_module_service(ch, (uint32_t)addr, c->ddasr,
+                                            c->left);
+        while (c->left && m->ready(m->opaque)) {
+            hpb_move_one(s, ch);
+        }
+        if (!c->left) {
+            hpb_chan_finish(s, ch);
+        }
+
+        hpb_dbg_dest(ch, addr, dar0, n0 - c->left, n0);
+        break;                          /* один канал на одну адресу */
+    }
+
+    s->servicing = false;
+}
+
+void clarion_hpbdma_module_attach(DeviceState *dev, hwaddr periph_addr,
+                                  ClarionHpbModuleReady ready, void *opaque)
+{
+    ClarionHpbDmaState *s = CLARION_HPBDMA(dev);
+
+    if (s->n_module >= HPB_MAX_MODULE) {
+        qemu_log_mask(LOG_UNIMP, "clarion-hpbdma: більше ніж %d модулів "
+                      "з власним буфером не передбачено\n", HPB_MAX_MODULE);
+        return;
+    }
+    s->module[s->n_module].addr = periph_addr;
+    s->module[s->n_module].ready = ready;
+    s->module[s->n_module].opaque = opaque;
+    s->n_module++;
+}
+
+void clarion_hpbdma_module_poke(DeviceState *dev, hwaddr periph_addr)
+{
+    hpb_service_module(CLARION_HPBDMA(dev), periph_addr);
 }
 
 static void hpb_chan_start(ClarionHpbDmaState *s, int ch, bool next)
@@ -297,6 +549,7 @@ static void hpb_chan_start(ClarionHpbDmaState *s, int ch, bool next)
     }
     hpb_chan_load_plane(s, ch, plane);
     c->active = true;
+    trace_clarion_hpbdma_start(ch, plane, c->dcr, c->dsasr, c->ddasr, c->left);
     if (hpb_dbg() && (ch == 4 || ch == 6)) {
         fprintf(stderr, "[dma] start ch%d plane%u dcr=%08x dar=%08x tcr=%u\n",
                 ch, plane, c->dcr, c->ddasr, c->left);
@@ -304,9 +557,12 @@ static void hpb_chan_start(ClarionHpbDmaState *s, int ch, bool next)
 
     if ((c->dcr & DCR_SMDL) && !(c->dcr & DCR_DMDL)) {
         /*
-         * Модуль -> пам'ять. Даних у нас немає — канал просто озброєно,
-         * байти в нього подасть SCIF через clarion_hpbdma_feed().
+         * Модуль -> пам'ять. Самі даних не вигадуємо. Модуль із власним
+         * буфером (SDHI) міг набрати їх ще до DMEN — у нього питаємо одразу;
+         * решті (SCIF) канал лишається просто озброєним, і байти подасть
+         * сама периферія через clarion_hpbdma_feed().
          */
+        hpb_service_module(s, hpb_module_addr(ch));
         return;
     }
     if ((c->dcr & DCR_SMDL) && (c->dcr & DCR_DMDL)) {
@@ -337,8 +593,19 @@ bool clarion_hpbdma_feed(DeviceState *dev, hwaddr periph_addr, uint8_t val)
     for (ch = 0; ch < CLARION_HPBDMA_NUM_CHAN; ch++) {
         ClarionHpbChan *c = &s->ch[ch];
 
-        if (!c->active || !c->left || !(c->dcr & DCR_SMDL) ||
-            c->dsasr != periph_addr) {
+        /*
+         * Канал шукаємо за ПРИВ'ЯЗКОЮ, а не за тим, що гість записав у
+         * DSAR. Для каналу без відомої прив'язки лишається старий шлях —
+         * інакше ми б мовчки перестали обслуговувати SCIF-подібні випадки,
+         * яких ще не розібрали.
+         */
+        hwaddr mod = hpb_module_addr(ch);
+
+        if (!c->active || !c->left || !(c->dcr & DCR_SMDL)) {
+            continue;
+        }
+        if (mod != HPB_NO_MODULE ? mod != periph_addr
+                                 : c->dsasr != periph_addr) {
             continue;
         }
         address_space_write(&address_space_memory, c->ddasr,
@@ -352,21 +619,7 @@ bool clarion_hpbdma_feed(DeviceState *dev, hwaddr periph_addr, uint8_t val)
                 fprintf(stderr, "[dma] ch%d буфер добіг (plane%u)\n",
                         ch, c->plane);
             }
-            hpb_chan_complete(s, ch);
-            if (c->dcr & DCR_CT) {
-                /*
-                 * CT не означає безумовне автоперемикання. Наступний set
-                 * запускається лише якщо software уже подало DNXT; інакше
-                 * канал лишається active у command-wait state.
-                 */
-                if (c->next_requested) {
-                    c->next_requested = false;
-                    hpb_chan_load_plane(s, ch,
-                                        (c->dcr & DCR_DIP) ? c->plane ^ 1 : 0);
-                }
-            } else {
-                c->active = false;
-            }
+            hpb_chan_finish(s, ch);
         }
         return true;
     }
@@ -420,6 +673,33 @@ static void hpb_chan_write(void *opaque, hwaddr addr, uint64_t val,
 
     if (ch >= CLARION_HPBDMA_NUM_CHAN) {
         return;
+    }
+
+    trace_clarion_hpbdma_chan_write(ch, (uint32_t)off, val);
+
+    /*
+     * ТИМЧАСОВО (QY8_DMA_VA_PROBE, знести після досліду 24.09.2026).
+     *
+     * Питання досліду: чому в DSAR/DDAR каналу 21 (SDHI0) потрапляють
+     * значення, яких немає у фізичній карті плати, тоді як канали 4/6/16/17
+     * дістають правильні фізичні адреси. Зонд перекладає записане значення
+     * як ВІРТУАЛЬНУ адресу в контексті того самого CPU, що робить запис.
+     * Якщо VA -> PA дає осмислену фізичну адресу — значить драйвер пише
+     * віртуальну адресу, а не фізичну.
+     */
+    if (hpb_va_probe() && (off == HPB_DSAR0 || off == HPB_DDAR0 ||
+                           off == HPB_DSAR1 || off == HPB_DDAR1)) {
+        CPUState *cs = current_cpu;
+        TranslateForDebugResult tres;
+
+        if (cs && cpu_translate_for_debug(cs, val, &tres)) {
+            fprintf(stderr, "[va] ch%-2d +0x%02x <- %08" PRIx64
+                    "   як VA -> PA %08" HWADDR_PRIx "\n",
+                    ch, (unsigned)off, val, tres.physaddr);
+        } else {
+            fprintf(stderr, "[va] ch%-2d +0x%02x <- %08" PRIx64
+                    "   як VA не транслюється\n", ch, (unsigned)off, val);
+        }
     }
 
     switch (off) {
