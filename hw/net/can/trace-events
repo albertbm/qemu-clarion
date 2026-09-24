@@ -32,3 +32,8 @@ xlnx_canfd_rx_fifo_filter_reject(char *path, uint32_t id, uint8_t dlc) "%s: Fram
 xlnx_canfd_rx_data(char *path, uint32_t id, uint8_t dlc, uint8_t flags) "%s: Frame: ID: 0x%08x DLC: 0x%02x CANFD Flag: 0x%02x"
 xlnx_canfd_tx_data(char *path, uint32_t id, uint8_t dlc, uint8_t flgas) "%s: Frame: ID: 0x%08x DLC: 0x%02x CANFD Flag: 0x%02x"
 xlnx_canfd_reset(char *path, uint32_t val) "%s: Resetting controller with value = 0x%08x"
+
+# renesas_can.c
+renesas_can_read(uint64_t off, unsigned size, uint64_t val, const char *ctx) "CAN +0x%03" PRIx64 " (%u) -> 0x%04" PRIx64 "%s"
+renesas_can_write(uint64_t off, unsigned size, uint64_t val, const char *ctx) "CAN +0x%03" PRIx64 " (%u) <- 0x%04" PRIx64 "%s"
+renesas_can_mode(const char *from, const char *to, bool sleep, uint16_t str) "CAN режим %s -> %s (sleep %d) STR 0x%04x"

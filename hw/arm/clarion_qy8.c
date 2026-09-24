@@ -38,6 +38,7 @@
 #include "hw/misc/clarion_micom.h"
 #include "hw/dma/clarion_hpbdma.h"
 #include "hw/sd/sd.h"
+#include "hw/net/renesas_can.h"
 #include "hw/sd/renesas_sdhi.h"
 #include "hw/misc/unimp.h"
 #include "hw/block/flash.h"
@@ -189,6 +190,7 @@ static int qy8_scif_chr_index(int scif)
  * режим 1) драйвер запускає з нульовим таймаутом, тож вона завершується
  * помилкою одразу, і завершення команди він чекає лише від ISR.
  */
+#define QY8_CAN_BASE        0xFFFD1000
 #define QY8_SDHI_BASE       0xFFE4C000
 #define QY8_SDHI_STRIDE     0x1000
 #define QY8_NUM_SDHI        2
@@ -1694,6 +1696,7 @@ struct Qy8MachineState {
     Qy8Hscif hscif0;
     DeviceState *micom;
     DeviceState *sdhi[QY8_NUM_SDHI];
+    DeviceState *can;
     Qy8Tmu tmu;
     Qy8Gpio gpio[QY8_GPIO_BANKS];
     Qy8Bctl bctl;
@@ -2110,6 +2113,26 @@ static void qy8_init(MachineState *machine)
                                    qdev_get_child_bus(s->sdhi[i], "sd-bus"),
                                    &error_fatal);
         }
+    }
+
+    /*
+     * --- CAN @0xFFFD1000 ---------------------------------------------
+     *
+     * Контролер плати, до якого ходить `CAN.dll` (а через `CAN1:` —
+     * `AntiTheft.exe`). Модель знає тільки про власні режими контролера;
+     * шини авто (BCM, метр, HVAC) за нею немає — див. renesas_can.c.
+     * Лінію переривання не під'єднуємо: номер GIC SPI для CAN нічим не
+     * доведено, а модель поки нічого й не піднімає.
+     */
+    /*
+     * QY8_CAN=off прибирає модель зовсім: блок знову падає в qy8.periph і
+     * `CAN.dll` знову впирається в таймаут. Це потрібно лише для порівняння
+     * «до/після», тому вимикач env, а не властивість машини.
+     */
+    if (g_strcmp0(getenv("QY8_CAN"), "off") != 0) {
+        s->can = qdev_new(TYPE_RENESAS_CAN);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(s->can), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(s->can), 0, QY8_CAN_BASE);
     }
 
     /* --- решта периферії: поки лише лог доступів (-d unimp) --- */

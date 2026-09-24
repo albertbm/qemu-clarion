@@ -162,3 +162,8 @@ config CAN_FLEXCAN
     bool
     depends on IMX
     select CAN_BUS
+
+config RENESAS_CAN
+    bool
+    # Контролер CAN R-Car Gen1 (R8A7778). Шини CAN модель поки не має,
+    # тому CAN_BUS свідомо НЕ вибирається.
