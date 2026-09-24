@@ -36,6 +36,7 @@
 #include "hw/intc/arm_gic.h"
 #include "hw/display/clarion_du.h"
 #include "hw/misc/clarion_micom.h"
+#include "hw/misc/clarion_dispmicom.h"
 #include "hw/dma/clarion_hpbdma.h"
 #include "hw/sd/sd.h"
 #include "hw/net/renesas_can.h"
@@ -171,6 +172,13 @@
 /* SCIF4 — лінк до супутнього МК плати (docs/20, «M3b»), не консоль. */
 #define QY8_SCIF_MICOM      4
 
+/*
+ * SCIF1 — лінк до МК панелі дисплея (Display Micom), не консоль. Реєстр
+ * гостя: Drivers\Launch\SCIF1 -> serial_scif.dll, Prefix 'SCI', Index 1,
+ * тобто ім'я потоку `SCI1:`, яке відкриває CLcdDrv::SCIF_Init @0xEF71724C.
+ */
+#define QY8_SCIF_DISPMICOM  1
+
 /* serial@ffe4n000 interrupts = <GIC_SPI 70+n> (r8a7778.dtsi) */
 #define QY8_SCIF_SPI0       70
 
@@ -259,6 +267,7 @@ typedef struct Qy8Scif {
     qemu_irq irq;
     DeviceState *dmac;          /* кому віддавати прийняті байти */
     DeviceState *micom;         /* супутній МК на тому ж дроті, якщо є */
+    DeviceState *dispmicom;     /* МК панелі на тому ж дроті, якщо є */
     hwaddr base;                /* фізична база — щоб назвати SCFRDR для DMA */
     uint16_t scsmr, scscr, scfcr;
     uint8_t fifo[QY8_SCIF_FIFO];
@@ -337,6 +346,14 @@ static void qy8_scif_idle_expire(void *opaque)
         s->dr = true;
         qy8_scif_rx_pump(s);        /* DR теж просить DMA — див. rx_pump */
     }
+    /*
+     * Посилка скінчилася: те, що канал DMA уже переніс, — усе, що буде.
+     * Кажемо йому завершити set, інакше короткий кадр мовчки лежав би в
+     * буфері гостя до кінця 128-байтного DTCR (див. clarion_hpbdma_eod).
+     */
+    if (s->dmac) {
+        clarion_hpbdma_eod(s->dmac, s->base + SCIF_SCFRDR);
+    }
     if (s->fifo_len) {
         /*
          * Канал DMA зараз не озброєний — запит лишається висіти, як у
@@ -411,6 +428,10 @@ static void qy8_scif_write(void *opaque, hwaddr addr, uint64_t val,
          */
         if (s->micom) {
             clarion_micom_rx_byte(s->micom, ch);
+            break;
+        }
+        if (s->dispmicom) {
+            clarion_dispmicom_rx_byte(s->dispmicom, ch);
             break;
         }
         /* синхронний вивід: без нього ранні рядки буту губляться */
@@ -849,6 +870,34 @@ static int qy8_micom_sink(void *opaque, const uint8_t *buf, int len)
     }
     qy8_scif_receive(s, buf, len);
     return len;
+}
+
+/*
+ * Те саме для МК панелі, але кадр віддається ЦІЛКОМ. Кадр 0x24 — 20 байтів,
+ * а FIFO приймача — 16, тож наївне «скільки влізло» розриває його на дві
+ * посилки, між якими встигає спрацювати таймер тиші: гість отримує два
+ * недокадри й відповідає NAK. На живому лінку такого немає — байти йдуть
+ * безперервним потоком, а DMA вигрібає FIFO на ходу. У моделі вигрібання
+ * миттєве (qy8_scif_receive -> rx_pump), тому просто доливаємо, доки є
+ * місце: кадр лишається однією посилкою.
+ */
+static int qy8_dispmicom_sink(void *opaque, const uint8_t *buf, int len)
+{
+    Qy8Scif *s = opaque;
+    int done = 0;
+
+    while (done < len) {
+        int room = qy8_scif_can_receive(s);
+        int n;
+
+        if (room <= 0) {
+            break;
+        }
+        n = MIN(room, len - done);
+        qy8_scif_receive(s, buf + done, n);
+        done += n;
+    }
+    return done;
 }
 
 /* --- TMU (таймери Renesas, регістрова мапа як у SH TMU) --------------- */
@@ -1695,6 +1744,7 @@ struct Qy8MachineState {
     Qy8Scif scif[QY8_NUM_SCIF];
     Qy8Hscif hscif0;
     DeviceState *micom;
+    DeviceState *dispmicom;
     DeviceState *sdhi[QY8_NUM_SDHI];
     DeviceState *can;
     Qy8Tmu tmu;
@@ -1712,6 +1762,7 @@ struct Qy8MachineState {
     uint32_t du_spi;            /* лінія GIC для DU, властивість машини */
     uint32_t du_dotclk;         /* точкова частота DU, Гц; 0 = без такту */
     bool micom_on;              /* вбудований супутній МК на SCIF4 */
+    bool dispmicom_on;          /* вбудований МК панелі на SCIF1 */
 
     MemoryRegion flash;          /* лише коли флеш подано як ROM */
     DriveInfo *flash_drive;      /* -drive if=pflash: записувана копія */
@@ -1937,6 +1988,22 @@ static void qy8_init(MachineState *machine)
         qdev_realize_and_unref(s->micom, NULL, &error_fatal);
     }
 
+    /*
+     * --- МК панелі дисплея (Display Micom) на SCIF1 ---
+     *
+     * Окрема мікросхема в блоці дисплея, теж розпаяна на живому авто, тож
+     * типово вона є. Без неї `lcddrv.dll` відкриває `SCI1:`, шле свій
+     * 10 02 23 10 03 30 і назавжди стоїть у WaitCommEvent: ACM-модуль 129
+     * ніколи не виставляється, і DrawOi малює перший кадр аж після
+     * 5-секундного таймауту очікування на 129. Вимкнути —
+     * `-M clarion-qy8,dispmicom=off`: тоді SCIF1 поводиться як звичайний
+     * порт і до нього можна причепити власний відповідач через -serial.
+     */
+    if (s->dispmicom_on) {
+        s->dispmicom = qdev_new(TYPE_CLARION_DISPMICOM);
+        qdev_realize_and_unref(s->dispmicom, NULL, &error_fatal);
+    }
+
     /* --- SCIF --- */
     for (i = 0; i < QY8_NUM_SCIF; i++) {
         Qy8Scif *sc = &s->scif[i];
@@ -1950,6 +2017,10 @@ static void qy8_init(MachineState *machine)
         if (i == QY8_SCIF_MICOM && s->micom) {
             sc->micom = s->micom;
             clarion_micom_set_sink(s->micom, qy8_micom_sink, sc);
+        }
+        if (i == QY8_SCIF_DISPMICOM && s->dispmicom) {
+            sc->dispmicom = s->dispmicom;
+            clarion_dispmicom_set_sink(s->dispmicom, qy8_dispmicom_sink, sc);
         }
         memory_region_init_io(&sc->mr, NULL, &qy8_scif_ops, sc, name, 0x100);
         memory_region_add_subregion(sysmem,
@@ -2203,6 +2274,16 @@ static void qy8_micom_set(Object *obj, bool value, Error **errp)
     QY8_MACHINE(obj)->micom_on = value;
 }
 
+static bool qy8_dispmicom_get(Object *obj, Error **errp)
+{
+    return QY8_MACHINE(obj)->dispmicom_on;
+}
+
+static void qy8_dispmicom_set(Object *obj, bool value, Error **errp)
+{
+    QY8_MACHINE(obj)->dispmicom_on = value;
+}
+
 static void qy8_machine_instance_init(Object *obj)
 {
     Qy8MachineState *s = QY8_MACHINE(obj);
@@ -2244,6 +2325,17 @@ static void qy8_machine_instance_init(Object *obj)
     object_property_add_bool(obj, "micom", qy8_micom_get, qy8_micom_set);
     object_property_set_description(obj, "micom",
         "вбудований супутній МК на SCIF4 (off — щоб причепити свій "
+        "відповідач через -serial)");
+
+    /*
+     * МК панелі дисплея. Теж типово ввімкнений: на залізі він розпаяний, і
+     * без нього lcddrv не виставляє ACM-модуль 129.
+     */
+    s->dispmicom_on = true;
+    object_property_add_bool(obj, "dispmicom", qy8_dispmicom_get,
+                             qy8_dispmicom_set);
+    object_property_set_description(obj, "dispmicom",
+        "вбудований МК панелі дисплея на SCIF1 (off — щоб причепити свій "
         "відповідач через -serial)");
 }
 

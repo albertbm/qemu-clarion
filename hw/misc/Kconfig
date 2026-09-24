@@ -267,3 +267,6 @@ source macio/Kconfig
 
 config CLARION_MICOM
     bool
+
+config CLARION_DISPMICOM
+    bool

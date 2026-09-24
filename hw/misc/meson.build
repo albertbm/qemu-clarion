@@ -178,3 +178,4 @@ system_ss.add(when: 'CONFIG_LASI', if_true: files('lasi.c'))
 
 system_ss.add(when: 'CONFIG_AXIADO_CLK', if_true: files('axiado_clk.c'))
 system_ss.add(when: 'CONFIG_CLARION_MICOM', if_true: files('clarion_micom.c'))
+system_ss.add(when: 'CONFIG_CLARION_DISPMICOM', if_true: files('clarion_dispmicom.c'))

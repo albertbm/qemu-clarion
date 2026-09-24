@@ -626,6 +626,45 @@ bool clarion_hpbdma_feed(DeviceState *dev, hwaddr periph_addr, uint8_t val)
     return false;
 }
 
+/*
+ * Приймач модуля замовк. Завершуємо активний set того каналу, який уже щось
+ * у цій посилці переніс: DTCSR лишається з недобраним залишком, і драйвер
+ * бачить рівно стільки байтів, скільки прийшло.
+ *
+ * Чому це потрібно моделі. SCIF віддає прийняте в HPB-DMAC, а не в
+ * переривання: гість тримає RIE = 0 на всіх SCIF (перевірено на буті —
+ * SCSCR 0x003E/0x00BE), тож RXI не працює як джерело. Драйвер дізнається
+ * про дані лише з переривання каналу DMA. Буфер у нього 128 байтів, а
+ * кадри лінків короткі (відповідь панелі — 20 байтів), тож без дострокового
+ * завершення set ніколи не добігав би до кінця і про кадр ніхто б не
+ * дізнався. На залізі цю роль грає сигнал «приймач порожній» (DR) SCIF.
+ */
+void clarion_hpbdma_eod(DeviceState *dev, hwaddr periph_addr)
+{
+    ClarionHpbDmaState *s = CLARION_HPBDMA(dev);
+    int ch;
+
+    for (ch = 0; ch < CLARION_HPBDMA_NUM_CHAN; ch++) {
+        ClarionHpbChan *c = &s->ch[ch];
+        hwaddr mod = hpb_module_addr(ch);
+
+        if (!c->active || !(c->dcr & DCR_SMDL)) {
+            continue;
+        }
+        if (mod != HPB_NO_MODULE ? mod != periph_addr
+                                 : c->dsasr != periph_addr) {
+            continue;
+        }
+        /* Порожній set завершувати нема чого — переривання без даних. */
+        if (!c->left || c->left == c->tcr[c->plane]) {
+            continue;
+        }
+        c->dtcsr = c->left;
+        hpb_chan_finish(s, ch);
+        return;                         /* один канал на одну адресу */
+    }
+}
+
 /* --- канальні регістри ------------------------------------------------ */
 
 static uint64_t hpb_chan_read(void *opaque, hwaddr addr, unsigned size)
