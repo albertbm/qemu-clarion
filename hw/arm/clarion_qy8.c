@@ -227,6 +227,28 @@ static int qy8_scif_chr_index(int scif)
 #define BCTL_ST_PWR         0x0080
 #define BCTL_ST_BOOT        0x0400
 
+/*
+ * Card-detect обох слотів SD живе в тому самому 16-бітному слові, що й DIPSW.
+ * Знято з бітових аксесорів `GPIO.dll` (читання vtbl+0x1C0 @VA 0xEF6C3204,
+ * запис vtbl+0x1C4 @0xEF6C3850; base = змаплений PA 0x18800000):
+ *
+ *   IOCTL 0x800A2174 -> ldrh [base+0x02] >> 5 & 1   card-detect слота 0
+ *   IOCTL 0x800A20EC -> ldrh [base+0x02] >> 6 & 1   card-detect слота 1
+ *
+ * До них ходить `SDHC.dll`: `SD_Sense_Card` (@0xEFA2D888) читає біт через
+ * `GPI1:`, а `CSDHCAccess::SDHC_CardCheck` (@0xEFA29ED4) віддає «картка є»
+ * лише коли біт дорівнює НУЛЮ (@0xEFA2D904: `*out = (bit == 1) ? 2 : 1`,
+ * @0xEFA29FDC: результат 1 лише при `*out == 1`). Тобто лінія активно-низька:
+ * порожній слот із підтяжкою читається як 1. Збій IOCTL прошивка теж трактує
+ * як «немає картки» — це її безпечний дефолт.
+ *
+ * ⚠ Слово +0x02 суто вхідне: у записувальному аксесорі для нього немає жодної
+ * гілки (усі 19 вихідних защіпок лежать у +0x04 і +0x00). Тому тут можна
+ * накладати біти при читанні, не боячись затерти щось, що пише гість.
+ */
+#define BCTL_CD0            0x0020      /* біт 5: слот 0, 0 = картка є */
+#define BCTL_CD1            0x0040      /* біт 6: слот 1, 0 = картка є */
+
 /* Режими DIPSW — таблиця переходів eboot @VA 0x97c07e28 */
 #define QY8_DIPSW_NORM_RES  5           /* "NORM(RES)>>" — як із TEST_B1 */
 
@@ -853,37 +875,31 @@ static void qy8_hscif_receive(void *opaque, const uint8_t *buf, int size)
 }
 
 /*
- * Куди micom кладе свої байти. Повертаємо, скільки прийнято: FIFO приймача
- * на 16 байтів, а кадр «набір команд» — 68 байтів разом із обгорткою, тож
- * решту micom досилає, коли DMA звільнить місце.
+ * Куди МК (обидва — плати на SCIF4 і панелі на SCIF1) кладуть свої байти.
+ * Повертаємо, скільки прийнято.
+ *
+ * Кадр мусить лягти в приймач ОДНІЄЮ посилкою. Наївне «скільки влізло у
+ * 16-байтовий FIFO, решту наступного разу» розриває будь-який довший кадр, бо
+ * між шматками встигає спрацювати таймер тиші SCIF (QY8_SCIF_IDLE_NS = 200
+ * мкс, а МК доливає через *_FILL_NS = 1 мс). А `qy8_scif_idle_expire()` — це
+ * не просто «підняти DR»: він ще й закриває набір DMA через
+ * `clarion_hpbdma_eod()`. Тобто гість отримує не один кадр, а кілька
+ * 16-байтових огризків, кожен як окрему завершену посилку.
+ *
+ * На живому лінку такого немає: байти йдуть безперервним потоком, а DMA
+ * вигрібає FIFO на ходу. У моделі вигрібання миттєве
+ * (qy8_scif_receive -> qy8_scif_rx_pump), тому просто доливаємо, доки є
+ * місце — віртуальний час усередині циклу не рухається, таймер тиші не
+ * спрацьовує, і кадр лишається однією посилкою.
+ *
+ * Симптоми, з яких це знайдено: МК панелі — кадр 0x24 (20 Б) розривався на
+ * два недокадри й гість відповідав NAK; МК плати — кадр «набір команд»
+ * `08 0a` (~70 Б) не доходив до розбирача EdaDrv взагалі, лінк назавжди
+ * лишався у стані 2, ACM-ID 61 ніколи не виставлявся (docs/24 у
+ * nissan-can-explore).
  */
-static int qy8_micom_sink(void *opaque, const uint8_t *buf, int len)
+static int qy8_micom_burst(Qy8Scif *s, const uint8_t *buf, int len)
 {
-    Qy8Scif *s = opaque;
-    int room = qy8_scif_can_receive(s);
-
-    if (room <= 0 || len <= 0) {
-        return 0;
-    }
-    if (len > room) {
-        len = room;
-    }
-    qy8_scif_receive(s, buf, len);
-    return len;
-}
-
-/*
- * Те саме для МК панелі, але кадр віддається ЦІЛКОМ. Кадр 0x24 — 20 байтів,
- * а FIFO приймача — 16, тож наївне «скільки влізло» розриває його на дві
- * посилки, між якими встигає спрацювати таймер тиші: гість отримує два
- * недокадри й відповідає NAK. На живому лінку такого немає — байти йдуть
- * безперервним потоком, а DMA вигрібає FIFO на ходу. У моделі вигрібання
- * миттєве (qy8_scif_receive -> rx_pump), тому просто доливаємо, доки є
- * місце: кадр лишається однією посилкою.
- */
-static int qy8_dispmicom_sink(void *opaque, const uint8_t *buf, int len)
-{
-    Qy8Scif *s = opaque;
     int done = 0;
 
     while (done < len) {
@@ -891,13 +907,23 @@ static int qy8_dispmicom_sink(void *opaque, const uint8_t *buf, int len)
         int n;
 
         if (room <= 0) {
-            break;
+            break;                  /* DMA не озброєний — решту доллє МК */
         }
         n = MIN(room, len - done);
         qy8_scif_receive(s, buf + done, n);
         done += n;
     }
     return done;
+}
+
+static int qy8_micom_sink(void *opaque, const uint8_t *buf, int len)
+{
+    return qy8_micom_burst(opaque, buf, len);
+}
+
+static int qy8_dispmicom_sink(void *opaque, const uint8_t *buf, int len)
+{
+    return qy8_micom_burst(opaque, buf, len);
 }
 
 /* --- TMU (таймери Renesas, регістрова мапа як у SH TMU) --------------- */
@@ -1073,13 +1099,41 @@ static const MemoryRegionOps qy8_tmu_ops = {
 typedef struct Qy8Bctl {
     MemoryRegion mr;
     uint16_t reg[QY8_BCTL_SIZE / 2];
+    SDBus *sd[QY8_NUM_SDHI];    /* шини SDHI — джерело card-detect */
 } Qy8Bctl;
+
+/*
+ * Card-detect не зберігається в reg[]: його рахуємо на кожному читанні з
+ * фактичної топології QEMU. `sdbus_get_inserted()` віддає true лише коли на
+ * шині є пристрій-картка І в нього вставлений блочний backend (hw/sd/core.c:
+ * `get_card()` повертає NULL для порожньої шини; hw/sd/sd.c:
+ * `sd_get_inserted()` = `blk && blk_is_inserted(blk)`). Тобто це саме
+ * «картка під'єднана», а не «контролер існує»: обидва SDHI в моделі є завжди,
+ * картку в слот вставляє лише `-drive if=sd,index=N`.
+ */
+static uint16_t qy8_bctl_card_detect(Qy8Bctl *b)
+{
+    static const uint16_t cd[QY8_NUM_SDHI] = { BCTL_CD0, BCTL_CD1 };
+    uint16_t bits = 0;
+    int i;
+
+    for (i = 0; i < QY8_NUM_SDHI; i++) {
+        if (!b->sd[i] || !sdbus_get_inserted(b->sd[i])) {
+            bits |= cd[i];          /* порожньо -> 1 (активно-низька лінія) */
+        }
+    }
+    return bits;
+}
 
 static uint64_t qy8_bctl_read(void *opaque, hwaddr addr, unsigned size)
 {
     Qy8Bctl *b = opaque;
+    uint16_t v = b->reg[addr >> 1];
 
-    return b->reg[addr >> 1];
+    if (addr == BCTL_DIPSW) {
+        v = (v & ~(BCTL_CD0 | BCTL_CD1)) | qy8_bctl_card_detect(b);
+    }
+    return v;
 }
 
 static void qy8_bctl_write(void *opaque, hwaddr addr, uint64_t val,
@@ -2184,6 +2238,12 @@ static void qy8_init(MachineState *machine)
                                    qdev_get_child_bus(s->sdhi[i], "sd-bus"),
                                    &error_fatal);
         }
+        /*
+         * Чип плати читає card-detect із цих самих шин (див. qy8_bctl_read).
+         * Прив'язку робимо тут, а не при створенні bctl, бо контролери
+         * створюються пізніше; гість читає регістр уже після init машини.
+         */
+        s->bctl.sd[i] = SD_BUS(qdev_get_child_bus(s->sdhi[i], "sd-bus"));
     }
 
     /*
