@@ -58,3 +58,8 @@ k230_gsdma_read_sdma_llt_failed(uint64_t addr) "K230 GSDMA read SDMA LLT failed:
 clarion_hpbdma_chan_write(int ch, uint32_t off, uint64_t val) "ch%d +0x%02x <- 0x%08" PRIx64
 clarion_hpbdma_start(int ch, unsigned plane, uint32_t dcr, uint32_t sar, uint32_t dar, uint32_t left) "ch%d plane%u DCR=%08x SAR=%08x DAR=%08x N=%u"
 clarion_hpbdma_module_service(int ch, uint32_t addr, uint32_t dar, uint32_t left) "ch%d модуль 0x%08x -> 0x%08x, лишилося %u од."
+
+# clarion_lbdma.c
+clarion_lbdma_write(uint32_t off, uint64_t val) "+0x%03x <- 0x%08" PRIx64
+clarion_lbdma_run(int i, uint32_t sar, uint32_t dar, uint32_t tcr, uint32_t bytes) "набір%d SAR=%08x DAR=%08x TCR=%u -> %u Б"
+clarion_lbdma_start(uint32_t ctrl, uint32_t bytes) "START CTRL=%08x перенесено %u Б"

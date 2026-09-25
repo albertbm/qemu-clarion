@@ -36,3 +36,6 @@ config K230_GSDMA
 
 config CLARION_HPBDMA
     bool
+
+config CLARION_LBDMA
+    bool

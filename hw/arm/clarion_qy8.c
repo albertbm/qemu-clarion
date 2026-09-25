@@ -38,6 +38,7 @@
 #include "hw/misc/clarion_micom.h"
 #include "hw/misc/clarion_dispmicom.h"
 #include "hw/dma/clarion_hpbdma.h"
+#include "hw/dma/clarion_lbdma.h"
 #include "hw/sd/sd.h"
 #include "hw/net/renesas_can.h"
 #include "hw/sd/renesas_sdhi.h"
@@ -1795,6 +1796,7 @@ struct Qy8MachineState {
     DeviceState *gic;
     DeviceState *du;
     DeviceState *dmac;
+    DeviceState *lbdma;      /* DMA читання NOR @0xFF801000 */
     Qy8Scif scif[QY8_NUM_SCIF];
     Qy8Hscif hscif0;
     DeviceState *micom;
@@ -1905,6 +1907,8 @@ static void qy8_init(MachineState *machine)
         qdev_prop_set_uint8(fl, "big-endian", 0);
         qdev_prop_set_uint16(fl, "id0", QY8_FLASH_MANUF_ID);
         qdev_prop_set_uint16(fl, "id1", QY8_FLASH_DEVICE_ID);
+        qdev_prop_set_uint16(fl, "id2", 0x22a3); /* PC28F512M29AWxB ext. ID */
+        qdev_prop_set_uint16(fl, "id3", 0x2201);
         /*
          * Адреси розблокування. Завантажувач пише за БАЙТОВИМИ 0xAAAA і
          * 0x5554; модель для x16 ділить на 2 і лишає 11 біт, тобто 0x555 і
@@ -2245,6 +2249,25 @@ static void qy8_init(MachineState *machine)
          */
         s->bctl.sd[i] = SD_BUS(qdev_get_child_bus(s->sdhi[i], "sd-bus"));
     }
+
+    /*
+     * --- LBSC DMAC @0xFF801000 ---------------------------------------
+     *
+     * Двигун, яким `Flash.dll` реально читає паралельну NOR: IOCTL
+     * `0x01112020` (`FlashReadToPhysMem`) не шле мікросхемі жодної команди
+     * CFI, а програмує сюди {SAR, DAR, TCR} і дає START. Без моделі запити
+     * ковтав широкий `qy8.periph`, призначення лишалося нульовим, а драйвер
+     * 5 секунд чекав переривання завершення, яке нізвідки взятися не могло.
+     *
+     * Лінію GIC узято не з аналогії: OAL самої прошивки віддає драйверу
+     * IRQ 0x6F для `LogicalLoc = 0xFF801000`, а «логічний IRQ» OAL — це GIC
+     * INTID, тож SPI = 111 - 32 = 79 (докладно — clarion_lbdma.h).
+     */
+    s->lbdma = qdev_new(TYPE_CLARION_LBDMA);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(s->lbdma), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(s->lbdma), 0, CLARION_LBDMA_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(s->lbdma), 0,
+                       qdev_get_gpio_in(s->gic, CLARION_LBDMA_SPI));
 
     /*
      * --- CAN @0xFFFD1000 ---------------------------------------------

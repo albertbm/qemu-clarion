@@ -739,6 +739,7 @@ config CLARION_QY8
     select UNIMP
     select CLARION_DU
     select CLARION_HPBDMA
+    select CLARION_LBDMA
     select CLARION_MICOM
     select CLARION_DISPMICOM
     select RENESAS_SDHI
