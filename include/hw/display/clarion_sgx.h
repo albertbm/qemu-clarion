@@ -41,17 +41,33 @@
 #define SGX_CR_BIF_DIR_LIST_BASE0   0x0C84
 
 /*
- * Невідомий регістр, який init-script прошивки пише ОСТАННІМ перед kick'ом і
- * значення якого доведено є адресою: 0x0080C180, а
- * `EUR_CR_PDS_EXEC_BASE + 0x0080C180` точно дорівнює поверненому device-VA
- * однієї з алокацій SGX. Імені в жодному з семи публічних заголовків немає
- * (docs/sgx/03), тому називаємо його за роллю, яку довели, а не за здогадом:
- * носій адреси відносно PDS_EXEC_BASE. Докази — docs/sgx/09-edm-boot-locator.md.
+ * Триплет task-control події «Other», який init-script прошивки пише ОСТАННІМ
+ * перед kick'ом.
+ *
+ * ⚠ Раніше тут стояло «імені в жодному з публічних заголовків немає» і
+ * робоча назва `SGX_CR_QY8_TASK_*`. Це було неправдою: імена є в
+ * `eurasia/hwdefs/sgx540defs.h:2135..2157` того самого дерева DDK — просто
+ * ми доти дивилися в заголовки інших ядер. Знайдено під час T6
+ * (docs/sgx/23), підтверджено дослівним збігом зсувів.
+ *
+ *   0x0A68 EUR_CR_EVENT_OTHER_PDS_EXEC  ADDR_MASK 0x03FFFFF0 — адреса
+ *          програми PDS відносно EUR_CR_PDS_EXEC_BASE (наш прогін: 0x0080C180)
+ *   0x0A6C EUR_CR_EVENT_OTHER_PDS_DATA  SIZE_MASK 0x3F — розмір сегмента
+ *          даних у одиницях по 16 Б (наш прогін: 2 -> 32 Б, і це точно
+ *          збігається з «2 рядки × 2 банки × 2 дв.сл.»)
+ *   0x0A70 EUR_CR_EVENT_OTHER_PDS_INFO  DM / ATTRIBUTE_SIZE / USESECEXEC
+ *
+ * Той самий триплет код мікроядра пише з боку USE інструкціями
+ * `str #666/#667` (номер = байтовий зсув / 4) — docs/sgx/23 §3.
+ * Докази ролі й ланцюга — docs/sgx/09-edm-boot-locator.md.
  */
-#define SGX_CR_QY8_TASK_ADDR        0x0A68
-#define SGX_CR_QY8_TASK_W1          0x0A6C
-#define SGX_CR_QY8_TASK_W2          0x0A70
+#define SGX_CR_EVENT_OTHER_PDS_EXEC 0x0A68
+#define SGX_CR_EVENT_OTHER_PDS_DATA 0x0A6C
+#define SGX_CR_EVENT_OTHER_PDS_INFO 0x0A70
 #define SGX_CR_QY8_TASK_W3          0x0A74
+
+#define SGX_EVENT_OTHER_PDS_EXEC_ADDR_MASK  0x03FFFFF0U
+#define SGX_EVENT_OTHER_PDS_DATA_SIZE_MASK  0x0000003FU
 
 /* Маски полів адрес — дослівно з sgx*defs.h. */
 #define SGX_PDS_EXEC_BASE_ADDR_MASK     0x0FF00000U
@@ -97,8 +113,48 @@
 #define PDS_TYPE_TSTZ               0       /* у групі FLOW */
 #define PDS_TYPE_BRA                2
 #define PDS_TYPE_HALT               5
+#define PDS_TYPE_TSTN               1       /* у групі FLOW */
+#define PDS_TYPE_CALL               3
+#define PDS_TYPE_RTN                4
+#define PDS_TYPE_NOP                6
 #define PDS_CC_SHIFT                24      /* біти 26:24 */
+#define PDS_CC_P0                   0
+#define PDS_CC_P1                   1
+#define PDS_CC_P2                   2
+#define PDS_CC_IF0                  3
+#define PDS_CC_IF1                  4
+#define PDS_CC_ALUZ                 5
+#define PDS_CC_ALUN                 6
 #define PDS_CC_ALWAYS               7
+
+/*
+ * TSTZ/TSTN — `sgxdefs.h:3068..3090`. Предикат p0..p2 (біти 2:0) дістає
+ * результат порівняння з нулем одного з двох джерел; SRCSEL (біт 8) вибирає,
+ * якого саме. SRC1 — ds0[] або вхідний регістр ir0/ir1, SRC2 — завжди ds1[].
+ */
+#define PDS_TST_DEST_MASK           0x7
+#define PDS_TST_SRC1SEL_SHIFT       23
+#define PDS_TST_SRC1SEL_REG         1
+#define PDS_TST_SRC1_SHIFT          17
+#define PDS_TST_SRC1_MASK           0x3F
+#define PDS_TST_SRC2_SHIFT          10
+#define PDS_TST_SRC2_MASK           0x3F
+#define PDS_TST_SRCSEL_SHIFT        8
+#define PDS_TST_SRCSEL_SRC2         1
+#define PDS_TST_SRC1_IR0            0x00
+#define PDS_TST_SRC1_IR1            0x01
+
+/*
+ * BRA/CALL — `sgxdefs.h:3106..3109` (`FLOW_DEST` біти 18:0).
+ *
+ * ⚠ Тут легко помилитися на один зсув, і ми на цьому вже спіймалися.
+ * `pdsasm/main.c:4736` рахує `uDest = uLabelOffset << ALIGNSHIFT`, але
+ * `PDSEncodeBRA` (`sgxpdsdefs.h:775..782`) кладе в поле `uDest >> ALIGNSHIFT`.
+ * Зсуви взаємно скорочуються, отже в полі лежить **номер інструкції**, а
+ * байтовий зсув від початку сегмента коду = поле << ALIGNSHIFT.
+ */
+#define PDS_FLOW_DEST_MASK          0x7FFFF
+#define PDS_FLOW_DEST_ALIGNSHIFT    2
 
 /*
  * MOVS, гілка БЕЗ `SGX_FEATURE_PDS_EXTENDED_SOURCES` (тобто наша, SGX540).
@@ -128,13 +184,27 @@
 #define PDS_MOVS_DEST_DOUTU         5
 #define PDS_MOVS_DEST_DOUTA         6
 
-/* MOV32 */
+/* MOV32 — `sgxdefs.h:2819..2845`. */
 #define PDS_MOV32_SRCSEL_SHIFT      15
+#define PDS_MOV32_SRCSEL_MASK       0x3
+#define PDS_MOV32_SRCSEL_DS0        0
+#define PDS_MOV32_SRCSEL_DS1        1
+#define PDS_MOV32_SRCSEL_REG        2
 #define PDS_MOV32_SRC_SHIFT         9
 #define PDS_MOV32_SRC_MASK          0x3F
 #define PDS_MOV32_DESTSEL_SHIFT     7
+#define PDS_MOV32_DESTSEL_MASK      0x1
+#define PDS_MOV32_DESTSEL_DS0       0
+#define PDS_MOV32_DESTSEL_DS1       1
 #define PDS_MOV32_DEST_SHIFT        1
 #define PDS_MOV32_DEST_MASK         0x3F
+#define PDS_MOV32_SRC_IR0           0x00
+#define PDS_MOV32_SRC_IR1           0x02
+#define PDS_MOV32_SRC_PC            0x04
+#define PDS_MOV32_SRC_TIM           0x06
+
+/* Розмір банку datastore, `sgxdefs.h:2485..2491`: 0..47 константи, 48..63 temp. */
+#define PDS_DATASTORE_PERBANKSIZE   64
 
 /* Розкладка сегмента даних: PDS_NUM_DWORDS_PER_ROW = 2 для SGX540. */
 #define PDS_NUM_DWORDS_PER_ROW      2
@@ -150,6 +220,27 @@
 #define PDS_DOUTD1_INSTR_SHIFT      19
 #define PDS_DOUTD1_STRIDE_SHIFT     21
 #define PDS_DOUTD1_STRIDE_MASK      0x1FF
+#define PDS_DOUTD1_STYPE            (1u << 30)
+#define PDS_DOUTD1_INSTR_NORMAL     0
+#define PDS_DOUTD1_INSTR_BYPASS     1
+#define PDS_DOUTD1_INSTR_LINEFILL   2
+
+/*
+ * Вторинні атрибути мікроядра. Розкладку задає `PVRSRV_SGX_EDMPROG_SECATTR`
+ * (`services4/srvinit/devices/sgx/sgx_mkif.h:144..156`): двійне слово 0 —
+ * `sTA3DCtl`, 1 — `sHostCtl`, 2 — `sCCBCtl`, далі `sMKState`. А
+ * `usedefs.h:68..72` дає імена, якими користується сам код USE:
+ * `R_HostCtl = SA(sHostCtl)`, тобто рівно `sa[1]` у лістингу мікроядра.
+ *
+ * `SGX_UKERNEL_SA_BURST_SIZE = 16` двійних слів (`sgx_mkif.h:171`), а
+ * загальний розмір — `SGX_UKERNEL_NUM_SEC_ATTRIB` (`sgx_mkif.h:174`); для
+ * нашої збірки DOUTD везе 2 рядки по 16, тобто 32 двійних слова. Банк тримаємо
+ * з запасом до максимуму поля AO.
+ */
+#define SGX_SA_DWORDS               (PDS_DOUTD1_AO_MASK + 1)
+#define SGX_SA_TA3DCTL              0
+#define SGX_SA_HOSTCTL              1
+#define SGX_SA_CCBCTL               2
 
 /* DOUTU — інтерфейс запуску задачі USE */
 #define PDS_DOUTU0_CBASE_MASK       0xF
