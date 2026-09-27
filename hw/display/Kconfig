@@ -76,6 +76,9 @@ config FRAMEBUFFER
 config CLARION_DU
     bool
 
+config CLARION_SGX
+    bool
+
 config SM501
     bool
     select I2C

@@ -35,6 +35,7 @@
 #include "hw/arm/boot.h"
 #include "hw/intc/arm_gic.h"
 #include "hw/display/clarion_du.h"
+#include "hw/display/clarion_sgx.h"
 #include "hw/misc/clarion_micom.h"
 #include "hw/misc/clarion_dispmicom.h"
 #include "hw/dma/clarion_hpbdma.h"
@@ -1803,6 +1804,7 @@ struct Qy8MachineState {
     DeviceState *dispmicom;
     DeviceState *sdhi[QY8_NUM_SDHI];
     DeviceState *can;
+    DeviceState *sgx;         /* PowerVR SGX @0xFCE00000 */
     Qy8Tmu tmu;
     Qy8Gpio gpio[QY8_GPIO_BANKS];
     Qy8Bctl bctl;
@@ -2287,6 +2289,25 @@ static void qy8_init(MachineState *machine)
         s->can = qdev_new(TYPE_RENESAS_CAN);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(s->can), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(s->can), 0, QY8_CAN_BASE);
+    }
+
+    /*
+     * --- PowerVR SGX @0xFCE00000 -------------------------------------
+     *
+     * Щабель M1 карти docs/28-sgx-roadmap.md: блок отримує власне вікно й
+     * прилад замість широкого перехоплювача. Поведінково для гостя це НІЩО —
+     * читання так само віддають нулі, переривань немає, `ui32InitStatus`
+     * модель не торкається, тож `SGXInitialise` доходить до того самого
+     * таймауту. Уся користь у тому, що на `EUR_CR_EVENT_KICK2` модель друкує
+     * розбір видимого стану: регістри-носії адрес, повний обхід каталогу
+     * сторінок SGX і вміст об'єкта за коренем `PDS_EXEC_BASE + рег 0x0A68`.
+     * Чому саме так і чому M3 поки не роблять — clarion_sgx.c і
+     * docs/sgx/09-edm-boot-locator.md.
+     */
+    if (g_strcmp0(getenv("QY8_SGX"), "off") != 0) {
+        s->sgx = qdev_new(TYPE_CLARION_SGX);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(s->sgx), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(s->sgx), 0, CLARION_SGX_BASE);
     }
 
     /* --- решта периферії: поки лише лог доступів (-d unimp) --- */
