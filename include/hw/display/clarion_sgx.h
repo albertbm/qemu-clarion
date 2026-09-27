@@ -255,4 +255,218 @@
 #define PDS_DOUTU0_PDSDMADEP        (1u << 21)
 #define PDS_DOUTU1_MODE_SHIFT       26
 
+/*
+ * --- Кодування USE (SGX540) -------------------------------------------
+ *
+ * Дослівно з `eurasia/hwdefs/sgxdefs.h` того самого дерева DDK. Інструкція —
+ * пара 32-бітних слів little-endian: word0 (низ) і word1 (верх). Опкод — у
+ * word1, біти 31:27.
+ *
+ * ⚠ Біт 18 word1 КОНТЕКСТНО-ЗАЛЕЖНИЙ: для інструкцій без операнда S0 це
+ * `END` (кінець задачі), для LD/ST це `S0BEXT`, для TEST — `PARTIAL`.
+ * Не можна перевіряти його наосліп для всіх опкодів.
+ */
+#define USE_INST_SIZE               8
+
+#define USE1_OP_SHIFT               27
+#define USE1_OP_MOVC                5
+#define USE1_OP_TEST                9
+#define USE1_OP_ANDOR               10
+#define USE1_OP_XOR                 11
+#define USE1_OP_SHLROL              12
+#define USE1_OP_SHRASR              13
+#define USE1_OP_LD                  29
+#define USE1_OP_ST                  30
+#define USE1_OP_SPECIAL             31
+
+/* Розширений предикат (біти 26:24) — `sgxdefs.h:5166..5176`. */
+#define USE1_EPRED_SHIFT            24
+#define USE1_EPRED_MASK             0x7
+#define USE1_EPRED_ALWAYS           0
+#define USE1_EPRED_P0               1
+#define USE1_EPRED_P1               2
+#define USE1_EPRED_P2               3
+#define USE1_EPRED_P3               4
+#define USE1_EPRED_NOTP0            5
+#define USE1_EPRED_NOTP1            6
+#define USE1_EPRED_PNMOD4           7
+
+/* Прапорці word1 — `sgxdefs.h:5198..5206`. */
+#define USE1_END                    0x00040000U
+#define USE1_S0BEXT                 0x00040000U
+#define USE1_S1BEXT                 0x00020000U
+#define USE1_S2BEXT                 0x00010000U
+#define USE1_DBEXT                  0x00080000U
+
+/* Поля регістрів — `sgxdefs.h:5225..5305`. */
+#define USE1_S0BANK_SHIFT           2
+#define USE1_S0BANK_MASK            0x1
+#define USE1_D1BANK_SHIFT           0
+#define USE1_D1BANK_MASK            0x3
+#define USE0_S1BANK_SHIFT           30
+#define USE0_S2BANK_SHIFT           28
+#define USE0_BANK_MASK              0x3
+#define USE0_DST_SHIFT              21
+#define USE0_SRC0_SHIFT             14
+#define USE0_SRC1_SHIFT             7
+#define USE0_SRC2_SHIFT             0
+#define USE0_REG_MASK               0x7F
+
+/* Банки. Std — коли відповідний *BEXT знято, Ext — коли виставлено. */
+#define USE_S0STDBANK_TEMP          0
+#define USE_S0STDBANK_PRIMATTR      1
+#define USE_S0EXTBANK_OUTPUT        0
+#define USE_S0EXTBANK_SECATTR       1
+#define USE_S12STDBANK_TEMP         0
+#define USE_S12STDBANK_OUTPUT       1
+#define USE_S12STDBANK_PRIMATTR     2
+#define USE_S12STDBANK_SECATTR      3
+#define USE_S12EXTBANK_INDEXED      0
+#define USE_S12EXTBANK_SPECIAL      1
+#define USE_S12EXTBANK_IMMEDIATE    2
+#define USE_S12EXTBANK_FPINTERNAL   3
+#define USE_D1STDBANK_TEMP          0
+#define USE_D1STDBANK_OUTPUT        1
+#define USE_D1STDBANK_PRIMATTR      2
+#define USE_D1EXTBANK_SECATTR       0
+
+/* SPECIAL: категорія (біти 21:20) — `sgxdefs.h:6453..6459`. */
+#define USE1_SPECIAL_OPCAT_SHIFT    20
+#define USE1_SPECIAL_OPCAT_MASK     0x3
+#define USE1_SPECIAL_OPCAT_FLOWCTRL 0
+#define USE1_SPECIAL_OPCAT_MOECTRL  1
+#define USE1_SPECIAL_OPCAT_OTHER    2
+#define USE1_SPECIAL_OPCAT_VISTEST  3
+
+/* FLOWCTRL: підопкод (біти 8:6) — `sgxdefs.h:6496..6507`. */
+#define USE1_FLOWCTRL_OP2_SHIFT     6
+#define USE1_FLOWCTRL_OP2_MASK      0x7
+#define USE1_FLOWCTRL_OP2_BA        0
+#define USE1_FLOWCTRL_OP2_BR        1
+#define USE1_FLOWCTRL_OP2_LAPC      2
+#define USE1_FLOWCTRL_OP2_SETL      3
+#define USE1_FLOWCTRL_OP2_SAVL      4
+#define USE1_FLOWCTRL_OP2_NOP       5
+
+/* Гілка: `sgxdefs.h:6518..6521`. Зсув у word0 — НОМЕР ПАРИ, крок 8 Б. */
+#define USE1_BRANCH_SAVELINK        0x00000200U
+#define USE0_BRANCH_OFFSET_MASK     0x000FFFFFU
+
+/* OTHER: підопкод (біти 26:24) — `sgxdefs.h:6656..6666`. */
+#define USE1_OTHER_OP2_SHIFT        24
+#define USE1_OTHER_OP2_MASK         0x7
+#define USE1_OTHER_OP2_IDF          0
+#define USE1_OTHER_OP2_WDF          1
+#define USE1_OTHER_OP2_EMIT         3
+#define USE1_OTHER_OP2_LIMM         4
+#define USE1_OTHER_OP2_LOCKRELEASE  5
+#define USE1_OTHER_OP2_LDRSTR       6
+#define USE1_OTHER_OP2_WOP          7
+
+/* MOECTRL: підопкод (біти 26:24) — `sgxdefs.h:6553..6560`. */
+#define USE1_MOECTRL_OP2_SHIFT      24
+#define USE1_MOECTRL_OP2_MASK       0x7
+#define USE1_MOECTRL_OP2_SMLSI      2
+
+/*
+ * LIMM — `sgxdefs.h:7435..7447`. 32-бітна константа розрізана на три шматки:
+ * біти 20:0 у word0, біти 25:21 у word1[8:4], біти 31:26 у word1[17:12].
+ */
+#define USE0_LIMM_IMML21_MASK       0x001FFFFFU
+#define USE1_LIMM_IMM2521_SHIFT     4
+#define USE1_LIMM_IMM2521_MASK      0x1F
+#define USE1_LIMM_IMM3126_SHIFT     12
+#define USE1_LIMM_IMM3126_MASK      0x3F
+
+/*
+ * LDRSTR (`str`/`ldr`) — `sgxdefs.h:7461..7475`. Номер спецрегістра склеєний
+ * із двох полів: SRC2 (біти 6:0) і SRC2EXT (біти 20:14), зсунутого на 7.
+ * За T6 (docs/sgx/23) номер × 4 = байтовий зсув регістра SGX.
+ */
+#define USE1_LDRSTR_DSEL_STORE      0x00080000U
+#define USE0_LDRSTR_SRC2EXT_SHIFT   14
+#define USE0_LDRSTR_SRC2EXT_MASK    0x7F
+#define USE_LDRSTR_SRC2EXT_INTSHIFT 7
+
+/* LD/ST — `sgxdefs.h:6374..6416`. */
+#define USE1_LDST_BPCACHE           0x00080000U
+#define USE1_LDST_DTYPE_SHIFT       4
+#define USE1_LDST_DTYPE_MASK        0x3
+#define USE1_LDST_DTYPE_32BIT       0
+#define USE1_LDST_DTYPE_16BIT       1
+#define USE1_LDST_DTYPE_8BIT        2
+#define USE1_LDST_AMODE_SHIFT       10
+#define USE1_LDST_AMODE_MASK        0x3
+#define USE1_LDST_AMODE_ABSOLUTE    0
+#define USE1_LDST_IMODE_SHIFT       8
+#define USE1_LDST_IMODE_MASK        0x3
+#define USE1_LDST_IMODE_NONE        0
+
+/* TEST — `sgxdefs.h:5488..5587`. */
+#define USE1_TEST_ZTST_SHIFT        8
+#define USE1_TEST_ZTST_MASK         0x3
+#define USE1_TEST_ZTST_NONE         0
+#define USE1_TEST_ZTST_ZERO         1
+#define USE1_TEST_ZTST_NOTZERO      2
+#define USE1_TEST_STST_SHIFT        10
+#define USE1_TEST_STST_MASK         0x3
+#define USE1_TEST_STST_NONE         0
+#define USE1_TEST_PDST_SHIFT        2
+#define USE1_TEST_PDST_MASK         0x3
+#define USE0_TEST_WBEN               0x00100000U
+#define USE0_TEST_ALUSEL_SHIFT      18
+#define USE0_TEST_ALUSEL_MASK       0x3
+#define USE0_TEST_ALUSEL_BITWISE    3
+#define USE0_TEST_ALUOP_SHIFT       14
+#define USE0_TEST_ALUOP_MASK        0xF
+#define USE0_TEST_ALUOP_BW_AND      0
+#define USE0_TEST_ALUOP_BW_OR       1
+#define USE0_TEST_ALUOP_BW_XOR      2
+#define USE0_TEST_ALUOP_BW_SHL      3
+#define USE0_TEST_ALUOP_BW_SHR      4
+#define USE0_TEST_ALUOP_BW_ASR      7
+
+/*
+ * Бітові операції — `sgxdefs.h:5603..5630`. Опкод задає ГРУПУ (ANDOR, XOR,
+ * SHLROL, SHRASR), а однобітове поле OP2 (біт 3) вибирає всередині неї.
+ * SRC2INV інвертує друге джерело, SRC2ROT крутить його перед операцією.
+ */
+#define USE1_BITWISE_OP2_SHIFT      3
+#define USE1_BITWISE_OP2_MASK       0x1
+#define USE1_BITWISE_SRC2INV        0x00000800U
+#define USE1_BITWISE_SRC2ROT_SHIFT  6
+#define USE1_BITWISE_SRC2ROT_MASK   0x1F
+#define USE1_BITWISE_PARTIAL        0x00000004U
+
+/*
+ * MOVC — `sgxdefs.h:5375..5393`. Поле TSTDTYPE = UNCOND означає звичайний
+ * `mov dst, src1` без умови; саме в такій формі мікроядро копіює вторинні
+ * атрибути в тимчасові регістри.
+ */
+#define USE1_MOVC_TSTDTYPE_SHIFT    8
+#define USE1_MOVC_TSTDTYPE_MASK     0x7
+#define USE1_MOVC_TSTDTYPE_UNCOND   0
+
+/* EMIT — `sgxdefs.h:6684..6702`. */
+#define USE1_EMIT_TARGET_SHIFT      14
+#define USE1_EMIT_TARGET_MASK       0x3
+#define USE1_EMIT_TARGET_PDS        2
+
+/*
+ * Sideband 0 програми PDS — `sgxdefs.h:7298..7306`. Саме звідси модель бере
+ * розмір сегмента даних запущеної програми, а не з припущення: поле
+ * PDSDATASIZE (біти 27:23) рахується в одиницях по 16 Б. У нашому образі
+ * `mov r0, #0x01800800` (мітка `IUKP1_PDSConstSizeSec`) дає
+ * (0x01800800 >> 23) & 0x1F = 3, тобто 48 Б — рівно 3 «рядки» розбирача.
+ */
+#define PDSSB0_PDSDATASIZE_SHIFT    23
+#define PDSSB0_PDSDATASIZE_MASK     0x1F
+#define PDSSB0_USEATTRSIZE_SHIFT    8
+#define PDSSB0_USEATTRSIZE_MASK     0xFF
+#define PDSSB0_SIZE_ALIGNSHIFT      4
+
+/* Кількість тимчасових регістрів USE, які тримає мікроядро (sgx_mkif.h:165). */
+#define USE_NUM_TEMPS               32
+#define USE_NUM_PREDICATES          4
+
 #endif /* HW_DISPLAY_CLARION_SGX_H */

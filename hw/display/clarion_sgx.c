@@ -89,6 +89,8 @@
 #define SGX_WR_JOURNAL      512
 #define SGX_FIND_TARGETS    8
 #define SGX_USE_QUEUE       16
+#define SGX_MAX_DEPTH       8
+#define SGX_USE_MAX_STEPS   4096
 
 typedef struct ClarionSgxDump {
     uint32_t va;
@@ -141,9 +143,10 @@ struct ClarionSgxState {
     unsigned sa_count;
     uint32_t sa_sbase;          /* SBASE останнього DOUTD — для самоперевірки */
 
-    /* Точки входу задач USE, які запустив DOUTU. Виконання — M3-B2. */
+    /* Точки входу задач USE, які запустив DOUTU. */
     uint32_t use_queue[SGX_USE_QUEUE];
     unsigned nuse;
+    unsigned nstores;           /* скільки stad справді лягло в пам'ять гостя */
 
     /* QY8_SGX_PDS_RUN — діагностичний запуск названої програми PDS. */
     uint32_t run_va;
@@ -154,6 +157,25 @@ struct ClarionSgxState {
 typedef struct ClarionSgxState ClarionSgxState;
 
 OBJECT_DECLARE_SIMPLE_TYPE(ClarionSgxState, CLARION_SGX)
+
+/*
+ * Друк траси. Виконання й докладність звіту — різні речі: гість б'є в
+ * EVENT_KICK2 багато разів, і виконувати ланцюг треба щоразу, а заливати
+ * стерр повним розбором — лише на перших QY8_SGX_KICKS.
+ */
+static bool sgx_silent;
+
+static void G_GNUC_PRINTF(1, 2) sgx_pr(const char *fmt, ...)
+{
+    va_list ap;
+
+    if (sgx_silent) {
+        return;
+    }
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+}
 
 static uint32_t sgx_reg(ClarionSgxState *s, hwaddr off)
 {
@@ -173,6 +195,21 @@ static uint32_t sgx_phys_ld32(uint32_t pa)
     address_space_read(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED,
                        &v, sizeof(v));
     return le32_to_cpu(v);
+}
+
+/*
+ * Записати слово у ФІЗИЧНУ пам'ять гостя.
+ *
+ * ⚠ Єдине місце, де модель змінює те, що бачить гість. Воно на шляху лише
+ * тоді, коли мікроядро справді виконало `stad` — і працює лише під
+ * QY8_SGX_EXEC. Нічого «про запас» тут не пишеться.
+ */
+static void sgx_phys_st32(uint32_t pa, uint32_t val)
+{
+    uint32_t v = cpu_to_le32(val);
+
+    address_space_write(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED,
+                        &v, sizeof(v));
 }
 
 /*
@@ -447,8 +484,17 @@ typedef struct ClarionPdsCtx {
     uint32_t ir[2];             /* вхідні регістри задачі */
     bool ir_known[2];
 
+    unsigned depth;             /* глибина вкладеності PDS -> USE -> PDS */
     const char *stop;           /* чому виконання спинено, або NULL */
 } ClarionPdsCtx;
+
+/*
+ * PDS і USE запускають одне одного: `MOVS DOUTU` віддає керування задачі USE,
+ * а її `emitpds` запускає наступну програму PDS. Тому — взаємна рекурсія і
+ * одна форвард-декларація.
+ */
+static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
+                        uint32_t entry, unsigned depth);
 
 /*
  * Зсув константи ds<bank>[k] у сегменті даних, у двійних словах. Дослівно
@@ -569,7 +615,7 @@ static void pds_doutd(ClarionPdsCtx *c, const uint32_t *emit, unsigned n)
     unsigned line, i, copied = 0;
 
     if (n < PDS_NUM_DMA_CONTROL_WORDS) {
-        fprintf(stderr, "[sgx]       DOUTD: операнди не розв'язані\n");
+        sgx_pr("[sgx]       DOUTD: операнди не розв'язані\n");
         c->stop = "DOUTD без розв'язаних операндів";
         return;
     }
@@ -582,31 +628,31 @@ static void pds_doutd(ClarionPdsCtx *c, const uint32_t *emit, unsigned n)
     instr = (ctl >> PDS_DOUTD1_INSTR_SHIFT) & 3;
     bytes = bsize * blines * 4;
 
-    fprintf(stderr, "[sgx]       DOUTD: SBASE=%08x  DOUTD1=%08x\n", sbase, ctl);
-    fprintf(stderr, "[sgx]              BSIZE=%u BLINES=%u AO=%u STRIDE=%u"
+    sgx_pr("[sgx]       DOUTD: SBASE=%08x  DOUTD1=%08x\n", sbase, ctl);
+    sgx_pr("[sgx]              BSIZE=%u BLINES=%u AO=%u STRIDE=%u"
             " INSTR=%u STYPE=%u -> %u Б з %08x\n", bsize, blines, ao, stride,
             instr, !!(ctl & PDS_DOUTD1_STYPE), bytes, sbase);
     if (!sgx_translate(c->pd, sbase, &pa)) {
-        fprintf(stderr, "[sgx]              ⚠ джерело DMA НЕ відображене в цьому"
+        sgx_pr("[sgx]              ⚠ джерело DMA НЕ відображене в цьому"
                 " каталозі\n");
         if (c->exec) {
             c->stop = "джерело DOUTD не відображене";
         }
         return;
     }
-    fprintf(stderr, "[sgx]              джерело DMA відображене: PA %08x\n", pa);
+    sgx_pr("[sgx]              джерело DMA відображене: PA %08x\n", pa);
 
     if (!c->exec) {
         return;
     }
     if (instr != PDS_DOUTD1_INSTR_NORMAL) {
-        fprintf(stderr, "[sgx]              ⚠ INSTR=%u не NORMAL — не виконуємо\n",
+        sgx_pr("[sgx]              ⚠ INSTR=%u не NORMAL — не виконуємо\n",
                 instr);
         c->stop = "режим DOUTD не NORMAL";
         return;
     }
     if (ao + bsize * blines > SGX_SA_DWORDS) {
-        fprintf(stderr, "[sgx]              ⚠ DMA не влазить у банк атрибутів\n");
+        sgx_pr("[sgx]              ⚠ DMA не влазить у банк атрибутів\n");
         c->stop = "DOUTD за межами банку вторинних атрибутів";
         return;
     }
@@ -618,7 +664,7 @@ static void pds_doutd(ClarionPdsCtx *c, const uint32_t *emit, unsigned n)
             uint32_t src_pa;
 
             if (!sgx_translate(c->pd, src_va, &src_pa)) {
-                fprintf(stderr, "[sgx]              ⚠ рядок %u слово %u: VA %08x"
+                sgx_pr("[sgx]              ⚠ рядок %u слово %u: VA %08x"
                         " не відображений — DMA спинено\n", line, i, src_va);
                 c->stop = "розрив у джерелі DOUTD";
                 return;
@@ -631,7 +677,7 @@ static void pds_doutd(ClarionPdsCtx *c, const uint32_t *emit, unsigned n)
     if (ao + copied > c->s->sa_count) {
         c->s->sa_count = ao + copied;
     }
-    fprintf(stderr, "[sgx]              ✔ ВИКОНАНО: %u двійних слів -> sa[%u..%u]\n",
+    sgx_pr("[sgx]              ✔ ВИКОНАНО: %u двійних слів -> sa[%u..%u]\n",
             copied, ao, ao + copied - 1);
 }
 
@@ -645,7 +691,7 @@ static void pds_doutu(ClarionPdsCtx *c, const uint32_t *emit, unsigned n)
     uint32_t w0, w1, cbase, coff, exe, exeaddr, va;
 
     if (n < PDS_NUM_USE_TASK_CONTROL_WORDS) {
-        fprintf(stderr, "[sgx]       DOUTU: операнди не розв'язані\n");
+        sgx_pr("[sgx]       DOUTU: операнди не розв'язані\n");
         if (c->exec) {
             c->stop = "DOUTU без розв'язаних операндів";
         }
@@ -660,13 +706,13 @@ static void pds_doutu(ClarionPdsCtx *c, const uint32_t *emit, unsigned n)
               (exe << PDS_DOUTU0_EXE_ALIGNSHIFT);
     va = c->use_base[cbase] + exeaddr;
 
-    fprintf(stderr, "[sgx]       DOUTU: %08x %08x %08x\n", w0, w1, emit[2]);
-    fprintf(stderr, "[sgx]              CBASE=%u -> USE_CODE_BASE_%u=%08x;"
+    sgx_pr("[sgx]       DOUTU: %08x %08x %08x\n", w0, w1, emit[2]);
+    sgx_pr("[sgx]              CBASE=%u -> USE_CODE_BASE_%u=%08x;"
             " COFF=%x EXE=%03x -> зсув 0x%05x\n",
             cbase, cbase, c->use_base[cbase], coff, exe, exeaddr);
-    fprintf(stderr, "[sgx]              ➜ ТОЧКА ВХОДУ ЗАДАЧІ USE: device VA %08x%s\n",
+    sgx_pr("[sgx]              ➜ ТОЧКА ВХОДУ ЗАДАЧІ USE: device VA %08x%s\n",
             va, (w0 & PDS_DOUTU0_PDSDMADEP) ? "  [PDSDMADEPENDENCY]" : "");
-    fprintf(stderr, "[sgx]              MODE=%s\n",
+    sgx_pr("[sgx]              MODE=%s\n",
             (w1 >> PDS_DOUTU1_MODE_SHIFT) & 1 ? "PERINSTANCE" : "PARALLEL");
 
     if (!c->exec) {
@@ -679,11 +725,9 @@ static void pds_doutu(ClarionPdsCtx *c, const uint32_t *emit, unsigned n)
      */
     if (c->s->nuse < SGX_USE_QUEUE) {
         c->s->use_queue[c->s->nuse++] = va;
-        fprintf(stderr, "[sgx]              ✔ поставлено в чергу задач USE (#%u);"
-                " виконання задачі — M3-B2\n", c->s->nuse);
-    } else {
-        fprintf(stderr, "[sgx]              ⚠ черга задач USE переповнена\n");
     }
+    sgx_pr("[sgx]              ✔ ЗАПУСК задачі USE @%08x\n", va);
+    sgx_use_run(c->s, c->pd, c->use_base[cbase], va, c->depth + 1);
 }
 
 /*
@@ -701,7 +745,7 @@ static void pds_doutu(ClarionPdsCtx *c, const uint32_t *emit, unsigned n)
  */
 static void sgx_pds_run(ClarionSgxState *s, uint32_t pd, uint32_t data_va,
                         uint32_t rows, const char *what, bool have_ir0,
-                        uint32_t ir0)
+                        uint32_t ir0, unsigned depth)
 {
     ClarionPdsCtx c;
     uint32_t pc = 0, i;
@@ -717,6 +761,7 @@ static void sgx_pds_run(ClarionSgxState *s, uint32_t pd, uint32_t data_va,
     c.ndwords = rows * 2 * PDS_NUM_DWORDS_PER_ROW;
     c.code_va = data_va + 4 * c.ndwords;
     c.exec = s->exec;
+    c.depth = depth;
     for (i = 0; i < 16; i++) {
         c.use_base[i] = pds_use_code_base(s, i);
     }
@@ -725,13 +770,18 @@ static void sgx_pds_run(ClarionSgxState *s, uint32_t pd, uint32_t data_va,
         c.ir_known[0] = true;
     }
 
-    fprintf(stderr, "[sgx]   %s програми PDS (%s):\n",
+    if (depth > SGX_MAX_DEPTH) {
+        sgx_pr("[sgx]   ⛔ глибина PDS/USE > %u — спинено\n",
+                SGX_MAX_DEPTH);
+        return;
+    }
+    sgx_pr("[sgx]   %*s%s програми PDS (%s):\n", 2 * depth, "",
             c.exec ? "ВИКОНАННЯ" : "розбір", what);
-    fprintf(stderr, "[sgx]     сегмент даних %08x, рядків %u -> %u двійних слів"
+    sgx_pr("[sgx]     сегмент даних %08x, рядків %u -> %u двійних слів"
             " (%u Б)\n", c.data_va, rows, c.ndwords, 4 * c.ndwords);
-    fprintf(stderr, "[sgx]     код з %08x\n", c.code_va);
+    sgx_pr("[sgx]     код з %08x\n", c.code_va);
     if (have_ir0) {
-        fprintf(stderr, "[sgx]     ir0 = %08x%s\n", ir0,
+        sgx_pr("[sgx]     ir0 = %08x%s\n", ir0,
                 ir0 ? "" : "  (нуль = холодний старт, не відновлення заліза —"
                            " sgx_init.use.asm:93..104)");
     }
@@ -741,7 +791,7 @@ static void sgx_pds_run(ClarionSgxState *s, uint32_t pd, uint32_t data_va,
         bool cc_known, taken;
 
         if (!sgx_translate(pd, c.code_va + pc, &pa)) {
-            fprintf(stderr, "[sgx]     +0x%02x: не відображено — спинено\n", pc);
+            sgx_pr("[sgx]     +0x%02x: не відображено — спинено\n", pc);
             c.stop = "код не відображений";
             break;
         }
@@ -750,27 +800,27 @@ static void sgx_pds_run(ClarionSgxState *s, uint32_t pd, uint32_t data_va,
         type = (w >> PDS_TYPE_SHIFT) & 7;
         cc = (w >> PDS_CC_SHIFT) & 7;
 
-        fprintf(stderr, "[sgx]     +0x%02x: %08x  група=%u тип=%u cc=%u", pc, w,
+        sgx_pr("[sgx]     +0x%02x: %08x  група=%u тип=%u cc=%u", pc, w,
                 group, type, cc);
 
         taken = pds_cc_true(&c, cc, &cc_known);
         if (c.exec && !cc_known) {
-            fprintf(stderr, "  ⚠ умова невідома — спинено\n");
+            sgx_pr("  ⚠ умова невідома — спинено\n");
             c.stop = "невідома умова виконання";
             break;
         }
         if (c.exec && !taken) {
-            fprintf(stderr, "  (умова хибна — пропущено)\n");
+            sgx_pr("  (умова хибна — пропущено)\n");
             pc += PDS_INSTRUCTION_SIZE;
             continue;
         }
 
         if (group == PDS_INST_FLOW && type == PDS_TYPE_HALT) {
-            fprintf(stderr, "  HALT\n");
+            sgx_pr("  HALT\n");
             break;
         }
         if (group == PDS_INST_FLOW && type == PDS_TYPE_NOP) {
-            fprintf(stderr, "  NOP\n");
+            sgx_pr("  NOP\n");
             pc += PDS_INSTRUCTION_SIZE;
             continue;
         }
@@ -788,35 +838,35 @@ static void sgx_pds_run(ClarionSgxState *s, uint32_t pd, uint32_t data_va,
 
             if (use_src2) {
                 known = pds_ds_read(&c, 1, src2, &val);
-                fprintf(stderr, "  %s p%u, ds1[%u]",
+                sgx_pr("  %s p%u, ds1[%u]",
                         type == PDS_TYPE_TSTZ ? "TSTZ" : "TSTN", dst, src2);
             } else if (src1_reg) {
                 known = src1 < 2 && c.ir_known[src1];
                 val = src1 < 2 ? c.ir[src1] : 0;
-                fprintf(stderr, "  %s p%u, ir%u",
+                sgx_pr("  %s p%u, ir%u",
                         type == PDS_TYPE_TSTZ ? "TSTZ" : "TSTN", dst, src1);
             } else {
                 known = pds_ds_read(&c, 0, src1, &val);
-                fprintf(stderr, "  %s p%u, ds0[%u]",
+                sgx_pr("  %s p%u, ds0[%u]",
                         type == PDS_TYPE_TSTZ ? "TSTZ" : "TSTN", dst, src1);
             }
             if (known) {
-                fprintf(stderr, " = %08x", val);
+                sgx_pr(" = %08x", val);
             }
             if (dst < 3) {
                 c.pred_known[dst] = known;
                 c.pred[dst] = known &&
                     (type == PDS_TYPE_TSTZ ? val == 0 : (int32_t)val < 0);
                 if (known) {
-                    fprintf(stderr, " -> p%u=%u", dst, c.pred[dst]);
+                    sgx_pr(" -> p%u=%u", dst, c.pred[dst]);
                 }
             }
             if (c.exec && !known) {
-                fprintf(stderr, "  ⚠ джерело невідоме — спинено\n");
+                sgx_pr("  ⚠ джерело невідоме — спинено\n");
                 c.stop = "джерело TST невідоме";
                 break;
             }
-            fprintf(stderr, "\n");
+            sgx_pr("\n");
             pc += PDS_INSTRUCTION_SIZE;
             continue;
         }
@@ -824,7 +874,7 @@ static void sgx_pds_run(ClarionSgxState *s, uint32_t pd, uint32_t data_va,
             (type == PDS_TYPE_BRA || type == PDS_TYPE_CALL)) {
             uint32_t dest = (w & PDS_FLOW_DEST_MASK) << PDS_FLOW_DEST_ALIGNSHIFT;
 
-            fprintf(stderr, "  %s -> інструкція %u (+0x%02x)\n",
+            sgx_pr("  %s -> інструкція %u (+0x%02x)\n",
                     type == PDS_TYPE_BRA ? "BRA" : "CALL",
                     dest >> PDS_FLOW_DEST_ALIGNSHIFT, dest);
             if (!c.exec) {
@@ -842,7 +892,7 @@ static void sgx_pds_run(ClarionSgxState *s, uint32_t pd, uint32_t data_va,
             continue;
         }
         if (group == PDS_INST_FLOW && type == PDS_TYPE_RTN) {
-            fprintf(stderr, "  RTN\n");
+            sgx_pr("  RTN\n");
             if (!c.exec) {
                 pc += PDS_INSTRUCTION_SIZE;
                 continue;
@@ -864,7 +914,7 @@ static void sgx_pds_run(ClarionSgxState *s, uint32_t pd, uint32_t data_va,
             uint32_t val = 0;
             bool known = false;
 
-            fprintf(stderr, "  MOV32 ds%u[%u] <- ", dstsel, dst);
+            sgx_pr("  MOV32 ds%u[%u] <- ", dstsel, dst);
             if (srcsel == PDS_MOV32_SRCSEL_REG) {
                 /*
                  * ir0/ir1 тут закодовані як 0x00/0x02 (`sgxdefs.h:2829`),
@@ -875,27 +925,27 @@ static void sgx_pds_run(ClarionSgxState *s, uint32_t pd, uint32_t data_va,
 
                     known = c.ir_known[k];
                     val = c.ir[k];
-                    fprintf(stderr, "ir%u", k);
+                    sgx_pr("ir%u", k);
                 } else {
-                    fprintf(stderr, "reg[%u]", src);
+                    sgx_pr("reg[%u]", src);
                 }
             } else {
                 known = pds_ds_read(&c, srcsel, src, &val);
-                fprintf(stderr, "ds%u[%u]", srcsel, src);
+                sgx_pr("ds%u[%u]", srcsel, src);
             }
             if (known) {
-                fprintf(stderr, " = %08x", val);
+                sgx_pr(" = %08x", val);
                 if (!pds_ds_write(&c, dstsel, dst, val) && c.exec) {
-                    fprintf(stderr, "  ⚠ приймач не тимчасовий — спинено\n");
+                    sgx_pr("  ⚠ приймач не тимчасовий — спинено\n");
                     c.stop = "MOV32 пише в константу";
                     break;
                 }
             } else if (c.exec) {
-                fprintf(stderr, "  ⚠ джерело невідоме — спинено\n");
+                sgx_pr("  ⚠ джерело невідоме — спинено\n");
                 c.stop = "джерело MOV32 невідоме";
                 break;
             }
-            fprintf(stderr, "\n");
+            sgx_pr("\n");
             pc += PDS_INSTRUCTION_SIZE;
             continue;
         }
@@ -932,7 +982,7 @@ static void sgx_pds_run(ClarionSgxState *s, uint32_t pd, uint32_t data_va,
                 n++;
             }
 
-            fprintf(stderr, "  MOVS dest=%u src1=%s[%u] src2=ds1[%u]"
+            sgx_pr("  MOVS dest=%u src1=%s[%u] src2=ds1[%u]"
                     " (розв'язано %u)\n",
                     dest, s1_ds0 ? "ds0" : "reg", d1, d2, n);
             if (dest == PDS_MOVS_DEST_DOUTD) {
@@ -940,7 +990,7 @@ static void sgx_pds_run(ClarionSgxState *s, uint32_t pd, uint32_t data_va,
             } else if (dest == PDS_MOVS_DEST_DOUTU) {
                 pds_doutu(&c, emit, n);
             } else if (c.exec) {
-                fprintf(stderr, "[sgx]       ⚠ приймач MOVS %u не тлумачимо —"
+                sgx_pr("[sgx]       ⚠ приймач MOVS %u не тлумачимо —"
                         " спинено\n", dest);
                 c.stop = "нетлумачений приймач MOVS";
             }
@@ -950,7 +1000,7 @@ static void sgx_pds_run(ClarionSgxState *s, uint32_t pd, uint32_t data_va,
             pc += PDS_INSTRUCTION_SIZE;
             continue;
         }
-        fprintf(stderr, "  (не тлумачимо)\n");
+        sgx_pr("  (не тлумачимо)\n");
         if (c.exec) {
             c.stop = "нетлумачена інструкція";
             break;
@@ -959,9 +1009,705 @@ static void sgx_pds_run(ClarionSgxState *s, uint32_t pd, uint32_t data_va,
     }
 
     if (c.stop) {
-        fprintf(stderr, "[sgx]     ⛔ виконання спинено: %s\n", c.stop);
+        sgx_pr("[sgx]     ⛔ виконання спинено: %s\n", c.stop);
     } else if (steps >= 256) {
-        fprintf(stderr, "[sgx]     ⛔ ліміт кроків — спинено\n");
+        sgx_pr("[sgx]     ⛔ ліміт кроків — спинено\n");
+    }
+}
+
+
+/* --- задача USE: розбір і виконання (усе за публічним DDK, SGX540) ----- */
+
+/*
+ * Банки регістрів USE. Модель підтримує рівно ті, що трапляються на
+ * виміряному шляху ([20]/[22] репозиторію): тимчасові, вторинні атрибути й
+ * безпосередні значення. Решта — чесний відмова, а не тихий нуль.
+ */
+typedef enum {
+    USE_BANK_TEMP,
+    USE_BANK_SECATTR,
+    USE_BANK_IMMEDIATE,
+    USE_BANK_UNSUPPORTED,
+} ClarionUseBank;
+
+typedef struct ClarionUseCtx {
+    ClarionSgxState *s;
+    uint32_t pd;
+    unsigned depth;
+
+    uint32_t r[USE_NUM_TEMPS];
+    bool r_known[USE_NUM_TEMPS];
+    bool pred[USE_NUM_PREDICATES];
+
+    uint32_t code_base;         /* вікно EUR_CR_USE_CODE_BASE_n цієї задачі */
+    uint32_t link;              /* регістр зв'язку для ba.savelink/lapc */
+    bool link_known;
+
+    const char *stop;
+} ClarionUseCtx;
+
+/* Банк джерела S0: один біт, розширення — прапорцем S0BEXT. */
+static ClarionUseBank use_bank_s0(uint32_t w1)
+{
+    uint32_t b = (w1 >> USE1_S0BANK_SHIFT) & USE1_S0BANK_MASK;
+
+    if (w1 & USE1_S0BEXT) {
+        return b == USE_S0EXTBANK_SECATTR ? USE_BANK_SECATTR
+                                          : USE_BANK_UNSUPPORTED;
+    }
+    return b == USE_S0STDBANK_TEMP ? USE_BANK_TEMP : USE_BANK_UNSUPPORTED;
+}
+
+/* Банк джерел S1/S2: два біти, розширення — прапорцем S1BEXT/S2BEXT. */
+static ClarionUseBank use_bank_s12(uint32_t bank, bool ext)
+{
+    if (ext) {
+        switch (bank) {
+        case USE_S12EXTBANK_IMMEDIATE: return USE_BANK_IMMEDIATE;
+        default:                       return USE_BANK_UNSUPPORTED;
+        }
+    }
+    switch (bank) {
+    case USE_S12STDBANK_TEMP:    return USE_BANK_TEMP;
+    case USE_S12STDBANK_SECATTR: return USE_BANK_SECATTR;
+    default:                     return USE_BANK_UNSUPPORTED;
+    }
+}
+
+static const char *use_bank_name(ClarionUseBank b)
+{
+    switch (b) {
+    case USE_BANK_TEMP:      return "r";
+    case USE_BANK_SECATTR:   return "sa";
+    case USE_BANK_IMMEDIATE: return "#";
+    default:                 return "?";
+    }
+}
+
+/* Прочитати операнд. Невідоме значення — це false, а не вигаданий нуль. */
+static bool use_read(ClarionUseCtx *c, ClarionUseBank bank, uint32_t num,
+                     uint32_t *out)
+{
+    switch (bank) {
+    case USE_BANK_IMMEDIATE:
+        *out = num;
+        return true;
+    case USE_BANK_TEMP:
+        if (num >= USE_NUM_TEMPS || !c->r_known[num]) {
+            return false;
+        }
+        *out = c->r[num];
+        return true;
+    case USE_BANK_SECATTR:
+        if (num >= SGX_SA_DWORDS || !c->s->sa_known[num]) {
+            return false;
+        }
+        *out = c->s->sa[num];
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool use_write(ClarionUseCtx *c, ClarionUseBank bank, uint32_t num,
+                      uint32_t val)
+{
+    if (bank == USE_BANK_TEMP && num < USE_NUM_TEMPS) {
+        c->r[num] = val;
+        c->r_known[num] = true;
+        return true;
+    }
+    if (bank == USE_BANK_SECATTR && num < SGX_SA_DWORDS) {
+        c->s->sa[num] = val;
+        c->s->sa_known[num] = true;
+        if (num + 1 > c->s->sa_count) {
+            c->s->sa_count = num + 1;
+        }
+        return true;
+    }
+    return false;
+}
+
+/* Банк приймача D1. */
+static ClarionUseBank use_bank_dst(uint32_t w1)
+{
+    uint32_t b = (w1 >> USE1_D1BANK_SHIFT) & USE1_D1BANK_MASK;
+
+    if (w1 & USE1_DBEXT) {
+        return b == USE_D1EXTBANK_SECATTR ? USE_BANK_SECATTR
+                                          : USE_BANK_UNSUPPORTED;
+    }
+    return b == USE_D1STDBANK_TEMP ? USE_BANK_TEMP : USE_BANK_UNSUPPORTED;
+}
+
+/*
+ * Предикат інструкції (`sgxdefs.h:5166..5176`). `PNMOD4` залежить від номера
+ * екземпляра задачі, якого ми не моделюємо, — тож не вгадуємо.
+ */
+static bool use_pred_true(ClarionUseCtx *c, uint32_t epred, bool *known)
+{
+    *known = true;
+    switch (epred) {
+    case USE1_EPRED_ALWAYS: return true;
+    case USE1_EPRED_P0:     return c->pred[0];
+    case USE1_EPRED_P1:     return c->pred[1];
+    case USE1_EPRED_P2:     return c->pred[2];
+    case USE1_EPRED_P3:     return c->pred[3];
+    case USE1_EPRED_NOTP0:  return !c->pred[0];
+    case USE1_EPRED_NOTP1:  return !c->pred[1];
+    default:
+        *known = false;
+        return false;
+    }
+}
+
+/* Множник зсуву в ldad/stad: одиниця адресації дорівнює ширині доступу. */
+static uint32_t use_ldst_scale(uint32_t w1)
+{
+    switch ((w1 >> USE1_LDST_DTYPE_SHIFT) & USE1_LDST_DTYPE_MASK) {
+    case USE1_LDST_DTYPE_32BIT: return 4;
+    case USE1_LDST_DTYPE_16BIT: return 2;
+    case USE1_LDST_DTYPE_8BIT:  return 1;
+    default:                    return 0;
+    }
+}
+
+/*
+ * Виконати задачу USE від точки входу.
+ *
+ * Підтримано рівно той набір класів, який виміряла T4 на досяжному шляху
+ * (docs/sgx/22 §4). Усе інше зупиняє виконання з названою причиною: модель
+ * радше зізнається, що не вміє, ніж вдасть, ніби виконала.
+ */
+static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
+                        uint32_t entry, unsigned depth)
+{
+    ClarionUseCtx c;
+    uint32_t pc = entry;
+    unsigned steps = 0;
+    const char *ind;
+
+    if (depth > SGX_MAX_DEPTH) {
+        sgx_pr("[sgx]   ⛔ глибина PDS/USE > %u — спинено\n",
+                SGX_MAX_DEPTH);
+        return;
+    }
+
+    memset(&c, 0, sizeof(c));
+    c.s = s;
+    c.pd = pd;
+    c.depth = depth;
+    c.code_base = code_base;
+    ind = "";
+
+    sgx_pr("[sgx]   %*sВИКОНАННЯ задачі USE @%08x (вікно коду %08x):\n",
+            2 * depth, ind, entry, code_base);
+
+    while (steps++ < SGX_USE_MAX_STEPS) {
+        uint32_t pa, w0, w1, op, epred, dst, src0, src1, src2;
+        bool pred_known, taken, is_end = false;
+
+        if (!sgx_translate(pd, pc, &pa)) {
+            sgx_pr("[sgx]     %*s%08x: не відображено — спинено\n",
+                    2 * depth, ind, pc);
+            c.stop = "код USE не відображений";
+            break;
+        }
+        w0 = sgx_phys_ld32(pa);
+        w1 = sgx_phys_ld32(pa + 4);
+        op = (w1 >> USE1_OP_SHIFT) & 0x1F;
+        epred = (w1 >> USE1_EPRED_SHIFT) & USE1_EPRED_MASK;
+        dst = (w0 >> USE0_DST_SHIFT) & USE0_REG_MASK;
+        src0 = (w0 >> USE0_SRC0_SHIFT) & USE0_REG_MASK;
+        src1 = (w0 >> USE0_SRC1_SHIFT) & USE0_REG_MASK;
+        src2 = (w0 >> USE0_SRC2_SHIFT) & USE0_REG_MASK;
+
+        sgx_pr("[sgx]     %*s%08x: %08x %08x ", 2 * depth, ind,
+                pc, w0, w1);
+
+        /*
+         * Предикат для LIMM лежить не там, де в решти (`sgxdefs.h:7443`), а
+         * гілки несуть його у звичайному полі. Щоб не тлумачити випадкові
+         * біти як предикат, гейтимо лише ті опкоди, для яких поле EPRED
+         * справді на місці: TEST, LD, ST і потік керування.
+         */
+        if (op == USE1_OP_TEST || op == USE1_OP_LD || op == USE1_OP_ST ||
+            (op == USE1_OP_SPECIAL &&
+             ((w1 >> USE1_SPECIAL_OPCAT_SHIFT) & USE1_SPECIAL_OPCAT_MASK) ==
+             USE1_SPECIAL_OPCAT_FLOWCTRL)) {
+            taken = use_pred_true(&c, epred, &pred_known);
+            if (!pred_known) {
+                sgx_pr(" ⚠ предикат %u не моделюємо — спинено\n",
+                        epred);
+                c.stop = "предикат USE не моделюємо";
+                break;
+            }
+            if (!taken) {
+                sgx_pr(" (предикат хибний — пропущено)\n");
+                pc += USE_INST_SIZE;
+                continue;
+            }
+        }
+
+        switch (op) {
+        case USE1_OP_SPECIAL: {
+            uint32_t cat = (w1 >> USE1_SPECIAL_OPCAT_SHIFT) &
+                           USE1_SPECIAL_OPCAT_MASK;
+
+            if (cat == USE1_SPECIAL_OPCAT_FLOWCTRL) {
+                uint32_t op2 = (w1 >> USE1_FLOWCTRL_OP2_SHIFT) &
+                               USE1_FLOWCTRL_OP2_MASK;
+
+                if (op2 == USE1_FLOWCTRL_OP2_NOP) {
+                    is_end = (w1 & USE1_END) != 0;
+                    sgx_pr("nop%s\n", is_end ? ".end" : "");
+                    break;
+                }
+                if (op2 == USE1_FLOWCTRL_OP2_BA) {
+                    /*
+                     * `ba` — абсолютна гілка В МЕЖАХ вікна коду задачі, а не
+                     * від нуля: поле несе НОМЕР ПАРИ від бази
+                     * `EUR_CR_USE_CODE_BASE_n`, з якої задачу запустив DOUTU.
+                     */
+                    uint32_t target = c.code_base +
+                                      (w0 & USE0_BRANCH_OFFSET_MASK) *
+                                      USE_INST_SIZE;
+
+                    if (w1 & USE1_BRANCH_SAVELINK) {
+                        c.link = pc + USE_INST_SIZE;
+                        c.link_known = true;
+                        sgx_pr("ba.savelink -> %08x (link=%08x)\n",
+                                target, c.link);
+                    } else {
+                        sgx_pr("ba -> %08x\n", target);
+                    }
+                    pc = target;
+                    continue;
+                }
+                if (op2 == USE1_FLOWCTRL_OP2_LAPC) {
+                    if (!c.link_known) {
+                        sgx_pr("lapc  ⚠ регістр зв'язку порожній\n");
+                        c.stop = "lapc без ba.savelink";
+                        break;
+                    }
+                    sgx_pr("lapc -> %08x\n", c.link);
+                    pc = c.link;
+                    c.link_known = false;
+                    continue;
+                }
+                sgx_pr("flowctrl op2=%u — не тлумачимо\n", op2);
+                c.stop = "нетлумачений потік керування USE";
+                break;
+            }
+
+            if (cat == USE1_SPECIAL_OPCAT_MOECTRL) {
+                uint32_t op2 = (w1 >> USE1_MOECTRL_OP2_SHIFT) &
+                               USE1_MOECTRL_OP2_MASK;
+
+                /*
+                 * SMLSI задає режими інкременту MOE для ПОВТОРЮВАНИХ
+                 * інструкцій. На нашому шляху жодна інструкція не має
+                 * лічильника повторів, тож стан MOE ні на що не впливає і
+                 * ми його лише фіксуємо в трасі. Щойно з'явиться повтор —
+                 * це треба буде змоделювати по-справжньому.
+                 */
+                if (op2 == USE1_MOECTRL_OP2_SMLSI) {
+                    sgx_pr("smlsi (стан MOE; повторів на шляху "
+                            "немає — не впливає)\n");
+                    break;
+                }
+                sgx_pr("moectrl op2=%u — не тлумачимо\n", op2);
+                c.stop = "нетлумачений MOE-контроль";
+                break;
+            }
+
+            if (cat == USE1_SPECIAL_OPCAT_OTHER) {
+                uint32_t op2 = (w1 >> USE1_OTHER_OP2_SHIFT) &
+                               USE1_OTHER_OP2_MASK;
+
+                if (op2 == USE1_OTHER_OP2_LIMM) {
+                    uint32_t imm = (w0 & USE0_LIMM_IMML21_MASK) |
+                        (((w1 >> USE1_LIMM_IMM2521_SHIFT) &
+                          USE1_LIMM_IMM2521_MASK) << 21) |
+                        (((w1 >> USE1_LIMM_IMM3126_SHIFT) &
+                          USE1_LIMM_IMM3126_MASK) << 26);
+                    ClarionUseBank db = use_bank_dst(w1);
+
+                    sgx_pr("mov %s%u, #0x%08x", use_bank_name(db),
+                            dst, imm);
+                    if (!use_write(&c, db, dst, imm)) {
+                        sgx_pr("  ⚠ приймач не підтримано\n");
+                        c.stop = "приймач LIMM не підтримано";
+                        break;
+                    }
+                    is_end = (w1 & USE1_END) != 0;
+                    sgx_pr("%s\n", is_end ? "  .end" : "");
+                    break;
+                }
+                if (op2 == USE1_OTHER_OP2_IDF || op2 == USE1_OTHER_OP2_WDF) {
+                    /*
+                     * Наші звернення до пам'яті синхронні, тож черга даних
+                     * завжди порожня і бар'єр справді нічого не робить. Це
+                     * не «пропустили», а «виконали тривіально».
+                     */
+                    sgx_pr("%s drc%u (доступи синхронні)\n",
+                            op2 == USE1_OTHER_OP2_IDF ? "idf" : "wdf", w1 & 3);
+                    break;
+                }
+                if (op2 == USE1_OTHER_OP2_LDRSTR) {
+                    uint32_t num = src2 |
+                        (((w0 >> USE0_LDRSTR_SRC2EXT_SHIFT) &
+                          USE0_LDRSTR_SRC2EXT_MASK)
+                         << USE_LDRSTR_SRC2EXT_INTSHIFT);
+                    uint32_t off = num * 4;
+                    uint32_t val;
+
+                    if (!(w1 & USE1_LDRSTR_DSEL_STORE)) {
+                        sgx_pr("ldr — не тлумачимо\n");
+                        c.stop = "ldr не реалізовано";
+                        break;
+                    }
+                    /*
+                     * ⚠ Дані для запису беруться з SRC1, а НЕ з поля
+                     * призначення: `usedisasm.c:12093..12099` декодує їх саме
+                     * як `DecodeSrc12(..., 1, ..., S1BEXT)`. Спершу я взяв
+                     * DST — і модель писала `r0` там, де еталонний
+                     * дизасемблер IMG каже `r1` або взагалі `#1`.
+                     */
+                    ClarionUseBank sb = use_bank_s12(
+                        (w0 >> USE0_S1BANK_SHIFT) & USE0_BANK_MASK,
+                        (w1 & USE1_S1BEXT) != 0);
+
+                    if (!use_read(&c, sb, src1, &val)) {
+                        sgx_pr("str #%u, %s%u  ⚠ джерело невідоме\n",
+                                num, use_bank_name(sb), src1);
+                        c.stop = "джерело str невідоме";
+                        break;
+                    }
+                    /*
+                     * Номер × 4 = байтовий зсув регістра SGX (docs/sgx/23).
+                     * Пишемо у власне дзеркало регістрів: це той самий банк,
+                     * у який пише гість через MMIO, і саме там програма
+                     * потім шукає task-control.
+                     */
+                    sgx_pr("str #%u, %s%u = %08x  -> рег +0x%04x\n",
+                            num, use_bank_name(sb), src1, val, off);
+                    if (off + 4 <= CLARION_SGX_SIZE) {
+                        s->regs[off / 4] = val;
+                    } else {
+                        c.stop = "str поза вікном регістрів";
+                    }
+                    break;
+                }
+                if (op2 == USE1_OTHER_OP2_EMIT) {
+                    uint32_t target = (w1 >> USE1_EMIT_TARGET_SHIFT) &
+                                      USE1_EMIT_TARGET_MASK;
+                    uint32_t sb0 = 0, addr = 0, ir0 = 0, rows, prog;
+                    uint32_t pds_base = sgx_reg(s, SGX_CR_PDS_EXEC_BASE) &
+                                        SGX_PDS_EXEC_BASE_ADDR_MASK;
+
+                    if (target != USE1_EMIT_TARGET_PDS) {
+                        sgx_pr("emit target=%u — не тлумачимо\n",
+                                target);
+                        c.stop = "emit не до PDS";
+                        break;
+                    }
+                    if (!use_read(&c, USE_BANK_TEMP, src0, &sb0) ||
+                        !use_read(&c, USE_BANK_TEMP, src1, &addr) ||
+                        !use_read(&c, USE_BANK_TEMP, src2, &ir0)) {
+                        sgx_pr("emitpds  ⚠ операнд невідомий\n");
+                        c.stop = "операнд emitpds невідомий";
+                        break;
+                    }
+                    /*
+                     * Адреса — у тому самому кодуванні, що й регістр
+                     * EUR_CR_EVENT_OTHER_PDS_EXEC: поле << 4 під маскою
+                     * ADDR. Розмір сегмента даних — поле PDSDATASIZE
+                     * sideband-слова 0, в одиницях по 16 Б; у розбирачі
+                     * «рядок» і є 16 Б, тому це той самий лічильник.
+                     */
+                    prog = pds_base +
+                           ((addr << 4) & SGX_EVENT_OTHER_PDS_EXEC_ADDR_MASK);
+                    rows = (sb0 >> PDSSB0_PDSDATASIZE_SHIFT) &
+                           PDSSB0_PDSDATASIZE_MASK;
+                    sgx_pr("emitpds r%u=%08x r%u=%08x r%u=%08x\n",
+                            src0, sb0, src1, addr, src2, ir0);
+                    sgx_pr("[sgx]     %*s  -> програма PDS %08x,"
+                            " даних %u × 16 Б, ir0=%08x\n",
+                            2 * depth, ind, prog, rows, ir0);
+                    sgx_pds_run(s, pd, prog, rows, "запущена emitpds",
+                                true, ir0, depth + 1);
+                    break;
+                }
+                sgx_pr("other op2=%u — не тлумачимо\n", op2);
+                c.stop = "нетлумачена інструкція OTHER";
+                break;
+            }
+            sgx_pr("special cat=%u — не тлумачимо\n", cat);
+            c.stop = "нетлумачена інструкція SPECIAL";
+            break;
+        }
+
+        case USE1_OP_TEST: {
+            uint32_t alusel = (w0 >> USE0_TEST_ALUSEL_SHIFT) &
+                              USE0_TEST_ALUSEL_MASK;
+            uint32_t aluop = (w0 >> USE0_TEST_ALUOP_SHIFT) &
+                             USE0_TEST_ALUOP_MASK;
+            uint32_t ztst = (w1 >> USE1_TEST_ZTST_SHIFT) & USE1_TEST_ZTST_MASK;
+            uint32_t stst = (w1 >> USE1_TEST_STST_SHIFT) & USE1_TEST_STST_MASK;
+            uint32_t pdst = (w1 >> USE1_TEST_PDST_SHIFT) & USE1_TEST_PDST_MASK;
+            ClarionUseBank b1 = use_bank_s12((w0 >> USE0_S1BANK_SHIFT) &
+                                             USE0_BANK_MASK,
+                                             (w1 & USE1_S1BEXT) != 0);
+            ClarionUseBank b2 = use_bank_s12((w0 >> USE0_S2BANK_SHIFT) &
+                                             USE0_BANK_MASK,
+                                             (w1 & USE1_S2BEXT) != 0);
+            uint32_t a, b, res;
+            const char *name;
+
+            if (alusel != USE0_TEST_ALUSEL_BITWISE) {
+                sgx_pr("test alusel=%u — не тлумачимо\n", alusel);
+                c.stop = "нецілочисельний TEST";
+                break;
+            }
+            if (stst != USE1_TEST_STST_NONE) {
+                sgx_pr("test зі знаковою перевіркою — не тлумачимо\n");
+                c.stop = "TEST зі знаковою перевіркою";
+                break;
+            }
+            if (!use_read(&c, b1, src1, &a) || !use_read(&c, b2, src2, &b)) {
+                sgx_pr("test  ⚠ джерело невідоме\n");
+                c.stop = "джерело TEST невідоме";
+                break;
+            }
+            switch (aluop) {
+            case USE0_TEST_ALUOP_BW_AND: res = a & b;  name = "and"; break;
+            case USE0_TEST_ALUOP_BW_OR:  res = a | b;  name = "or";  break;
+            case USE0_TEST_ALUOP_BW_XOR: res = a ^ b;  name = "xor"; break;
+            case USE0_TEST_ALUOP_BW_SHL: res = a << (b & 31); name = "shl"; break;
+            case USE0_TEST_ALUOP_BW_SHR: res = a >> (b & 31); name = "shr"; break;
+            case USE0_TEST_ALUOP_BW_ASR:
+                res = (uint32_t)((int32_t)a >> (b & 31)); name = "asr"; break;
+            default:
+                sgx_pr("test aluop=%u — не тлумачимо\n", aluop);
+                c.stop = "нетлумачена операція TEST";
+                res = 0; name = "?";
+                break;
+            }
+            if (c.stop) {
+                break;
+            }
+            sgx_pr("%s.test %s%u, %s%u = %08x", name,
+                    use_bank_name(b1), src1, use_bank_name(b2), src2, res);
+            if (ztst == USE1_TEST_ZTST_ZERO) {
+                c.pred[pdst] = res == 0;
+                sgx_pr(" -> p%u=%u (==0)\n", pdst, c.pred[pdst]);
+            } else if (ztst == USE1_TEST_ZTST_NOTZERO) {
+                c.pred[pdst] = res != 0;
+                sgx_pr(" -> p%u=%u (!=0)\n", pdst, c.pred[pdst]);
+            } else {
+                sgx_pr("  ⚠ ztst=%u не тлумачимо\n", ztst);
+                c.stop = "нетлумачена умова TEST";
+                break;
+            }
+            if (w0 & USE0_TEST_WBEN) {
+                ClarionUseBank db = use_bank_dst(w1);
+
+                if (!use_write(&c, db, dst, res)) {
+                    c.stop = "приймач TEST не підтримано";
+                }
+            }
+            break;
+        }
+
+        case USE1_OP_MOVC: {
+            uint32_t tst = (w1 >> USE1_MOVC_TSTDTYPE_SHIFT) &
+                           USE1_MOVC_TSTDTYPE_MASK;
+            ClarionUseBank b1 = use_bank_s12((w0 >> USE0_S1BANK_SHIFT) &
+                                             USE0_BANK_MASK,
+                                             (w1 & USE1_S1BEXT) != 0);
+            ClarionUseBank db = use_bank_dst(w1);
+            uint32_t val;
+
+            if (tst != USE1_MOVC_TSTDTYPE_UNCOND) {
+                sgx_pr("movc з умовою (tstdtype=%u) — не тлумачимо\n",
+                        tst);
+                c.stop = "умовний movc";
+                break;
+            }
+            if (!use_read(&c, b1, src1, &val)) {
+                sgx_pr("mov %s%u, %s%u  ⚠ джерело невідоме\n",
+                        use_bank_name(db), dst, use_bank_name(b1), src1);
+                c.stop = "джерело mov невідоме";
+                break;
+            }
+            is_end = (w1 & USE1_END) != 0;
+            sgx_pr("mov %s%u, %s%u = %08x%s\n", use_bank_name(db),
+                    dst, use_bank_name(b1), src1, val,
+                    is_end ? "  .end" : "");
+            if (!use_write(&c, db, dst, val)) {
+                c.stop = "приймач mov не підтримано";
+            }
+            break;
+        }
+
+        case USE1_OP_ANDOR:
+        case USE1_OP_XOR:
+        case USE1_OP_SHLROL:
+        case USE1_OP_SHRASR: {
+            uint32_t op2 = (w1 >> USE1_BITWISE_OP2_SHIFT) &
+                           USE1_BITWISE_OP2_MASK;
+            uint32_t rot = (w1 >> USE1_BITWISE_SRC2ROT_SHIFT) &
+                           USE1_BITWISE_SRC2ROT_MASK;
+            ClarionUseBank b1 = use_bank_s12((w0 >> USE0_S1BANK_SHIFT) &
+                                             USE0_BANK_MASK,
+                                             (w1 & USE1_S1BEXT) != 0);
+            ClarionUseBank b2 = use_bank_s12((w0 >> USE0_S2BANK_SHIFT) &
+                                             USE0_BANK_MASK,
+                                             (w1 & USE1_S2BEXT) != 0);
+            ClarionUseBank db = use_bank_dst(w1);
+            uint32_t a, b, res = 0;
+            const char *name = "?";
+
+            if (w1 & USE1_BITWISE_PARTIAL) {
+                sgx_pr("бітова операція з PARTIAL — не тлумачимо\n");
+                c.stop = "PARTIAL у бітовій операції";
+                break;
+            }
+            if (!use_read(&c, b1, src1, &a) || !use_read(&c, b2, src2, &b)) {
+                sgx_pr("бітова операція  ⚠ джерело невідоме\n");
+                c.stop = "джерело бітової операції невідоме";
+                break;
+            }
+            if (rot) {
+                b = (b >> rot) | (b << (32 - rot));
+            }
+            if (w1 & USE1_BITWISE_SRC2INV) {
+                b = ~b;
+            }
+            switch (op) {
+            case USE1_OP_ANDOR:
+                res = op2 ? (a | b) : (a & b);
+                name = op2 ? "or" : "and";
+                break;
+            case USE1_OP_XOR:
+                res = a ^ b;
+                name = "xor";
+                break;
+            case USE1_OP_SHLROL:
+                if (op2) {
+                    res = (b & 31) ? (a << (b & 31)) | (a >> (32 - (b & 31)))
+                                   : a;
+                    name = "rol";
+                } else {
+                    res = (b & 31) ? a << (b & 31) : a;
+                    name = "shl";
+                }
+                break;
+            default:
+                res = op2 ? (uint32_t)((int32_t)a >> (b & 31))
+                          : (a >> (b & 31));
+                name = op2 ? "asr" : "shr";
+                break;
+            }
+            sgx_pr("%s %s%u, %s%u, %s%u = %08x\n", name,
+                    use_bank_name(db), dst, use_bank_name(b1), src1,
+                    use_bank_name(b2), src2, res);
+            if (!use_write(&c, db, dst, res)) {
+                c.stop = "приймач бітової операції не підтримано";
+            }
+            break;
+        }
+
+        case USE1_OP_LD:
+        case USE1_OP_ST: {
+            bool store = op == USE1_OP_ST;
+            ClarionUseBank b0 = use_bank_s0(w1);
+            ClarionUseBank b1 = use_bank_s12((w0 >> USE0_S1BANK_SHIFT) &
+                                             USE0_BANK_MASK,
+                                             (w1 & USE1_S1BEXT) != 0);
+            ClarionUseBank b2 = use_bank_s12((w0 >> USE0_S2BANK_SHIFT) &
+                                             USE0_BANK_MASK,
+                                             (w1 & USE1_S2BEXT) != 0);
+            uint32_t base, off, scale, va, pa2, val = 0;
+
+            if (((w1 >> USE1_LDST_AMODE_SHIFT) & USE1_LDST_AMODE_MASK) !=
+                USE1_LDST_AMODE_ABSOLUTE ||
+                ((w1 >> USE1_LDST_IMODE_SHIFT) & USE1_LDST_IMODE_MASK) !=
+                USE1_LDST_IMODE_NONE) {
+                sgx_pr("ld/st з нетлумаченим режимом адресації\n");
+                c.stop = "режим адресації ld/st";
+                break;
+            }
+            scale = use_ldst_scale(w1);
+            if (scale != 4) {
+                sgx_pr("ld/st шириною %u Б — не тлумачимо\n", scale);
+                c.stop = "ширина доступу ld/st";
+                break;
+            }
+            if (!use_read(&c, b0, src0, &base) ||
+                !use_read(&c, b1, src1, &off)) {
+                sgx_pr("%s  ⚠ адреса невідома\n",
+                        store ? "stad" : "ldad");
+                c.stop = "адреса ld/st невідома";
+                break;
+            }
+            va = base + off * scale;
+            if (!sgx_translate(pd, va, &pa2)) {
+                sgx_pr("%s [%s%u,+#%u] -> VA %08x НЕ відображено\n",
+                        store ? "stad" : "ldad", use_bank_name(b0), src0,
+                        off, va);
+                c.stop = "ціль ld/st не відображена";
+                break;
+            }
+            if (store) {
+                if (!use_read(&c, b2, src2, &val)) {
+                    sgx_pr("stad  ⚠ значення невідоме\n");
+                    c.stop = "значення stad невідоме";
+                    break;
+                }
+                sgx_pr("stad [%s%u,+#%u] <- %08x  (VA %08x, PA %08x)",
+                        use_bank_name(b0), src0, off, val, va, pa2);
+                sgx_phys_st32(pa2, val);
+                s->nstores++;
+                sgx_pr("  ✔ ЗАПИСАНО В ПАМ'ЯТЬ ГОСТЯ\n");
+            } else {
+                ClarionUseBank db = (w1 & 0x00000080U) ? USE_BANK_UNSUPPORTED
+                                                       : USE_BANK_TEMP;
+
+                val = sgx_phys_ld32(pa2);
+                sgx_pr("ldad r%u <- [%s%u,+#%u] = %08x  (VA %08x)\n",
+                        dst, use_bank_name(b0), src0, off, val, va);
+                if (!use_write(&c, db, dst, val)) {
+                    c.stop = "приймач ldad не підтримано";
+                }
+            }
+            break;
+        }
+
+        default:
+            sgx_pr("опкод %u — не тлумачимо\n", op);
+            c.stop = "нетлумачений опкод USE";
+            break;
+        }
+
+        if (c.stop) {
+            break;
+        }
+        if (is_end) {
+            sgx_pr("[sgx]     %*s— задача USE завершилась\n",
+                    2 * depth, ind);
+            break;
+        }
+        pc += USE_INST_SIZE;
+    }
+
+    if (c.stop) {
+        sgx_pr("[sgx]     %*s⛔ задачу USE спинено: %s\n",
+                2 * depth, ind, c.stop);
+    } else if (steps >= SGX_USE_MAX_STEPS) {
+        sgx_pr("[sgx]     %*s⛔ ліміт кроків задачі USE\n",
+                2 * depth, ind);
     }
 }
 
@@ -980,35 +1726,35 @@ static void sgx_report_sa(ClarionSgxState *s)
     unsigned i;
 
     if (!s->sa_count) {
-        fprintf(stderr, "[sgx]   вторинні атрибути: DMA не виконувався\n");
+        sgx_pr("[sgx]   вторинні атрибути: DMA не виконувався\n");
         return;
     }
-    fprintf(stderr, "[sgx]   вторинні атрибути мікроядра (%u двійних слів):\n",
+    sgx_pr("[sgx]   вторинні атрибути мікроядра (%u двійних слів):\n",
             s->sa_count);
     for (i = 0; i < s->sa_count; i += 4) {
         unsigned k;
 
-        fprintf(stderr, "[sgx]     sa[%2u]:", i);
+        sgx_pr("[sgx]     sa[%2u]:", i);
         for (k = 0; k < 4 && i + k < s->sa_count; k++) {
             if (s->sa_known[i + k]) {
-                fprintf(stderr, " %08x", s->sa[i + k]);
+                sgx_pr(" %08x", s->sa[i + k]);
             } else {
-                fprintf(stderr, " --------");
+                sgx_pr(" --------");
             }
         }
-        fprintf(stderr, "\n");
+        sgx_pr("\n");
     }
-    fprintf(stderr, "[sgx]     sa[%u] sTA3DCtl = %08x\n", SGX_SA_TA3DCTL,
+    sgx_pr("[sgx]     sa[%u] sTA3DCtl = %08x\n", SGX_SA_TA3DCTL,
             s->sa[SGX_SA_TA3DCTL]);
-    fprintf(stderr, "[sgx]     sa[%u] sHostCtl = %08x   ← R_HostCtl коду USE\n",
+    sgx_pr("[sgx]     sa[%u] sHostCtl = %08x   ← R_HostCtl коду USE\n",
             SGX_SA_HOSTCTL, s->sa[SGX_SA_HOSTCTL]);
-    fprintf(stderr, "[sgx]     sa[%u] sCCBCtl  = %08x\n", SGX_SA_CCBCTL,
+    sgx_pr("[sgx]     sa[%u] sCCBCtl  = %08x\n", SGX_SA_CCBCTL,
             s->sa[SGX_SA_CCBCTL]);
     if (s->sa_known[SGX_SA_TA3DCTL] && s->sa[SGX_SA_TA3DCTL] == s->sa_sbase) {
-        fprintf(stderr, "[sgx]     ✔ самоперевірка: sa[0] == SBASE DMA (%08x) —"
+        sgx_pr("[sgx]     ✔ самоперевірка: sa[0] == SBASE DMA (%08x) —"
                 " зсув і крок копіювання правильні\n", s->sa_sbase);
     } else if (s->sa_known[SGX_SA_TA3DCTL]) {
-        fprintf(stderr, "[sgx]     ⛔ самоперевірка ПРОВАЛЕНА: sa[0]=%08x, а"
+        sgx_pr("[sgx]     ⛔ самоперевірка ПРОВАЛЕНА: sa[0]=%08x, а"
                 " SBASE DMA = %08x\n", s->sa[SGX_SA_TA3DCTL], s->sa_sbase);
     }
 }
@@ -1029,24 +1775,24 @@ static void sgx_report_kick(ClarionSgxState *s)
     uint32_t pa;
     unsigned i;
 
-    fprintf(stderr, "[sgx] EVENT_KICK2 #%u — розбір видимого стану\n",
+    sgx_pr("[sgx] EVENT_KICK2 #%u — розбір видимого стану\n",
             s->kicks);
-    fprintf(stderr, "[sgx]   EVENT_HOST_ENABLE  = %08x   (біт 14 = SW event)\n",
+    sgx_pr("[sgx]   EVENT_HOST_ENABLE  = %08x   (біт 14 = SW event)\n",
             sgx_reg(s, SGX_CR_EVENT_HOST_ENABLE));
-    fprintf(stderr, "[sgx]   EVENT_KICKER       = %08x   device-VA лічильника\n",
+    sgx_pr("[sgx]   EVENT_KICKER       = %08x   device-VA лічильника\n",
             kicker);
-    fprintf(stderr, "[sgx]   PDS_EXEC_BASE      = %08x\n", pds);
-    fprintf(stderr, "[sgx]   USE_CODE_BASE_15   = %08x   DM=%u ADDR<<8=%08x\n",
+    sgx_pr("[sgx]   PDS_EXEC_BASE      = %08x\n", pds);
+    sgx_pr("[sgx]   USE_CODE_BASE_15   = %08x   DM=%u ADDR<<8=%08x\n",
             use15,
             (use15 & SGX_USE_CODE_BASE_DM_MASK) >> SGX_USE_CODE_BASE_DM_SHIFT,
             (use15 & SGX_USE_CODE_BASE_ADDR_MASK) << 8);
-    fprintf(stderr, "[sgx]   EVENT_OTHER_PDS EXEC/DATA/INFO + 0x0A74 ="
+    sgx_pr("[sgx]   EVENT_OTHER_PDS EXEC/DATA/INFO + 0x0A74 ="
             " %08x %08x %08x %08x\n",
             task, sgx_reg(s, SGX_CR_EVENT_OTHER_PDS_DATA),
             sgx_reg(s, SGX_CR_EVENT_OTHER_PDS_INFO), sgx_reg(s, SGX_CR_QY8_TASK_W3));
-    fprintf(stderr, "[sgx]   корінь = PDS_EXEC_BASE + рег 0x0A68 = %08x\n",
+    sgx_pr("[sgx]   корінь = PDS_EXEC_BASE + рег 0x0A68 = %08x\n",
             root);
-    fprintf(stderr, "[sgx]   BIF_DIR_LIST_BASE0 = %08x\n", pd);
+    sgx_pr("[sgx]   BIF_DIR_LIST_BASE0 = %08x\n", pd);
 
     if (s->show_writes) {
         /*
@@ -1054,10 +1800,10 @@ static void sgx_report_kick(ClarionSgxState *s)
          * — не єдине джерело записів: `SGXReset` пише частину регістрів
          * (зокрема BIF_DIR_LIST_BASE0) прямо, і в таблиці скрипта їх немає.
          */
-        fprintf(stderr, "[sgx]   журнал записів (%u%s):\n", s->nwr,
+        sgx_pr("[sgx]   журнал записів (%u%s):\n", s->nwr,
                 s->wr_overflow ? ", ПЕРЕПОВНЕНО" : "");
         for (i = 0; i < s->nwr; i++) {
-            fprintf(stderr, "[sgx]     %3u  +0x%04x <- %08x\n",
+            sgx_pr("[sgx]     %3u  +0x%04x <- %08x\n",
                     i, s->wr[i].off, s->wr[i].val);
         }
     }
@@ -1067,7 +1813,7 @@ static void sgx_report_kick(ClarionSgxState *s)
          * Гість не писав каталог у це вікно. Нічого не вигадуємо: без
          * каталогу жоден device-VA перекласти неможливо, і так і кажемо.
          */
-        fprintf(stderr, "[sgx]   каталог сторінок не записаний у цей блок — "
+        sgx_pr("[sgx]   каталог сторінок не записаний у цей блок — "
                 "обхід MMU неможливий\n");
         return;
     }
@@ -1075,7 +1821,7 @@ static void sgx_report_kick(ClarionSgxState *s)
     sgx_report_pd(pd);
 
     if (!sgx_translate(pd, root, &pa)) {
-        fprintf(stderr, "[sgx]   корінь %08x НЕ відображений у цьому "
+        sgx_pr("[sgx]   корінь %08x НЕ відображений у цьому "
                 "каталозі\n", root);
     } else {
         sgx_report_range(pd, "корінь", root, 0x40);
@@ -1098,7 +1844,7 @@ static void sgx_report_kick(ClarionSgxState *s)
          * вдаємо, що знаємо, — ця програма на ir0 і не дивиться.
          */
         sgx_pds_run(s, pd, root, sgx_reg(s, SGX_CR_EVENT_OTHER_PDS_DATA),
-                    "task-control із MMIO", false, 0);
+                    "task-control із MMIO", false, 0, 0);
     }
 
     /*
@@ -1109,10 +1855,10 @@ static void sgx_report_kick(ClarionSgxState *s)
      * DOUTD і везе вторинні атрибути.
      */
     if (s->run_set) {
-        fprintf(stderr, "[sgx]   ⚠ QY8_SGX_PDS_RUN — діагностичний запуск, не"
+        sgx_pr("[sgx]   ⚠ QY8_SGX_PDS_RUN — діагностичний запуск, не"
                 " частина чесного ланцюга\n");
         sgx_pds_run(s, pd, s->run_va, s->run_rows, "QY8_SGX_PDS_RUN",
-                    true, s->run_ir0);
+                    true, s->run_ir0, 0);
     }
 
     if (s->exec) {
@@ -1120,9 +1866,9 @@ static void sgx_report_kick(ClarionSgxState *s)
         if (s->nuse) {
             unsigned k;
 
-            fprintf(stderr, "[sgx]   черга задач USE (виконання — M3-B2):\n");
+            sgx_pr("[sgx]   запущені задачі USE:\n");
             for (k = 0; k < s->nuse; k++) {
-                fprintf(stderr, "[sgx]     #%u  device VA %08x\n",
+                sgx_pr("[sgx]     #%u  device VA %08x\n",
                         k, s->use_queue[k]);
             }
         }
@@ -1175,12 +1921,21 @@ static void sgx_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 
     if (addr == SGX_CR_EVENT_KICK2 && (val & SGX_CR_EVENT_KICK2_NOW)) {
         s->kicks++;
-        if (s->kicks <= s->kick_reports) {
-            sgx_report_kick(s);
-        } else {
-            fprintf(stderr, "[sgx] EVENT_KICK2 #%u (розбір пропущено, "
-                    "QY8_SGX_KICKS=%u)\n", s->kicks, s->kick_reports);
+        if (s->kicks > s->kick_reports) {
+            /*
+             * Далі працюємо мовчки. Саме працюємо: без цього мікроядро
+             * виконалося б лише на перших kick'ах, а гість б'є в дзвін
+             * стільки разів, скільки йому треба.
+             */
+            if (s->kicks == s->kick_reports + 1) {
+                fprintf(stderr, "[sgx] EVENT_KICK2 #%u — далі без розбору"
+                        " (QY8_SGX_KICKS=%u), виконання триває\n",
+                        s->kicks, s->kick_reports);
+            }
+            sgx_silent = true;
         }
+        sgx_report_kick(s);
+        sgx_silent = false;
     }
 }
 
@@ -1215,6 +1970,7 @@ static void clarion_sgx_reset_hold(Object *obj, ResetType type)
     s->sa_count = 0;
     s->sa_sbase = 0;
     s->nuse = 0;
+    s->nstores = 0;
 }
 
 /* QY8_SGX_DUMP="0x0F003000:0x104,0x0E40C1B0:0x4C" */
