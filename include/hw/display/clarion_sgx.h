@@ -75,4 +75,93 @@
 #define SGX_MMU_ENTRY_VALID     0x00000001U
 #define SGX_MMU_ENTRY_ADDR_MASK 0xFFFFF000U
 
+/*
+ * --- Кодування PDS (SGX540) -------------------------------------------
+ *
+ * Усе нижче — дослівно з публічного DDK, гілка SGX540 (без
+ * `SGX_FEATURE_USE_UNLIMITED_PHASES` і без `SGX_FEATURE_PDS_EXTENDED_SOURCES`):
+ * `eurasia/hwdefs/sgxdefs.h` і `eurasia/codegen/pds/pds.c` дерева
+ * GFX_Linux_DDK @ f184ac914561fa100a5c92a488df777de8785f93. Нічого не вгадано;
+ * розбір і посилання на рядки — docs/sgx/13 і docs/sgx/14.
+ */
+#define PDS_INSTRUCTION_SIZE        4
+#define PDS_INST_SHIFT              30      /* біти 31:30 — група */
+#define PDS_INST_MOV                0
+#define PDS_INST_ARITH              1
+#define PDS_INST_FLOW               2
+#define PDS_INST_LOGIC              3
+#define PDS_TYPE_SHIFT              27      /* біти 29:27 — тип */
+#define PDS_TYPE_MOVS               0
+#define PDS_TYPE_MOV16              1
+#define PDS_TYPE_MOV32              2
+#define PDS_TYPE_TSTZ               0       /* у групі FLOW */
+#define PDS_TYPE_BRA                2
+#define PDS_TYPE_HALT               5
+#define PDS_CC_SHIFT                24      /* біти 26:24 */
+#define PDS_CC_ALWAYS               7
+
+/*
+ * MOVS, гілка БЕЗ `SGX_FEATURE_PDS_EXTENDED_SOURCES` (тобто наша, SGX540).
+ * ⚠ Ця гілка інша, ніж розширена: `SRC2SEL` там немає взагалі (джерело 2 —
+ * завжди банк DS1), `SRC2` стоїть на 13, а свізли — на 11/9/7/5, не 10/8/6/4.
+ * `SRC1`/`SRC2` індексують ЧЕТВЕРНІ слова, тож індекс двійного слова —
+ * `src * PDS_NUM_DWORDS_PER_QWORD + (swiz & 1)` (`pdsdisasm.c`).
+ */
+#define PDS_MOVS_SRC1SEL_SHIFT      23
+#define PDS_MOVS_SRC1_SHIFT         18
+#define PDS_MOVS_SRC1_MASK          0x1F
+#define PDS_MOVS_SRC2_SHIFT         13
+#define PDS_MOVS_SRC2_MASK          0x1F
+#define PDS_MOVS_SWIZ_SHIFT(i)      (11 - 2 * (i))   /* SWIZ0..SWIZ3 */
+#define PDS_NUM_DWORDS_PER_QWORD    2
+#define PDS_DATASTORE_TEMPSTART     48
+#define PDS_MOVS_DEST_MR            0
+#define PDS_MOVS_SWIZ_SRC1L         0
+#define PDS_MOVS_SWIZ_SRC1H         1
+#define PDS_MOVS_SWIZ_SRC2L         2
+#define PDS_MOVS_SWIZ_SRC2H         3
+#define PDS_MOVS_DEST_MASK          0xF
+#define PDS_MOVS_DEST_SLC           1
+#define PDS_MOVS_DEST_DOUTI         2
+#define PDS_MOVS_DEST_DOUTD         3
+#define PDS_MOVS_DEST_DOUTT         4
+#define PDS_MOVS_DEST_DOUTU         5
+#define PDS_MOVS_DEST_DOUTA         6
+
+/* MOV32 */
+#define PDS_MOV32_SRCSEL_SHIFT      15
+#define PDS_MOV32_SRC_SHIFT         9
+#define PDS_MOV32_SRC_MASK          0x3F
+#define PDS_MOV32_DESTSEL_SHIFT     7
+#define PDS_MOV32_DEST_SHIFT        1
+#define PDS_MOV32_DEST_MASK         0x3F
+
+/* Розкладка сегмента даних: PDS_NUM_DWORDS_PER_ROW = 2 для SGX540. */
+#define PDS_NUM_DWORDS_PER_ROW      2
+#define PDS_NUM_USE_TASK_CONTROL_WORDS  3
+#define PDS_NUM_DMA_CONTROL_WORDS   2
+
+/* DOUTD — DMA-інтерфейс PDS */
+#define PDS_DOUTD1_BSIZE_MASK       0xF
+#define PDS_DOUTD1_BLINES_SHIFT     4
+#define PDS_DOUTD1_BLINES_MASK      0xF
+#define PDS_DOUTD1_AO_SHIFT         8
+#define PDS_DOUTD1_AO_MASK          0x7FF
+#define PDS_DOUTD1_INSTR_SHIFT      19
+#define PDS_DOUTD1_STRIDE_SHIFT     21
+#define PDS_DOUTD1_STRIDE_MASK      0x1FF
+
+/* DOUTU — інтерфейс запуску задачі USE */
+#define PDS_DOUTU0_CBASE_MASK       0xF
+#define PDS_DOUTU0_COFF_SHIFT       4
+#define PDS_DOUTU0_COFF_MASK        0xF
+#define PDS_DOUTU0_COFF_ALIGNSHIFT  15
+#define PDS_DOUTU0_EXE_SHIFT        8
+#define PDS_DOUTU0_EXE_MASK         0x7FF
+#define PDS_DOUTU0_EXE_ALIGNSHIFT   4
+#define PDS_DOUTU0_ITERATORSDEP     (1u << 19)
+#define PDS_DOUTU0_TEXTUREDEP       (1u << 20)
+#define PDS_DOUTU0_PDSDMADEP        (1u << 21)
+#define PDS_DOUTU1_MODE_SHIFT       26
+
 #endif /* HW_DISPLAY_CLARION_SGX_H */
