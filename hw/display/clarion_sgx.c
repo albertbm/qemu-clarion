@@ -1861,11 +1861,6 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                 c.stop = "нецілочисельний TEST";
                 break;
             }
-            if (stst != USE1_TEST_STST_NONE) {
-                sgx_pr("test зі знаковою перевіркою — не тлумачимо\n");
-                c.stop = "TEST зі знаковою перевіркою";
-                break;
-            }
             if (!use_read(&c, b1, src1, &a) || !use_read(&c, b2, src2, &b)) {
                 sgx_pr("test  ⚠ джерело невідоме\n");
                 c.stop = "джерело TEST невідоме";
@@ -1888,18 +1883,52 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
             if (c.stop) {
                 break;
             }
-            sgx_pr("%s.test %s%u, %s%u = %08x", name,
-                    use_bank_name(b1), src1, use_bank_name(b2), src2, res);
-            if (ztst == USE1_TEST_ZTST_ZERO) {
-                c.pred[pdst] = res == 0;
-                sgx_pr(" -> p%u=%u (==0)\n", pdst, c.pred[pdst]);
-            } else if (ztst == USE1_TEST_ZTST_NOTZERO) {
-                c.pred[pdst] = res != 0;
-                sgx_pr(" -> p%u=%u (!=0)\n", pdst, c.pred[pdst]);
-            } else {
-                sgx_pr("  ⚠ ztst=%u не тлумачимо\n", ztst);
-                c.stop = "нетлумачена умова TEST";
-                break;
+            /*
+             * Дві незалежні перевірки — нуля й знака — і поєднання за
+             * бітом CRCOMB (див. заголовок). `NONE` тут означає «завжди
+             * істинна», а не «немає перевірки».
+             */
+            {
+                bool zt, st, comb_and = (w1 & USE1_TEST_CRCOMB_AND) != 0;
+                const char *zn, *sn;
+
+                switch (ztst) {
+                case USE1_TEST_ZTST_NONE:
+                    zt = true;  zn = "-";   break;
+                case USE1_TEST_ZTST_ZERO:
+                    zt = res == 0; zn = "==0"; break;
+                case USE1_TEST_ZTST_NOTZERO:
+                    zt = res != 0; zn = "!=0"; break;
+                default:
+                    sgx_pr("  ⚠ зарезервована умова нуля\n");
+                    c.stop = "зарезервована умова нуля в TEST";
+                    zt = false; zn = "?";
+                    break;
+                }
+                if (c.stop) {
+                    break;
+                }
+                switch (stst) {
+                case USE1_TEST_STST_NONE:
+                    st = true; sn = "-"; break;
+                case USE1_TEST_STST_NEGATIVE:
+                    st = (int32_t)res < 0;  sn = "знак"; break;
+                case USE1_TEST_STST_POSITIVE:
+                    st = (int32_t)res >= 0; sn = "!знак"; break;
+                default:
+                    sgx_pr("  ⚠ зарезервована умова знака\n");
+                    c.stop = "зарезервована умова знака в TEST";
+                    st = false; sn = "?";
+                    break;
+                }
+                if (c.stop) {
+                    break;
+                }
+                c.pred[pdst] = comb_and ? (zt && st) : (zt || st);
+                sgx_pr("%s.test %s%u, %s%u = %08x -> p%u=%u (%s %s %s)\n",
+                        name, use_bank_name(b1), src1, use_bank_name(b2),
+                        src2, res, pdst, c.pred[pdst], sn,
+                        comb_and ? "і" : "або", zn);
             }
             if (w0 & USE0_TEST_WBEN) {
                 ClarionUseBank db = use_bank_dst(w1);

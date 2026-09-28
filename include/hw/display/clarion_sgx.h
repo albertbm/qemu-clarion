@@ -634,9 +634,36 @@
 #define USE1_TEST_ZTST_NONE         0
 #define USE1_TEST_ZTST_ZERO         1
 #define USE1_TEST_ZTST_NOTZERO      2
+#define USE1_TEST_ZTST_RESERVED     3
 #define USE1_TEST_STST_SHIFT        10
 #define USE1_TEST_STST_MASK         0x3
 #define USE1_TEST_STST_NONE         0
+#define USE1_TEST_STST_NEGATIVE     1
+#define USE1_TEST_STST_POSITIVE     2
+#define USE1_TEST_STST_RESERVED     3
+
+/*
+ * ⚠ У `TEST` ДВІ незалежні перевірки — нуля й знака, — і як їх поєднати,
+ * каже окремий біт: `CRCOMB` виставлений = AND, знятий = OR
+ * (`sgxdefs.h:5509`, `usedisasm.c:9385`). Значення `NONE` в обох полях —
+ * це не «немає перевірки», а «перевірка завжди істинна»
+ * (`usedisasm.c:9222..9232`: `STST_NONE -> SIGN_TRUE`,
+ * `ZTST_NONE -> ZERO_TRUE`), тому з AND вона просто не заважає.
+ *
+ * `POSITIVE` означає «біт знака ЗНЯТО», а не «> 0», і це видно з самого
+ * асемблера (`use.l:761..767`), де суфікси розкриваються дослівно:
+ *
+ *   .tests  -> n&t    знак стоїть
+ *   .testns -> p&t    знак знято          <- наш випадок
+ *   .testp  -> p&nz   «додатне» = знак знято І не нуль
+ *   .testn  -> n&nz   «від'ємне»
+ *
+ * Тобто якби `POSITIVE` уже означало «> 0», то `.testp` не мусив би окремо
+ * додавати `nz`. Звідси ідіом мікроядра «перевірити біт N»:
+ * `shl.testns p0, rX, #(31 - N)` — зсунути біт у знак і перевірити, що він
+ * знятий.
+ */
+#define USE1_TEST_CRCOMB_AND        0x00000080U
 #define USE1_TEST_PDST_SHIFT        2
 #define USE1_TEST_PDST_MASK         0x3
 #define USE0_TEST_WBEN               0x00100000U
