@@ -1240,6 +1240,7 @@ typedef struct ClarionUseCtx {
     uint32_t r[USE_NUM_TEMPS];
     bool r_known[USE_NUM_TEMPS];
     bool pred[USE_NUM_PREDICATES];
+    bool pred_known[USE_NUM_PREDICATES];
 
     /*
      * Індексні регістри задачі. На вході НЕВІДОМІ: модель не знає, що лишив у
@@ -1558,12 +1559,12 @@ static bool use_pred_true(ClarionUseCtx *c, uint32_t epred, bool *known)
     *known = true;
     switch (epred) {
     case USE1_EPRED_ALWAYS: return true;
-    case USE1_EPRED_P0:     return c->pred[0];
-    case USE1_EPRED_P1:     return c->pred[1];
-    case USE1_EPRED_P2:     return c->pred[2];
-    case USE1_EPRED_P3:     return c->pred[3];
-    case USE1_EPRED_NOTP0:  return !c->pred[0];
-    case USE1_EPRED_NOTP1:  return !c->pred[1];
+    case USE1_EPRED_P0:     *known = c->pred_known[0]; return c->pred[0];
+    case USE1_EPRED_P1:     *known = c->pred_known[1]; return c->pred[1];
+    case USE1_EPRED_P2:     *known = c->pred_known[2]; return c->pred[2];
+    case USE1_EPRED_P3:     *known = c->pred_known[3]; return c->pred[3];
+    case USE1_EPRED_NOTP0:  *known = c->pred_known[0]; return !c->pred[0];
+    case USE1_EPRED_NOTP1:  *known = c->pred_known[1]; return !c->pred[1];
     default:
         *known = false;
         return false;
@@ -1724,6 +1725,32 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                     } else {
                         sgx_pr("ba -> %08x\n", target);
                     }
+                    pc = target;
+                    continue;
+                }
+                if (op2 == USE1_FLOWCTRL_OP2_BR) {
+                    uint32_t imm = w0 & USE0_BRANCH_OFFSET_MASK;
+                    int32_t disp = (imm & (1U <<
+                                           (SGX_FEATURE_USE_NUMBER_PC_BITS - 1)))
+                                   ? (int32_t)imm -
+                                     (1 << SGX_FEATURE_USE_NUMBER_PC_BITS)
+                                   : (int32_t)imm;
+                    uint32_t index = (pc - c.page_base) / USE_INST_SIZE;
+                    uint32_t target;
+
+                    /* Only the plain relative branch is modeled here.
+                     * SAVELINK and ordering modifiers need separate behavior. */
+                    if ((w0 & ~USE0_BRANCH_OFFSET_MASK) ||
+                        (w1 & USE1_BRANCH_MODIFIER_MASK)) {
+                        sgx_pr("br extension bits w0=%08x w1=%08x"
+                               " — не тлумачимо\n",
+                               w0 & ~USE0_BRANCH_OFFSET_MASK,
+                               w1 & USE1_BRANCH_MODIFIER_MASK);
+                        c.stop = "нетлумачені модифікатори BR";
+                        break;
+                    }
+                    target = use_page_pc(c.page_base, index + disp);
+                    sgx_pr("br #%+d pairs -> %08x\n", disp, target);
                     pc = target;
                     continue;
                 }
@@ -2124,6 +2151,7 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                     break;
                 }
                 c.pred[pdst] = comb_and ? (zt && st) : (zt || st);
+                c.pred_known[pdst] = true;
                 sgx_pr("%s.test %s%u, %s%u = %08x -> p%u=%u (%s %s %s)\n",
                         name, use_bank_name(b1), src1, use_bank_name(b2),
                         src2, res, pdst, c.pred[pdst], sn,

@@ -536,7 +536,18 @@
 
 /* Гілка: `sgxdefs.h:6518..6521`. Зсув у word0 — НОМЕР ПАРИ, крок 8 Б. */
 #define USE1_BRANCH_SAVELINK        0x00000200U
-#define USE0_BRANCH_OFFSET_MASK     0x000FFFFFU
+#define USE0_BRANCH_OFFSET_MASK     0x00000FFFU
+#define USE1_FLOWCTRL_NOSCHED       0x00000800U
+#define USE1_FLOWCTRL_SYNCEND       0x00800000U
+#define USE1_FLOWCTRL_SYNCEXT       0x00001000U
+#define USE1_FLOWCTRL_EXCEPTION    0x00080000U
+#define USE1_BRANCH_MONITOR         0x00000400U
+#define USE1_BRANCH_MODIFIER_MASK   (USE1_BRANCH_SAVELINK | \
+                                     USE1_BRANCH_MONITOR | \
+                                     USE1_FLOWCTRL_NOSCHED | \
+                                     USE1_FLOWCTRL_SYNCEXT | \
+                                     USE1_FLOWCTRL_EXCEPTION | \
+                                     USE1_FLOWCTRL_SYNCEND)
 
 /* OTHER: підопкод (біти 26:24) — `sgxdefs.h:6656..6666`. */
 #define USE1_OTHER_OP2_SHIFT        24
