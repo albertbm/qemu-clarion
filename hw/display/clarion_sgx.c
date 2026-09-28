@@ -78,6 +78,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/cutils.h"
 #include "hw/core/sysbus.h"
 #include "hw/display/clarion_sgx.h"
 #include "system/address-spaces.h"
@@ -111,6 +112,14 @@ struct ClarionSgxState {
 
     /* Усе, що гість записав. Ніщо тут не має власної семантики. */
     uint32_t regs[SGX_NREGS];
+    /*
+     * Чи має модель ПІДСТАВУ вважати, що знає значення регістра. Підстава —
+     * рівно одна: хтось у нього писав (гість через MMIO або мікроядро через
+     * `str`). Без цього прапорця `ldr` віддавав би нуль там, де залізо
+     * повертає біти стану, — і мікроядро крутилося б у порожньому очікуванні,
+     * а ми б думали, що це його власна логіка.
+     */
+    bool regs_known[SGX_NREGS];
 
     uint32_t kicks;             /* скільки разів прийшов EVENT_KICK2 */
     uint32_t kick_reports;      /* скільки з них розбирати докладно */
@@ -190,6 +199,50 @@ static void G_GNUC_PRINTF(1, 2) sgx_pr(const char *fmt, ...)
 static uint32_t sgx_reg(ClarionSgxState *s, hwaddr off)
 {
     return s->regs[off / 4];
+}
+
+static void sgx_set_reg(ClarionSgxState *s, hwaddr off, uint32_t val)
+{
+    s->regs[off / 4] = val;
+    s->regs_known[off / 4] = true;
+}
+
+/*
+ * Побічні дії запису в регістр — те саме, хто б не писав: гість через MMIO чи
+ * мікроядро інструкцією `str`. Поки що тут лише вузол системного кешу MNE.
+ *
+ * Чому це чесно. Кеша в моделі немає, тому «інвалідувати все» справді
+ * виконується миттєво й повністю — ми не вдаємо завершення, воно настало.
+ * А єдиний спосіб сказати про це мікроядру — рівно той, який описує
+ * заголовок: біт `INVAL` у `MNE_CR_EVENT_STATUS`, який гаситься записом у
+ * `MNE_CR_EVENT_CLEAR`. Без цього мікроядро крутиться в
+ * `ISLC_WaitForInvalidate` вічно, і причина зовні виглядала б як його власна
+ * логіка, а не як прогалина моделі.
+ *
+ * ⚠ Гість цього біта НЕ бачить: читання вікна SGX і далі віддають нулі
+ * (див. `sgx_read`), тож A/B-прогін лишається чистим. Біт існує для того,
+ * хто читає регістри зсередини — для `ldr` коду USE.
+ */
+static void sgx_reg_side_effects(ClarionSgxState *s, hwaddr off, uint32_t val)
+{
+    switch (off) {
+    case SGX_CR_MNE_CTRL:
+        if (val & SGX_CR_MNE_CTRL_INVAL_ALL) {
+            sgx_set_reg(s, SGX_CR_MNE_EVENT_STATUS,
+                        sgx_reg(s, SGX_CR_MNE_EVENT_STATUS) |
+                        SGX_CR_MNE_EVENT_STATUS_INVAL);
+        }
+        break;
+    case SGX_CR_MNE_EVENT_CLEAR:
+        if (val & SGX_CR_MNE_EVENT_CLEAR_INVAL) {
+            sgx_set_reg(s, SGX_CR_MNE_EVENT_STATUS,
+                        sgx_reg(s, SGX_CR_MNE_EVENT_STATUS) &
+                        ~SGX_CR_MNE_EVENT_STATUS_INVAL);
+        }
+        break;
+    default:
+        break;
+    }
 }
 
 /* --- обхід MMU SGX ---------------------------------------------------- */
@@ -1185,12 +1238,17 @@ typedef struct ClarionUseCtx {
     const char *stop;
 } ClarionUseCtx;
 
-/* Банк джерела S0: один біт, розширення — прапорцем S0BEXT. */
-static ClarionUseBank use_bank_s0(uint32_t w1)
+/*
+ * Банк джерела S0: один біт. Розширення банку прапорцем S0BEXT дозволене не
+ * всім інструкціям — у цілочисельній групі той самий біт 18 означає END
+ * (`usedisasm.c:10856` передає `DecodeSrc0(..., FALSE, 0, ...)`), тож
+ * розширення там тлумачити НЕЛЬЗЯ.
+ */
+static ClarionUseBank use_bank_s0_ex(uint32_t w1, bool allow_ext)
 {
     uint32_t b = (w1 >> USE1_S0BANK_SHIFT) & USE1_S0BANK_MASK;
 
-    if (w1 & USE1_S0BEXT) {
+    if (allow_ext && (w1 & USE1_S0BEXT)) {
         return b == USE_S0EXTBANK_SECATTR ? USE_BANK_SECATTR
                                           : USE_BANK_UNSUPPORTED;
     }
@@ -1199,6 +1257,11 @@ static ClarionUseBank use_bank_s0(uint32_t w1)
     case USE_S0STDBANK_PRIMATTR: return USE_BANK_PRIMATTR;
     default:                     return USE_BANK_UNSUPPORTED;
     }
+}
+
+static ClarionUseBank use_bank_s0(uint32_t w1)
+{
+    return use_bank_s0_ex(w1, true);
 }
 
 /* Банк джерел S1/S2: два біти, розширення — прапорцем S1BEXT/S2BEXT. */
@@ -1291,6 +1354,40 @@ static bool use_write(ClarionUseCtx *c, ClarionUseBank bank, uint32_t num,
     return false;
 }
 
+/*
+ * Чи існує такий слот узагалі — окремо від питання, чи відоме значення.
+ * Потрібно там, де «невідоме значення» треба ПРОНЕСТИ далі, а «немає такого
+ * банку» мусить спинити виконання: змішувати ці два випадки не можна.
+ */
+static bool use_slot_ok(ClarionUseBank bank, uint32_t num)
+{
+    switch (bank) {
+    case USE_BANK_IMMEDIATE: return true;
+    case USE_BANK_TEMP:      return num < USE_NUM_TEMPS;
+    case USE_BANK_SECATTR:   return num < SGX_SA_DWORDS;
+    case USE_BANK_PRIMATTR:  return num < SGX_PA_DWORDS;
+    default:                 return false;
+    }
+}
+
+/* Зробити слот невідомим — чесна альтернатива запису вигаданого нуля. */
+static bool use_forget(ClarionUseCtx *c, ClarionUseBank bank, uint32_t num)
+{
+    if (bank == USE_BANK_TEMP && num < USE_NUM_TEMPS) {
+        c->r_known[num] = false;
+        return true;
+    }
+    if (bank == USE_BANK_PRIMATTR && num < SGX_PA_DWORDS) {
+        c->s->pa_known[num] = false;
+        return true;
+    }
+    if (bank == USE_BANK_SECATTR && num < SGX_SA_DWORDS) {
+        c->s->sa_known[num] = false;
+        return true;
+    }
+    return false;
+}
+
 /* Банк приймача D1. */
 static ClarionUseBank use_bank_dst(uint32_t w1)
 {
@@ -1325,6 +1422,21 @@ static bool use_pred_true(ClarionUseCtx *c, uint32_t epred, bool *known)
     default:
         *known = false;
         return false;
+    }
+}
+
+/*
+ * Короткий предикат цілочисельної групи (`sgxdefs.h:5184..5190`,
+ * `usedisasm.c:1932..1938`). Це ІНШЕ поле, ніж EPRED, і в ньому лише чотири
+ * значення — жодного «не моделюємо» тут бути не може.
+ */
+static bool use_spred_true(ClarionUseCtx *c, uint32_t spred)
+{
+    switch (spred) {
+    case USE1_SPRED_P0:    return c->pred[0];
+    case USE1_SPRED_P1:    return c->pred[1];
+    case USE1_SPRED_NOTP0: return !c->pred[0];
+    default:               return true;   /* ALWAYS */
     }
 }
 
@@ -1462,6 +1574,78 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                     c.link_known = false;
                     continue;
                 }
+                if (op2 == USE1_FLOWCTRL_OP2_SETL) {
+                    /*
+                     * `mov pclink, src1`. Значення — НОМЕР ІНСТРУКЦІЇ у вікні
+                     * коду (див. заголовок): саме в такому вигляді хост кладе
+                     * у команду `ui32ServiceAddress`. Переводимо в адресу тим
+                     * самим правилом, що й ціль `ba`, — інакше два шляхи до
+                     * одного PC розійдуться.
+                     */
+                    ClarionUseBank sb = use_bank_s12(
+                        (w0 >> USE0_S1BANK_SHIFT) & USE0_BANK_MASK,
+                        (w1 & USE1_S1BEXT) != 0);
+                    uint32_t val;
+
+                    if (!use_slot_ok(sb, src1)) {
+                        sgx_pr("mov pclink, %s%u  ⚠ банк не підтримано\n",
+                                use_bank_name(sb), src1);
+                        c.stop = "банк джерела setl не підтримано";
+                        break;
+                    }
+                    if (!use_read(&c, sb, src1, &val)) {
+                        /*
+                         * Так виглядає ВІДНОВЛЕННЯ зв'язку у макросі виклику
+                         * `PVRSRV_SGXUTILS_CALL` (`usedefs.h:502..505`):
+                         * `mov R_UTILS_PCLINK, pclink` -> `bal` ->
+                         * `mov pclink, R_UTILS_PCLINK`. Якщо збережене
+                         * значення нам невідоме, то невідомим стає й регістр
+                         * зв'язку — і це правда, а не нуль.
+                         */
+                        c.link_known = false;
+                        sgx_pr("mov pclink, %s%u — значення невідоме,"
+                                " pclink стає невідомим\n",
+                                use_bank_name(sb), src1);
+                        break;
+                    }
+                    c.link = c.code_base + val * USE_INST_SIZE;
+                    c.link_known = true;
+                    sgx_pr("mov pclink, %s%u = %08x  -> link=%08x\n",
+                            use_bank_name(sb), src1, val, c.link);
+                    break;
+                }
+                if (op2 == USE1_FLOWCTRL_OP2_SAVL) {
+                    ClarionUseBank db = use_bank_dst(w1);
+
+                    if (!c.link_known) {
+                        /*
+                         * Обробник подій запускається через DOUTU, а не
+                         * гілкою, тож на вході pclink несе те, що лишив
+                         * попередній власник конвеєра. Макрос виклику зберігає
+                         * і повертає це значення НЕ дивлячись у нього, тому
+                         * невідомість тут безпечно пронести далі; спинимось,
+                         * тільки якщо хтось спробує цим числом скористатися.
+                         */
+                        if (!use_forget(&c, db, dst)) {
+                            sgx_pr("mov %s%u, pclink  ⚠ приймач не "
+                                    "підтримано\n", use_bank_name(db), dst);
+                            c.stop = "приймач savl не підтримано";
+                            break;
+                        }
+                        sgx_pr("mov %s%u, pclink — pclink невідомий,"
+                                " приймач стає невідомим\n",
+                                use_bank_name(db), dst);
+                        break;
+                    }
+                    sgx_pr("mov %s%u, pclink = %08x (інстр. %u)\n",
+                            use_bank_name(db), dst, c.link,
+                            (c.link - c.code_base) / USE_INST_SIZE);
+                    if (!use_write(&c, db, dst,
+                                   (c.link - c.code_base) / USE_INST_SIZE)) {
+                        c.stop = "приймач savl не підтримано";
+                    }
+                    break;
+                }
                 sgx_pr("flowctrl op2=%u — не тлумачимо\n", op2);
                 c.stop = "нетлумачений потік керування USE";
                 break;
@@ -1530,8 +1714,35 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                     uint32_t val;
 
                     if (!(w1 & USE1_LDRSTR_DSEL_STORE)) {
-                        sgx_pr("ldr — не тлумачимо\n");
-                        c.stop = "ldr не реалізовано";
+                        /*
+                         * `ldr dst, #номер` — читання регістра SGX із того
+                         * самого простору, куди пише `str` (T6, docs/sgx/23).
+                         * Віддаємо значення ЛИШЕ якщо модель має підставу його
+                         * знати; інакше кажемо, якого саме регістра бракує, і
+                         * спиняємось. Нуль «про запас» тут гірший за зупинку:
+                         * мікроядро опитує біти стану в циклі й від нуля
+                         * крутилося б вічно.
+                         */
+                        ClarionUseBank db = use_bank_dst(w1);
+
+                        if (off + 4 > CLARION_SGX_SIZE) {
+                            sgx_pr("ldr #%u — поза вікном регістрів\n", num);
+                            c.stop = "ldr поза вікном регістрів";
+                            break;
+                        }
+                        if (!s->regs_known[off / 4]) {
+                            sgx_pr("ldr %s%u, #%u  ⚠ рег +0x%04x модель не"
+                                    " моделює (ніхто в нього не писав)\n",
+                                    use_bank_name(db), dst, num, off);
+                            c.stop = "значення регістра SGX невідоме";
+                            break;
+                        }
+                        sgx_pr("ldr %s%u, #%u = %08x  (рег +0x%04x)\n",
+                                use_bank_name(db), dst, num,
+                                s->regs[off / 4], off);
+                        if (!use_write(&c, db, dst, s->regs[off / 4])) {
+                            c.stop = "приймач ldr не підтримано";
+                        }
                         break;
                     }
                     /*
@@ -1560,7 +1771,8 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                     sgx_pr("str #%u, %s%u = %08x  -> рег +0x%04x\n",
                             num, use_bank_name(sb), src1, val, off);
                     if (off + 4 <= CLARION_SGX_SIZE) {
-                        s->regs[off / 4] = val;
+                        sgx_set_reg(s, off, val);
+                        sgx_reg_side_effects(s, off, val);
                     } else {
                         c.stop = "str поза вікном регістрів";
                     }
@@ -1821,14 +2033,47 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
             ClarionUseBank b2 = use_bank_s12((w0 >> USE0_S2BANK_SHIFT) &
                                              USE0_BANK_MASK,
                                              (w1 & USE1_S2BEXT) != 0);
-            uint32_t base, off, scale, va, pa2, val = 0;
+            uint32_t imode = (w1 >> USE1_LDST_IMODE_SHIFT) &
+                             USE1_LDST_IMODE_MASK;
+            /* Лічильник один, а зміст залежить від MOEEXPAND — див. заголовок. */
+            uint32_t count = ((w1 >> USE1_RMSKCNT_SHIFT) &
+                              USE1_RMSKCNT_MASK) + 1;
+            bool fetch = (w1 & USE1_LDST_MOEEXPAND) == 0;
+            uint32_t base, off, scale, addr, step, pa2, val = 0;
+            const char *mnem = store ? "stad" : "ldad";
+            char suffix[16];
+            unsigned i;
 
             if (((w1 >> USE1_LDST_AMODE_SHIFT) & USE1_LDST_AMODE_MASK) !=
-                USE1_LDST_AMODE_ABSOLUTE ||
-                ((w1 >> USE1_LDST_IMODE_SHIFT) & USE1_LDST_IMODE_MASK) !=
-                USE1_LDST_IMODE_NONE) {
+                USE1_LDST_AMODE_ABSOLUTE) {
                 sgx_pr("ld/st з нетлумаченим режимом адресації\n");
                 c.stop = "режим адресації ld/st";
+                break;
+            }
+            if (imode == USE1_LDST_IMODE_RESERVED) {
+                sgx_pr("ld/st з зарезервованим режимом інкременту\n");
+                c.stop = "зарезервований режим інкременту ld/st";
+                break;
+            }
+            if (w1 & USE1_LDST_RANGEENABLE) {
+                /*
+                 * RANGEENABLE додає третє джерело — межу діапазону, і апарат
+                 * може ВІДКЛЮЧИТИ інструкцію, якщо адреса за межею. Ми цього
+                 * не міряли, тож вгадувати нічого не будемо.
+                 */
+                sgx_pr("ld/st з rangeenable — не тлумачимо\n");
+                c.stop = "rangeenable у ld/st";
+                break;
+            }
+            if (!fetch && count > 1) {
+                /*
+                 * Повтори тут розгортає MOE, а стан MOE ми не моделюємо
+                 * (див. SMLSI вище). Один доступ MOE не торкається, тому
+                 * count == 1 — це чесно, а більше — ні.
+                 */
+                sgx_pr("ld/st з повтором ×%u через MOE — не тлумачимо\n",
+                        count);
+                c.stop = "повтор ld/st через MOE";
                 break;
             }
             scale = use_ldst_scale(w1);
@@ -1839,40 +2084,209 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
             }
             if (!use_read(&c, b0, src0, &base) ||
                 !use_read(&c, b1, src1, &off)) {
-                sgx_pr("%s  ⚠ адреса невідома\n",
-                        store ? "stad" : "ldad");
+                sgx_pr("%s  ⚠ адреса невідома\n", mnem);
                 c.stop = "адреса ld/st невідома";
                 break;
             }
-            va = base + off * scale;
-            if (!sgx_translate(pd, va, &pa2)) {
-                sgx_pr("%s [%s%u,+#%u] -> VA %08x НЕ відображено\n",
-                        store ? "stad" : "ldad", use_bank_name(b0), src0,
-                        off, va);
-                c.stop = "ціль ld/st не відображена";
+            /*
+             * ⚠ `INCSGN` задає знак ІНКРЕМЕНТУ, а не зсуву в адресі. Тому
+             * його не можна застосовувати до `IMODE_NONE`, де інкремента
+             * взагалі немає: там зсув додається до адреси як є.
+             */
+            step = off * scale;
+            if (w1 & USE1_LDST_INCSGN) {
+                step = (uint32_t)-(int32_t)step;
+            }
+            /*
+             * ⚠ ЯК САМЕ РОЗМІЩЕНО ІНКРЕМЕНТ — це не домовленість, а вимір.
+             * Обробник подій робить поспіль:
+             *
+             *   ldad.fcfill CCB(ui32ServiceAddress), [r0, #1++]
+             *   ldad.f7     CCB(ui32CacheControl),   [r0, #0++]
+             *
+             * а `CCB(x)` — це `r[4 + DOFFSET(SGXMKIF_COMMAND.x)]`
+             * (`usedefs.h:59`), тобто r4 і r5..r11. Щоб r4 отримало дв.слово 0
+             * команди, а r5..r11 — дв.слова 1..7, перший доступ мусить піти за
+             * САМОЮ базою, і лише потім база зросте на 4. Отже POST: адреса =
+             * база, далі база += зсув; PRE: спершу база += зсув, потім адреса.
+             */
+            addr = (imode == USE1_LDST_IMODE_PRE)  ? base + step :
+                   (imode == USE1_LDST_IMODE_POST) ? base :
+                                                     base + off * scale;
+            if (fetch && count > 1 && imode != USE1_LDST_IMODE_NONE &&
+                step != 0) {
+                /*
+                 * Скільки разів база зростає при вибірці кількох двослів —
+                 * ми не міряли (на нашому шляху зсув там нульовий). Не
+                 * вигадуємо.
+                 */
+                sgx_pr("ld/st: вибірка ×%u з інкрементом #%u — не міряно\n",
+                        count, off);
+                c.stop = "вибірка ld/st з ненульовим інкрементом";
                 break;
             }
+
+            suffix[0] = '\0';
+            if (fetch) {
+                snprintf(suffix, sizeof(suffix), ".f%u", count);
+            }
+            if (w1 & USE1_LDST_FCLFILL) {
+                /* Кеша немає — вимога виконана тривіально. */
+                pstrcat(suffix, sizeof(suffix), ".fcfill");
+            }
+
             if (store) {
                 if (!use_read(&c, b2, src2, &val)) {
                     sgx_pr("stad  ⚠ значення невідоме\n");
                     c.stop = "значення stad невідоме";
                     break;
                 }
-                sgx_pr("stad [%s%u,+#%u] <- %08x  (VA %08x, PA %08x)",
-                        use_bank_name(b0), src0, off, val, va, pa2);
+                if (!sgx_translate(pd, addr, &pa2)) {
+                    sgx_pr("stad%s [%s%u,+#%u] -> VA %08x НЕ відображено\n",
+                            suffix, use_bank_name(b0), src0, off, addr);
+                    c.stop = "ціль ld/st не відображена";
+                    break;
+                }
+                sgx_pr("stad%s [%s%u,+#%u] <- %08x  (VA %08x, PA %08x)",
+                        suffix, use_bank_name(b0), src0, off, val, addr, pa2);
                 sgx_phys_st32(pa2, val);
                 s->nstores++;
                 sgx_pr("  ✔ ЗАПИСАНО В ПАМ'ЯТЬ ГОСТЯ\n");
             } else {
-                ClarionUseBank db = (w1 & 0x00000080U) ? USE_BANK_UNSUPPORTED
-                                                       : USE_BANK_TEMP;
+                ClarionUseBank db = (w1 & USE1_LDST_DBANK_PRIMATTR)
+                                    ? USE_BANK_PRIMATTR : USE_BANK_TEMP;
 
-                val = sgx_phys_ld32(pa2);
-                sgx_pr("ldad r%u <- [%s%u,+#%u] = %08x  (VA %08x)\n",
-                        dst, use_bank_name(b0), src0, off, val, va);
-                if (!use_write(&c, db, dst, val)) {
-                    c.stop = "приймач ldad не підтримано";
+                sgx_pr("ldad%s %s%u..+%u <- [%s%u,+#%u]  (VA %08x)\n",
+                        suffix, use_bank_name(db), dst, count - 1,
+                        use_bank_name(b0), src0, off, addr);
+                for (i = 0; i < count; i++) {
+                    if (!sgx_translate(pd, addr + i * 4, &pa2)) {
+                        sgx_pr("[sgx]     %*s  VA %08x НЕ відображено\n",
+                                2 * depth, ind, addr + i * 4);
+                        c.stop = "ціль ld/st не відображена";
+                        break;
+                    }
+                    val = sgx_phys_ld32(pa2);
+                    sgx_pr("[sgx]     %*s  %s%u = %08x  (VA %08x)\n",
+                            2 * depth, ind, use_bank_name(db), dst + i, val,
+                            addr + i * 4);
+                    if (!use_write(&c, db, dst + i, val)) {
+                        c.stop = "приймач ldad не підтримано";
+                        break;
+                    }
                 }
+                if (c.stop) {
+                    break;
+                }
+            }
+
+            if (imode != USE1_LDST_IMODE_NONE && step != 0) {
+                uint32_t nb = base + step;
+
+                if (!use_write(&c, b0, src0, nb)) {
+                    sgx_pr("[sgx]     %*s  ⚠ базу %s%u не оновити\n",
+                            2 * depth, ind, use_bank_name(b0), src0);
+                    c.stop = "база ld/st не оновлюється";
+                    break;
+                }
+                sgx_pr("[sgx]     %*s  %s%u = %08x (інкремент %s#%u)\n",
+                        2 * depth, ind, use_bank_name(b0), src0, nb,
+                        imode == USE1_LDST_IMODE_PRE ? "перед, " : "після, ",
+                        off);
+            }
+            break;
+        }
+
+        case USE1_OP_IMAE: {
+            /*
+             * dst = src0(півслово) × src1(півслово) + src2.
+             * Саме нею мікроядро рахує адресу слота Kernel CCB:
+             * `imae r0, r1.low, #SIZEOF(SGXMKIF_COMMAND), r0, u32`
+             * (`eventhandler.use.asm:383`) — 32 байти на команду, бо `SIZEOF`
+             * у лексері асемблера БАЙТОВИЙ (`use.l:1017` ділить на 4 лише
+             * `DOFFSET`/`DSIZEOF`).
+             */
+            uint32_t spred = (w1 >> USE1_SPRED_SHIFT) & USE1_SPRED_MASK;
+            uint32_t s2type = (w1 >> USE1_IMAE_SRC2TYPE_SHIFT) &
+                              USE1_IMAE_SRC2TYPE_MASK;
+            uint32_t orshift = (w1 >> USE1_IMAE_ORSHIFT_SHIFT) &
+                               USE1_IMAE_ORSHIFT_MASK;
+            uint32_t rcount = ((w1 >> USE1_INT_RCOUNT_SHIFT) &
+                               USE1_INT_RCOUNT_MASK) + 1;
+            /* ⚠ S0 без розширення банку: біт 18 тут — END, не S0BEXT. */
+            ClarionUseBank b0 = use_bank_s0_ex(w1, false);
+            ClarionUseBank b1 = use_bank_s12((w0 >> USE0_S1BANK_SHIFT) &
+                                             USE0_BANK_MASK,
+                                             (w1 & USE1_S1BEXT) != 0);
+            ClarionUseBank b2 = use_bank_s12((w0 >> USE0_S2BANK_SHIFT) &
+                                             USE0_BANK_MASK,
+                                             (w1 & USE1_S2BEXT) != 0);
+            ClarionUseBank db = use_bank_dst(w1);
+            uint32_t a, b, acc, res;
+
+            if (!use_spred_true(&c, spred)) {
+                sgx_pr("imae (предикат хибний — пропущено)\n");
+                break;
+            }
+            if (w1 & USE1_IMAE_SIGNED) {
+                sgx_pr("imae зі знаком — не тлумачимо\n");
+                c.stop = "знакова imae";
+                break;
+            }
+            if (w1 & USE1_IMAE_SATURATE) {
+                sgx_pr("imae з насиченням — не тлумачимо\n");
+                c.stop = "imae з насиченням";
+                break;
+            }
+            if (w1 & (USE1_IMAE_CARRYINENABLE | USE1_IMAE_CARRYOUTENABLE)) {
+                /* Внутрішні регістри i0/i1 модель не тримає. */
+                sgx_pr("imae з переносом — не тлумачимо\n");
+                c.stop = "imae з переносом";
+                break;
+            }
+            if (orshift != 0) {
+                sgx_pr("imae зі зсувом результату на %u — не тлумачимо\n",
+                        orshift);
+                c.stop = "imae зі зсувом результату";
+                break;
+            }
+            if (rcount != 1) {
+                sgx_pr("imae з повтором ×%u — не тлумачимо\n", rcount);
+                c.stop = "повтор imae";
+                break;
+            }
+            if (s2type == USE1_IMAE_SRC2TYPE_MASK) {
+                sgx_pr("imae з зарезервованим типом src2\n");
+                c.stop = "зарезервований тип src2 в imae";
+                break;
+            }
+            if (!use_read(&c, b0, src0, &a) ||
+                !use_read(&c, b1, src1, &b) ||
+                !use_read(&c, b2, src2, &acc)) {
+                sgx_pr("imae  ⚠ джерело невідоме\n");
+                c.stop = "джерело imae невідоме";
+                break;
+            }
+            a = (w1 & USE1_IMAE_SRC0H_SELECTHIGH) ? (a >> 16) : (a & 0xFFFF);
+            b = (w1 & USE1_IMAE_SRC1H_SELECTHIGH) ? (b >> 16) : (b & 0xFFFF);
+            if (s2type != USE1_IMAE_SRC2TYPE_32BIT) {
+                uint32_t h = (w1 & USE1_IMAE_SRC2H_SELECTHIGH)
+                             ? (acc >> 16) : (acc & 0xFFFF);
+
+                acc = (s2type == USE1_IMAE_SRC2TYPE_16BITSEXT)
+                      ? (uint32_t)(int32_t)(int16_t)h : h;
+            }
+            res = a * b + acc;
+            sgx_pr("imae %s%u, %s%u.%s, %s%u.%s, %s%u = %08x\n",
+                    use_bank_name(db), dst,
+                    use_bank_name(b0), src0,
+                    (w1 & USE1_IMAE_SRC0H_SELECTHIGH) ? "high" : "low",
+                    use_bank_name(b1), src1,
+                    (w1 & USE1_IMAE_SRC1H_SELECTHIGH) ? "high" : "low",
+                    use_bank_name(b2), src2, res);
+            is_end = (w1 & USE1_END) != 0;
+            if (!use_write(&c, db, dst, res)) {
+                c.stop = "приймач imae не підтримано";
             }
             break;
         }
@@ -2118,7 +2532,8 @@ static void sgx_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     trace_clarion_sgx_write((uint32_t)addr, size, val);
 
     if (size == 4 && addr + 4 <= CLARION_SGX_SIZE) {
-        s->regs[addr / 4] = (uint32_t)val;
+        sgx_set_reg(s, addr, (uint32_t)val);
+        sgx_reg_side_effects(s, addr, (uint32_t)val);
         if (s->nwr < SGX_WR_JOURNAL) {
             s->wr[s->nwr].off = (uint32_t)addr;
             s->wr[s->nwr].val = (uint32_t)val;

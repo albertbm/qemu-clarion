@@ -41,6 +41,27 @@
 #define SGX_CR_BIF_DIR_LIST_BASE0   0x0C84
 
 /*
+ * MNE — вузол системного кешу (`eurasia/hwdefs/mnemedefs.h`). Мікроядро
+ * проходить через нього щоразу, коли хост просить `SGXMKIF_CC_INVAL_BIF_SL`.
+ *
+ * ⚠ На ЦЬОМУ ядрі запит «інвалідувати все» стоїть у біті 0 самого
+ * `MNE_CR_CTRL`, а не в окремому `MNE_CR_CTRL_INVAL` (0x0D20): у
+ * `usedefs.h` це гілка `#if !defined(MNE_CR_CTRL_INVAL)`, і прошивка
+ * підтвердила саме її — `ldr 0xD00` -> `or #1` -> `str 0xD00` -> `ldr 0xD14`,
+ * інструкція в інструкцію. Тому `MNE_CR_CTRL_INVAL_ALL` тут описує біт у
+ * 0x0D00, хоча ім'я маски в заголовку належить регістру 0x0D20.
+ *
+ * Протокол рівневий: запит виставляють, чекають на `EVENT_STATUS.INVAL`,
+ * гасять його через `EVENT_CLEAR`, і лише потім знімають сам запит.
+ */
+#define SGX_CR_MNE_CTRL             0x0D00
+#define SGX_CR_MNE_CTRL_INVAL_ALL   0x00000001U
+#define SGX_CR_MNE_EVENT_STATUS     0x0D14
+#define SGX_CR_MNE_EVENT_STATUS_INVAL 0x00000001U
+#define SGX_CR_MNE_EVENT_CLEAR      0x0D18
+#define SGX_CR_MNE_EVENT_CLEAR_INVAL  0x00000001U
+
+/*
  * Триплет task-control події «Other», який init-script прошивки пише ОСТАННІМ
  * перед kick'ом.
  *
@@ -342,6 +363,7 @@
 #define USE1_OP_XOR                 11
 #define USE1_OP_SHLROL              12
 #define USE1_OP_SHRASR              13
+#define USE1_OP_IMAE                21
 #define USE1_OP_LD                  29
 #define USE1_OP_ST                  30
 #define USE1_OP_SPECIAL             31
@@ -357,6 +379,19 @@
 #define USE1_EPRED_NOTP0            5
 #define USE1_EPRED_NOTP1            6
 #define USE1_EPRED_PNMOD4           7
+
+/*
+ * Короткий предикат (біти 26:25) — `sgxdefs.h:5184..5190`. Цілочисельні
+ * інструкції (IMAE і решта групи INT) несуть предикат ТУТ, а не в полі
+ * EPRED: у них біт 27 зайнято номером опкоду, а 26:25 лишилися предикату.
+ * Сплутати простір легко, тому поля названо окремо.
+ */
+#define USE1_SPRED_SHIFT            25
+#define USE1_SPRED_MASK             0x3
+#define USE1_SPRED_ALWAYS           0
+#define USE1_SPRED_P0               1
+#define USE1_SPRED_P1               2
+#define USE1_SPRED_NOTP0            3
 
 /* Прапорці word1 — `sgxdefs.h:5198..5206`. */
 #define USE1_END                    0x00040000U
@@ -415,6 +450,19 @@
 #define USE1_FLOWCTRL_OP2_SAVL      4
 #define USE1_FLOWCTRL_OP2_NOP       5
 
+/*
+ * `SETL` і `SAVL` — це `mov pclink, src1` і `mov dst, pclink`
+ * (`useasm.c:14077..14120`): окремої інструкції «запиши регістр зв'язку» в
+ * асемблері немає, є спеціальна форма `mov`. Джерело SETL читається як SRC1,
+ * приймач SAVL — звичайним полем призначення.
+ *
+ * ⚠ Регістр зв'язку тримає НОМЕР ІНСТРУКЦІЇ відносно вікна коду, а не адресу:
+ * host-kick обробники мікроядро віддає хостові саме так —
+ * `ui32ServiceAddress = <зсув мітки> / EURASIA_USE_INSTRUCTION_SIZE`
+ * (`srvinit/devices/sgx/sgxinit.c:690..692`), і це значення потрапляє в
+ * `pclink` без жодного перетворення. Той самий простір, що й у цілі `ba`.
+ */
+
 /* Гілка: `sgxdefs.h:6518..6521`. Зсув у word0 — НОМЕР ПАРИ, крок 8 Б. */
 #define USE1_BRANCH_SAVELINK        0x00000200U
 #define USE0_BRANCH_OFFSET_MASK     0x000FFFFFU
@@ -468,6 +516,72 @@
 #define USE1_LDST_IMODE_SHIFT       8
 #define USE1_LDST_IMODE_MASK        0x3
 #define USE1_LDST_IMODE_NONE        0
+#define USE1_LDST_IMODE_PRE         1
+#define USE1_LDST_IMODE_POST        2
+#define USE1_LDST_IMODE_RESERVED    3
+
+/*
+ * Банк приймача LD — окремий однобітовий прапорець, а не поле D1BANK
+ * (`sgxdefs.h:6397..6399`). Асемблер прямо забороняє будь-який інший банк:
+ * «The destination for an LD must be the primary attribute bank or the
+ * temporary bank» (`useasm.c:12266`).
+ */
+#define USE1_LDST_DBANK_PRIMATTR    0x00000080U
+
+/*
+ * ⚠ `MOEEXPAND` — ІНВЕРСНИЙ прапорець режиму вибірки (`sgxdefs.h:6376`).
+ * Еталонний декодер: `if (!(uInst1 & MOEEXPAND)) FETCHENABLE`
+ * (`usedisasm.c:2286..2288`). Тобто:
+ *
+ *   MOEEXPAND = 1 → звичайний доступ, повтори розгортає MOE;
+ *   MOEEXPAND = 0 → режим ВИБІРКИ (`.fetchN`): N поспіль двослів у N поспіль
+ *                   регістрів приймача, MOE в цьому не бере участі.
+ *
+ * Лічильник в обох режимах той самий — `RMSKCNT`, і його значення на одиницю
+ * менше за N (`useasm.c:12176`: `(uRptCount - 1) << RMSKCNT_SHIFT`;
+ * `usedisasm.c:2306`: `uMaskCount + 1`).
+ */
+#define USE1_LDST_MOEEXPAND         0x00200000U
+#define USE1_RMSKCNT_SHIFT          12
+#define USE1_RMSKCNT_MASK           0xF
+
+/*
+ * `.fcfill` = force cache line fill (`sgxdefs.h:6413`) — підказка кешу даних.
+ * Кеша в моделі немає, тому вимога виконується тривіально, а не «пропущена».
+ */
+#define USE1_LDST_FCLFILL           0x00000002U
+#define USE1_LDST_RANGEENABLE       0x00000040U
+#define USE1_LDST_INCSGN            0x00000008U
+
+/*
+ * IMAE — цілочисельне множення з додаванням, `sgxdefs.h:5155, 6021..6055`.
+ * Семантика — з коментаря самого компілятора IMG (`usc2/finalise.c:3137`):
+ *
+ *   IMAE  DST, SRC0, #SRC1, SRC2   //  DST = SRC0 * SRC1 + SRC2
+ *
+ * Множники — ПІВСЛОВА (16 біт), і яке саме півслово, обирають прапорці
+ * SRC0H/SRC1H; додаток SRC2 має власний тип (16 із нулями, 16 зі знаком або
+ * повні 32 біти). Псевдоінструкція `iaddu32 d, a, b` — це той самий IMAE з
+ * SRC1 = #1 (`useasm.c:6217..6252`), тому окремо її реалізовувати не треба.
+ */
+#define USE1_IMAE_SRC0H_SELECTHIGH  0x01000000U
+#define USE1_IMAE_SRC1H_SELECTHIGH  0x00200000U
+#define USE1_IMAE_SRC2H_SELECTHIGH  0x00100000U
+#define USE1_IMAE_SIGNED            0x00000800U
+#define USE1_IMAE_SATURATE          0x00000400U
+#define USE1_IMAE_CARRYINENABLE     0x00000200U
+#define USE1_IMAE_CARRYOUTENABLE    0x00000100U
+#define USE1_IMAE_SRC2TYPE_SHIFT    6
+#define USE1_IMAE_SRC2TYPE_MASK     0x3
+#define USE1_IMAE_SRC2TYPE_16BITZEXT 0
+#define USE1_IMAE_SRC2TYPE_16BITSEXT 1
+#define USE1_IMAE_SRC2TYPE_32BIT    2
+#define USE1_IMAE_ORSHIFT_SHIFT     3
+#define USE1_IMAE_ORSHIFT_MASK      0x7
+
+/* Лічильник повторів цілочисельної групи — `sgxdefs.h:5641..5643`. */
+#define USE1_INT_RCOUNT_SHIFT       12
+#define USE1_INT_RCOUNT_MASK        0x7
 
 /* TEST — `sgxdefs.h:5488..5587`. */
 #define USE1_TEST_ZTST_SHIFT        8
