@@ -701,11 +701,16 @@
 #define USE1_TEST_CRCOMB_AND        0x00000080U
 #define USE1_TEST_PDST_SHIFT        2
 #define USE1_TEST_PDST_MASK         0x3
+#define USE1_TEST_CHANCC_SHIFT      4
+#define USE1_TEST_CHANCC_MASK       0x7
+#define USE1_TEST_CHANCC_SELECT0   0
 #define USE0_TEST_WBEN               0x00100000U
 #define USE0_TEST_ALUSEL_SHIFT      18
 #define USE0_TEST_ALUSEL_MASK       0x3
+#define USE0_TEST_ALUSEL_I16       1
 #define USE0_TEST_ALUSEL_BITWISE    3
 #define USE0_TEST_ALUOP_SHIFT       14
+#define USE0_TEST_ALUOP_I16_ISUB   7
 #define USE0_TEST_ALUOP_MASK        0xF
 #define USE0_TEST_ALUOP_BW_AND      0
 #define USE0_TEST_ALUOP_BW_OR       1

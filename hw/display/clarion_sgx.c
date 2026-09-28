@@ -1912,7 +1912,6 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                          * крутилося б вічно.
                          */
                         ClarionUseBank db = use_bank_dst(w1);
-
                         if (off + 4 > CLARION_SGX_SIZE) {
                             sgx_pr("ldr #%u — поза вікном регістрів\n", num);
                             c.stop = "ldr поза вікном регістрів";
@@ -2039,9 +2038,12 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
             uint32_t a, b, res;
             const char *name;
 
-            if (alusel != USE0_TEST_ALUSEL_BITWISE) {
-                sgx_pr("test alusel=%u — не тлумачимо\n", alusel);
-                c.stop = "нецілочисельний TEST";
+            if (alusel != USE0_TEST_ALUSEL_BITWISE &&
+                !(alusel == USE0_TEST_ALUSEL_I16 &&
+                  aluop == USE0_TEST_ALUOP_I16_ISUB)) {
+                sgx_pr("test alusel=%u aluop=%u — не тлумачимо\n",
+                        alusel, aluop);
+                c.stop = "нетлумачений ALUSEL у TEST";
                 break;
             }
             if (!use_read(&c, b1, src1, &a) || !use_read(&c, b2, src2, &b)) {
@@ -2049,7 +2051,21 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                 c.stop = "джерело TEST невідоме";
                 break;
             }
-            switch (aluop) {
+            if (alusel == USE0_TEST_ALUSEL_I16) {
+                uint32_t channel = (w1 >> USE1_TEST_CHANCC_SHIFT) &
+                                   USE1_TEST_CHANCC_MASK;
+
+                /* SGX540 ISUB16 computes signed halfword lanes. TEST channel 0
+                 * observes the low halfword; this instruction does not write
+                 * back the arithmetic result (WBEN is clear in the target). */
+                if (channel != USE1_TEST_CHANCC_SELECT0) {
+                    sgx_pr("isub16.test channel=%u — не тлумачимо\n", channel);
+                    c.stop = "нетлумачений канал I16 TEST";
+                    break;
+                }
+                res = (uint32_t)(int32_t)(int16_t)(uint16_t)(a - b);
+                name = "isub16";
+            } else switch (aluop) {
             case USE0_TEST_ALUOP_BW_AND: res = a & b;  name = "and"; break;
             case USE0_TEST_ALUOP_BW_OR:  res = a | b;  name = "or";  break;
             case USE0_TEST_ALUOP_BW_XOR: res = a ^ b;  name = "xor"; break;
