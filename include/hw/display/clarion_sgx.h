@@ -85,6 +85,9 @@
 #define SGX_CR_BIF_CTRL             0x0C00
 #define SGX_CR_BIF_DIR_LIST_BASE0   0x0C84
 
+/* SGX540 DDK sgxfeaturedefs.h: SGX_FEATURE_USE_NUMBER_PC_BITS = 12. */
+#define SGX_FEATURE_USE_NUMBER_PC_BITS 12
+
 /*
  * MNE — вузол системного кешу (`eurasia/hwdefs/mnemedefs.h`). Мікроядро
  * проходить через нього щоразу, коли хост просить `SGXMKIF_CC_INVAL_BIF_SL`.

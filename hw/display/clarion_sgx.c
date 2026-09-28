@@ -562,6 +562,7 @@ typedef struct ClarionPdsCtx {
  * одна форвард-декларація.
  */
 static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
+                        uint32_t page_base, unsigned cbase, unsigned coff,
                         uint32_t entry, unsigned depth);
 
 /*
@@ -835,7 +836,9 @@ static void pds_doutu(ClarionPdsCtx *c, const uint32_t *emit, unsigned n)
         c->s->use_queue[c->s->nuse++] = va;
     }
     sgx_pr("[sgx]              ✔ ЗАПУСК задачі USE @%08x\n", va);
-    sgx_use_run(c->s, c->pd, c->use_base[cbase], va, c->depth + 1);
+    sgx_use_run(c->s, c->pd, c->use_base[cbase],
+                c->use_base[cbase] + (coff << PDS_DOUTU0_COFF_ALIGNSHIFT),
+                cbase, coff, va, c->depth + 1);
 }
 
 /*
@@ -1250,6 +1253,9 @@ typedef struct ClarionUseCtx {
     unsigned notes;
 
     uint32_t code_base;         /* вікно EUR_CR_USE_CODE_BASE_n цієї задачі */
+    uint32_t page_base;         /* code_base + COFF * USE_PAGE_SIZE */
+    unsigned cbase;
+    unsigned coff;
     uint32_t link;              /* регістр зв'язку для ba.savelink/lapc */
     bool link_known;
 
@@ -1597,11 +1603,27 @@ static uint32_t use_ldst_scale(uint32_t w1)
  * (docs/sgx/22 §4). Усе інше зупиняє виконання з названою причиною: модель
  * радше зізнається, що не вміє, ніж вдасть, ніби виконала.
  */
+#define USE_PC_INDEX_MASK ((1U << SGX_FEATURE_USE_NUMBER_PC_BITS) - 1U)
+
+static uint32_t use_page_pc(uint32_t page_base, uint32_t index)
+{
+    return page_base + ((index & USE_PC_INDEX_MASK) * USE_INST_SIZE);
+}
+
+static uint32_t use_next_pc(const ClarionUseCtx *c, uint32_t pc)
+{
+    uint32_t index = (pc - c->page_base) / USE_INST_SIZE;
+
+    return use_page_pc(c->page_base, index + 1U);
+}
+
 static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
+                        uint32_t page_base, unsigned cbase, unsigned coff,
                         uint32_t entry, unsigned depth)
 {
     ClarionUseCtx c;
-    uint32_t pc = entry;
+    uint32_t pc = use_page_pc(page_base,
+                              (entry - page_base) / USE_INST_SIZE);
     unsigned steps = 0;
     const char *ind;
 
@@ -1616,10 +1638,14 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
     c.pd = pd;
     c.depth = depth;
     c.code_base = code_base;
+    c.page_base = page_base;
+    c.cbase = cbase;
+    c.coff = coff;
     ind = "";
 
-    sgx_pr("[sgx]   %*sВИКОНАННЯ задачі USE @%08x (вікно коду %08x):\n",
-            2 * depth, ind, entry, code_base);
+    sgx_pr("[sgx]   %*sВИКОНАННЯ задачі USE @%08x (CBASE=%u COFF=%u;"
+            " page_base=%08x; вікно коду %08x):\n",
+            2 * depth, ind, entry, cbase, coff, page_base, code_base);
 
     while (steps++ < SGX_USE_MAX_STEPS) {
         uint32_t pa, w0, w1, op, epred, dst, src0, src1, src2;
@@ -1664,7 +1690,7 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
             }
             if (!taken) {
                 sgx_pr(" (предикат хибний — пропущено)\n");
-                pc += USE_INST_SIZE;
+                pc = use_next_pc(&c, pc);
                 continue;
             }
         }
@@ -1684,17 +1710,14 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                     break;
                 }
                 if (op2 == USE1_FLOWCTRL_OP2_BA) {
-                    /*
-                     * `ba` — абсолютна гілка В МЕЖАХ вікна коду задачі, а не
-                     * від нуля: поле несе НОМЕР ПАРИ від бази
-                     * `EUR_CR_USE_CODE_BASE_n`, з якої задачу запустив DOUTU.
-                     */
-                    uint32_t target = c.code_base +
-                                      (w0 & USE0_BRANCH_OFFSET_MASK) *
-                                      USE_INST_SIZE;
+                    /* SGX540 BA target is a 12-bit instruction index within
+                     * this task's COFF-selected code page (DDK
+                     * SGX_FEATURE_USE_NUMBER_PC_BITS). */
+                    uint32_t target = use_page_pc(c.page_base,
+                                      w0 & USE_PC_INDEX_MASK);
 
                     if (w1 & USE1_BRANCH_SAVELINK) {
-                        c.link = pc + USE_INST_SIZE;
+                        c.link = use_next_pc(&c, pc);
                         c.link_known = true;
                         sgx_pr("ba.savelink -> %08x (link=%08x)\n",
                                 target, c.link);
@@ -1749,7 +1772,7 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                                 use_bank_name(sb), src1);
                         break;
                     }
-                    c.link = c.code_base + val * USE_INST_SIZE;
+                    c.link = use_page_pc(c.page_base, val);
                     c.link_known = true;
                     sgx_pr("mov pclink, %s%u = %08x  -> link=%08x\n",
                             use_bank_name(sb), src1, val, c.link);
@@ -1780,9 +1803,9 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                     }
                     sgx_pr("mov %s%u, pclink = %08x (інстр. %u)\n",
                             use_bank_name(db), dst, c.link,
-                            (c.link - c.code_base) / USE_INST_SIZE);
+                            (c.link - c.page_base) / USE_INST_SIZE);
                     if (!use_write(&c, db, dst,
-                                   (c.link - c.code_base) / USE_INST_SIZE)) {
+                                   (c.link - c.page_base) / USE_INST_SIZE)) {
                         c.stop = "приймач savl не підтримано";
                     }
                     break;
@@ -1846,7 +1869,7 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                         sgx_pr("mov %s%u, #0x%08x"
                                 " (предикат хибний — пропущено)\n",
                                 use_bank_name(db), dst, imm);
-                        pc += USE_INST_SIZE;
+                        pc = use_next_pc(&c, pc);
                         continue;
                     }
                     sgx_pr("mov %s%u, #0x%08x", use_bank_name(db),
@@ -2511,7 +2534,7 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                     2 * depth, ind);
             break;
         }
-        pc += USE_INST_SIZE;
+        pc = use_next_pc(&c, pc);
     }
 
     if (c.stop) {
