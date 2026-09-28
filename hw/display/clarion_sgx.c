@@ -167,6 +167,11 @@ struct ClarionSgxState {
     unsigned nuse;
     unsigned nstores;           /* скільки stad справді лягло в пам'ять гостя */
 
+    /* --- M5-C: ідентичність ядра (QY8_SGX_CORE_REV / QY8_SGX_CORE_ID) --- */
+    uint32_t core_rev;
+    uint32_t core_id;
+    bool core_id_warned;
+
     /* QY8_SGX_PDS_RUN — діагностичний запуск названої програми PDS. */
     uint32_t run_va;
     uint32_t run_rows;
@@ -1737,9 +1742,16 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                             c.stop = "значення регістра SGX невідоме";
                             break;
                         }
-                        sgx_pr("ldr %s%u, #%u = %08x  (рег +0x%04x)\n",
+                        sgx_pr("ldr %s%u, #%u = %08x  (рег +0x%04x)%s\n",
                                 use_bank_name(db), dst, num,
-                                s->regs[off / 4], off);
+                                s->regs[off / 4], off,
+                                off == SGX_CR_CORE_ID
+                                    ? "  ⚠ EUR_CR_CORE_ID: значення без"
+                                      " підстави; контракт його не читає"
+                                    : off == SGX_CR_CORE_REVISION
+                                    ? "  EUR_CR_CORE_REVISION: константа, яку"
+                                      " називає сама прошивка"
+                                    : "");
                         if (!use_write(&c, db, dst, s->regs[off / 4])) {
                             c.stop = "приймач ldr не підтримано";
                         }
@@ -2532,8 +2544,19 @@ static void sgx_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     trace_clarion_sgx_write((uint32_t)addr, size, val);
 
     if (size == 4 && addr + 4 <= CLARION_SGX_SIZE) {
-        sgx_set_reg(s, addr, (uint32_t)val);
-        sgx_reg_side_effects(s, addr, (uint32_t)val);
+        /*
+         * Регістри ідентичності апаратно лише для читання, тож значення не
+         * змінюємо — інакше модель забула б, яке ядро вона вдає. У журнал
+         * запис однаково потрапляє: це журнал того, що РОБИВ гість.
+         */
+        if (addr == SGX_CR_CORE_ID || addr == SGX_CR_CORE_REVISION) {
+            qemu_log_mask(LOG_GUEST_ERROR, "clarion-sgx: запис у регістр"
+                          " ідентичності 0x%04" HWADDR_PRIx
+                          " — проігноровано\n", addr);
+        } else {
+            sgx_set_reg(s, addr, (uint32_t)val);
+            sgx_reg_side_effects(s, addr, (uint32_t)val);
+        }
         if (s->nwr < SGX_WR_JOURNAL) {
             s->wr[s->nwr].off = (uint32_t)addr;
             s->wr[s->nwr].val = (uint32_t)val;
@@ -2598,6 +2621,16 @@ static void clarion_sgx_reset_hold(Object *obj, ResetType type)
     s->sa_sbase = 0;
     s->nuse = 0;
     s->nstores = 0;
+
+    /*
+     * Регістри ідентичності апарат тримає завжди — їх ніхто не «пише», вони
+     * просто є. Тому після скидання вони ВІДОМІ, на відміну від решти вікна.
+     */
+    s->regs[SGX_CR_CORE_REVISION / 4] = s->core_rev;
+    s->regs_known[SGX_CR_CORE_REVISION / 4] = true;
+    s->regs[SGX_CR_CORE_ID / 4] = s->core_id;
+    s->regs_known[SGX_CR_CORE_ID / 4] = true;
+    s->core_id_warned = false;
 }
 
 /* QY8_SGX_DUMP="0x0F003000:0x104,0x0E40C1B0:0x4C" */
@@ -2690,6 +2723,19 @@ static void clarion_sgx_realize(DeviceState *dev, Error **errp)
     s->show_writes = getenv("QY8_SGX_WRITES") != NULL;
     s->graph = getenv("QY8_SGX_GRAPH") != NULL;
     s->exec = getenv("QY8_SGX_EXEC") != NULL;
+    e = getenv("QY8_SGX_CORE_REV");
+    s->core_rev = e ? (uint32_t)strtoul(e, NULL, 0) : SGX_CORE_REVISION_QY8;
+    e = getenv("QY8_SGX_CORE_ID");
+    s->core_id = e ? (uint32_t)strtoul(e, NULL, 0) : SGX_CORE_ID_UNKNOWN;
+    fprintf(stderr, "[sgx] ідентичність ядра: EUR_CR_CORE_REVISION = %08x"
+            " (SGX540 r%u.%u.%u — константа самої прошивки, див. заголовок),"
+            " EUR_CR_CORE_ID = %08x%s\n",
+            s->core_rev,
+            (s->core_rev >> 16) & 0xFF, (s->core_rev >> 8) & 0xFF,
+            s->core_rev & 0xFF, s->core_id,
+            s->core_id == SGX_CORE_ID_UNKNOWN
+                ? " ⚠ ПІДСТАВИ НЕМАЄ (жодна перевірка його не читає)" : "");
+
     sgx_parse_dump(s, getenv("QY8_SGX_DUMP"));
     sgx_parse_find(s, getenv("QY8_SGX_FIND"));
     sgx_parse_pds_run(s, getenv("QY8_SGX_PDS_RUN"));
