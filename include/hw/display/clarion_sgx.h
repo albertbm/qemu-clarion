@@ -61,6 +61,7 @@
  * `str #666/#667` (номер = байтовий зсув / 4) — docs/sgx/23 §3.
  * Докази ролі й ланцюга — docs/sgx/09-edm-boot-locator.md.
  */
+#define SGX_CR_EVENT_PDS_ENABLE     0x0A58
 #define SGX_CR_EVENT_OTHER_PDS_EXEC 0x0A68
 #define SGX_CR_EVENT_OTHER_PDS_DATA 0x0A6C
 #define SGX_CR_EVENT_OTHER_PDS_INFO 0x0A70
@@ -78,6 +79,20 @@
 #define SGX_BIF_DIR_LIST_BASE_ADDR_MASK 0xFFFFF000U
 
 #define SGX_CR_EVENT_KICK2_NOW          0x00000001U
+
+/*
+ * Програмна подія. ⚠ Нумерація РІЗНА у двох просторах, і сплутати їх легко:
+ *
+ *   регістри   `EUR_CR_EVENT_{STATUS,HOST_ENABLE,HOST_CLEAR,PDS_ENABLE}`
+ *              — `SW_EVENT` це біт **14** (`sgx540defs.h:536,631,726,2043`);
+ *   вхід PDS   `ir1` — `EURASIA_PDS_IR1_EDM_EVENT_SWEVENT` це біт **8**
+ *              (`sgxdefs.h:3566`, гілка НЕ-543/544/554, тобто наша).
+ *
+ * Відповідність між ними — за іменем тієї самої події, а не за позицією.
+ */
+#define SGX_EVENT_SW_EVENT_MASK         0x00004000U
+#define PDS_IR1_EDM_EVENT_SWEVENT       (1u << 8)
+#define PDS_IR1_EDM_EVENT_KICKPTR_SHIFT 24
 
 /*
  * Формат MMU SGX — DDK 1.7 services4/srvkm/hwdefs/sgxmmu.h, варіант без
@@ -128,6 +143,32 @@
 #define PDS_CC_ALWAYS               7
 
 /*
+ * Логічні операції — `sgxdefs.h:3119..3176`, гілка БЕЗ
+ * `SGX_FEATURE_PDS_EXTENDED_SOURCES` (наша, SGX540): `SRC2SEL` немає взагалі,
+ * друге джерело — завжди банк DS1, і `SRC2` стоїть на 10, а не на 9.
+ */
+#define PDS_TYPE_OR                 0       /* у групі LOGIC */
+#define PDS_TYPE_AND                1
+#define PDS_TYPE_XOR                2
+#define PDS_TYPE_NOT                3
+#define PDS_TYPE_NOR                4
+#define PDS_TYPE_NAND               5
+#define PDS_TYPE_SHL                6
+#define PDS_TYPE_SHR                7
+#define PDS_LOGIC_SRC1SEL_SHIFT     23
+#define PDS_LOGIC_SRC1SEL_REG       1
+#define PDS_LOGIC_SRC1_SHIFT        17
+#define PDS_LOGIC_SRC1_MASK         0x3F
+#define PDS_LOGIC_SRC2_SHIFT        10
+#define PDS_LOGIC_SRC2_MASK         0x3F
+#define PDS_LOGIC_DESTSEL_SHIFT     6
+#define PDS_LOGIC_DESTSEL_MASK      0x1
+#define PDS_LOGIC_DEST_MASK         0x3F
+#define PDS_LOGIC_SRC1_IR0          0x00
+#define PDS_LOGIC_SRC1_IR1          0x01
+#define PDS_LOGIC_SRC1_TIM          0x02
+
+/*
  * TSTZ/TSTN — `sgxdefs.h:3068..3090`. Предикат p0..p2 (біти 2:0) дістає
  * результат порівняння з нулем одного з двох джерел; SRCSEL (біт 8) вибирає,
  * якого саме. SRC1 — ds0[] або вхідний регістр ir0/ir1, SRC2 — завжди ds1[].
@@ -164,6 +205,14 @@
  * `src * PDS_NUM_DWORDS_PER_QWORD + (swiz & 1)` (`pdsdisasm.c`).
  */
 #define PDS_MOVS_SRC1SEL_SHIFT      23
+#define PDS_MOVS_SRC1SEL_REG        1
+/*
+ * Коли SRC1SEL = REG, поле SRC1 індексує не datastore, а вхідні регістри
+ * задачі (`sgxdefs.h:2674..2676`).
+ */
+#define PDS_MOVS_SRC1_IR0           0x00
+#define PDS_MOVS_SRC1_IR1           0x01
+#define PDS_MOVS_SRC1_TIM           0x02
 #define PDS_MOVS_SRC1_SHIFT         18
 #define PDS_MOVS_SRC1_MASK          0x1F
 #define PDS_MOVS_SRC2_SHIFT         13
@@ -241,6 +290,24 @@
 #define SGX_SA_TA3DCTL              0
 #define SGX_SA_HOSTCTL              1
 #define SGX_SA_CCBCTL               2
+
+/*
+ * DOUTA — запис у ПЕРВИННІ атрибути задачі USE (`sgxdefs.h:3654..3662`).
+ * Слово 0 — самі дані (усі 32 біти), слово 1 несе `AO` — зсув у банку
+ * атрибутів, біти 18:8 у нашій гілці (CLRMSK `0xFFF800FF`).
+ *
+ * Саме цим обробник подій мікроядра починає роботу:
+ * `movs douta, ir0, INPUT_IR0_PA_DEST` і те саме для `ir1`
+ * (`services4/srvinit/devices/sgx/eventhandler.pds.asm:84..85`) — тобто
+ * перекладає прапорці події з вхідних регістрів у атрибути, щоб код USE міг
+ * перевірити, яка подія сталася.
+ */
+#define PDS_NUM_ATTRIB_CONTROL_WORDS 2
+#define PDS_DOUTA1_AO_SHIFT         8
+#define PDS_DOUTA1_AO_MASK          0x7FF
+
+/* Банк первинних атрибутів; розмір — за максимумом поля AO. */
+#define SGX_PA_DWORDS               (PDS_DOUTA1_AO_MASK + 1)
 
 /* DOUTU — інтерфейс запуску задачі USE */
 #define PDS_DOUTU0_CBASE_MASK       0xF
@@ -437,6 +504,23 @@
 #define USE1_BITWISE_SRC2ROT_SHIFT  6
 #define USE1_BITWISE_SRC2ROT_MASK   0x1F
 #define USE1_BITWISE_PARTIAL        0x00000004U
+
+/*
+ * ⚠ Безпосередній операнд бітових операцій — НЕ 7-бітний `SRC2`, а 16-бітний,
+ * склеєний із трьох полів (`sgxdefs.h:5611..5636`):
+ *
+ *   біти  6:0  — `SRC2`               (word0 6:0)
+ *   біти 13:7  — `SRC2IEXTLPSEL`      (word0 20:14)
+ *   біти 15:14 — `SRC2IEXTH`          (word1 5:4)
+ *
+ * Звідси й `EURASIA_USE_BITWISE_MAXIMUM_UNROTATED_IMMEDIATE = 0xFFFF`.
+ * Прочитавши лише `SRC2`, модель бачила маски як нулі — і ланцюг перевірок
+ * подій провалювався наскрізь, нічого не збігаючи.
+ */
+#define USE0_BITWISE_SRC2IEXTLPSEL_SHIFT 14
+#define USE0_BITWISE_SRC2IEXTLPSEL_MASK  0x7F
+#define USE1_BITWISE_SRC2IEXTH_SHIFT     4
+#define USE1_BITWISE_SRC2IEXTH_MASK      0x3
 
 /*
  * MOVC — `sgxdefs.h:5375..5393`. Поле TSTDTYPE = UNCOND означає звичайний
