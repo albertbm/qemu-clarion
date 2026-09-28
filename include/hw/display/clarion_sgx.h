@@ -477,6 +477,29 @@
 #define USE_D1STDBANK_PRIMATTR      2
 #define USE_D1EXTBANK_SECATTR       0
 
+/*
+ * Індексована адресація. Приймач `mov` у банку `D1EXTBANK_INDEX`
+ * (`sgxdefs.h:5260`) несе в полі номера не номер регістра, а МАСКУ: еталонний
+ * асемблер приймає лише 1, 2, 3 і відкидає решту з «Invalid index mask»
+ * (`useasm.c:1920..1927`). Індексований операнд (`S12EXTBANK_INDEXED` як
+ * джерело, `D1STDBANK_INDEXED` як приймач) тримає в полі номера трійку
+ * {банк, вибір регістра, зсув}: біти 6:5 — банк, біт 4 — IDXSEL, біти 3:0 —
+ * зсув (`sgxdefs.h:7719..7733`, складання — `useasm.c:1023..1060`).
+ */
+#define USE_D1STDBANK_INDEXED       3
+#define USE_D1EXTBANK_INDEX         2
+#define USE_INDEX_BANK_SHIFT        5
+#define USE_INDEX_BANK_MASK         0x3
+#define USE_INDEX_IDXSEL            0x10U
+#define USE_INDEX_OFFSET_MASK       0xFU
+#define USE_INDEX_BANK_TEMP         0
+#define USE_INDEX_BANK_OUTPUT       1
+#define USE_INDEX_BANK_PRIMATTR     2
+#define USE_INDEX_BANK_SECATTR      3
+#define USE_INDEX_MASK_L            1
+#define USE_INDEX_MASK_H            2
+#define USE_INDEX_BANK_SIZE         2
+
 /* SPECIAL: категорія (біти 21:20) — `sgxdefs.h:6453..6459`. */
 #define USE1_SPECIAL_OPCAT_SHIFT    20
 #define USE1_SPECIAL_OPCAT_MASK     0x3
@@ -537,6 +560,15 @@
 #define USE1_LIMM_IMM2521_MASK      0x1F
 #define USE1_LIMM_IMM3126_SHIFT     12
 #define USE1_LIMM_IMM3126_MASK      0x3F
+
+/*
+ * Предикат LIMM живе у власному полі (біти 11:9, `sgxdefs.h:7443..7444`), а
+ * набір значень у нього той самий, що й у звичайного EPRED: еталонний
+ * асемблер кладе туда результат того самого `EncodePredicate(..., FALSE)`
+ * (`useasm.c:14012`, `useasm.c:2664..2671`).
+ */
+#define USE1_LIMM_EPRED_SHIFT       9
+#define USE1_LIMM_EPRED_MASK        0x7
 
 /*
  * LDRSTR (`str`/`ldr`) — `sgxdefs.h:7461..7475`. Номер спецрегістра склеєний

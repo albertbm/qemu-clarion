@@ -1224,6 +1224,8 @@ typedef enum {
     USE_BANK_SECATTR,
     USE_BANK_PRIMATTR,
     USE_BANK_IMMEDIATE,
+    USE_BANK_INDEX,             /* самі i.l/i.h як приймач `mov` */
+    USE_BANK_INDEXED,           /* операнд, номер якого ще треба розв'язати */
     USE_BANK_UNSUPPORTED,
 } ClarionUseBank;
 
@@ -1235,6 +1237,17 @@ typedef struct ClarionUseCtx {
     uint32_t r[USE_NUM_TEMPS];
     bool r_known[USE_NUM_TEMPS];
     bool pred[USE_NUM_PREDICATES];
+
+    /*
+     * Індексні регістри задачі. На вході НЕВІДОМІ: модель не знає, що лишив у
+     * конвеєрі попередній власник, і вигадувати нуль тут не можна.
+     */
+    uint32_t idx[USE_INDEX_BANK_SIZE];
+    bool idx_known[USE_INDEX_BANK_SIZE];
+
+    /* Примітки до поточної інструкції — друкуються під її рядком. */
+    char note[2][96];
+    unsigned notes;
 
     uint32_t code_base;         /* вікно EUR_CR_USE_CODE_BASE_n цієї задачі */
     uint32_t link;              /* регістр зв'язку для ba.savelink/lapc */
@@ -1275,6 +1288,7 @@ static ClarionUseBank use_bank_s12(uint32_t bank, bool ext)
     if (ext) {
         switch (bank) {
         case USE_S12EXTBANK_IMMEDIATE: return USE_BANK_IMMEDIATE;
+        case USE_S12EXTBANK_INDEXED:   return USE_BANK_INDEXED;
         default:                       return USE_BANK_UNSUPPORTED;
         }
     }
@@ -1293,14 +1307,91 @@ static const char *use_bank_name(ClarionUseBank b)
     case USE_BANK_SECATTR:   return "sa";
     case USE_BANK_PRIMATTR:  return "pa";
     case USE_BANK_IMMEDIATE: return "#";
+    case USE_BANK_INDEX:     return "i";
+    case USE_BANK_INDEXED:   return "idx";
     default:                 return "?";
     }
+}
+
+/* Назва індексного регістра за маскою приймача (`useasm.c:1920..1927`). */
+static const char *use_index_name(uint32_t mask)
+{
+    switch (mask) {
+    case USE_INDEX_MASK_L: return "i.l";
+    case USE_INDEX_MASK_H: return "i.h";
+    case USE_INDEX_MASK_L | USE_INDEX_MASK_H: return "i.lh";
+    default: return "i?";
+    }
+}
+
+/* Примітка під рядком інструкції: чесний слід того, що ми розв'язали. */
+static void use_note(ClarionUseCtx *c, const char *fmt, ...)
+{
+    va_list ap;
+
+    if (c->notes >= ARRAY_SIZE(c->note)) {
+        return;
+    }
+    va_start(ap, fmt);
+    vsnprintf(c->note[c->notes], sizeof(c->note[0]), fmt, ap);
+    va_end(ap);
+    c->notes++;
+}
+
+/*
+ * Перетворити індексований операнд у пару «банк + номер».
+ *
+ * Поле номера несе {банк, IDXSEL, зсув} (`sgxdefs.h:7719..7733`). Ефективний
+ * номер регістра — `індекс + зсув`: поле зветься OFFSET, а еталонний асемблер
+ * називає його «Offset into indexed register bank» (`useasm.c:1048..1060`).
+ * Це STRONG INFERENCE, і саме його перевіряє приймання T17.
+ *
+ * Невідомий індекс — це відмова з поясненням у лозі, а не нуль.
+ */
+static bool use_index_resolve(ClarionUseCtx *c, ClarionUseBank *bank,
+                              uint32_t *num)
+{
+    uint32_t enc, off, sel;
+    ClarionUseBank target;
+    unsigned reg;
+
+    if (*bank != USE_BANK_INDEXED) {
+        return true;
+    }
+    enc = *num;
+    off = enc & USE_INDEX_OFFSET_MASK;
+    reg = (enc & USE_INDEX_IDXSEL) ? 1 : 0;
+    sel = (enc & USE_INDEX_IDXSEL) ? USE_INDEX_MASK_H : USE_INDEX_MASK_L;
+
+    switch ((enc >> USE_INDEX_BANK_SHIFT) & USE_INDEX_BANK_MASK) {
+    case USE_INDEX_BANK_TEMP:     target = USE_BANK_TEMP; break;
+    case USE_INDEX_BANK_PRIMATTR: target = USE_BANK_PRIMATTR; break;
+    case USE_INDEX_BANK_SECATTR:  target = USE_BANK_SECATTR; break;
+    default:
+        /* OUTPUT: банку виходу модель не має — кажемо це вголос. */
+        use_note(c, "індексований банк OUTPUT не змодельовано");
+        return false;
+    }
+    if (!c->idx_known[reg]) {
+        use_note(c, "індекс %s невідомий — операнд не розв'язати",
+                 use_index_name(sel));
+        return false;
+    }
+    *bank = target;
+    *num = c->idx[reg] + off;
+    use_note(c, "%s[%s+%u] -> %s%u   (%s = %u)", use_bank_name(target),
+             use_index_name(sel), off, use_bank_name(target), *num,
+             use_index_name(sel), c->idx[reg]);
+    return true;
 }
 
 /* Прочитати операнд. Невідоме значення — це false, а не вигаданий нуль. */
 static bool use_read(ClarionUseCtx *c, ClarionUseBank bank, uint32_t num,
                      uint32_t *out)
 {
+    if (!use_index_resolve(c, &bank, &num)) {
+        return false;
+    }
     switch (bank) {
     case USE_BANK_IMMEDIATE:
         *out = num;
@@ -1335,6 +1426,25 @@ static bool use_read(ClarionUseCtx *c, ClarionUseBank bank, uint32_t num,
 static bool use_write(ClarionUseCtx *c, ClarionUseBank bank, uint32_t num,
                       uint32_t val)
 {
+    if (!use_index_resolve(c, &bank, &num)) {
+        return false;
+    }
+    if (bank == USE_BANK_INDEX) {
+        /* Номер — маска регістрів, а не номер регістра. */
+        if (num == 0 || num > (USE_INDEX_MASK_L | USE_INDEX_MASK_H)) {
+            return false;
+        }
+        if (num & USE_INDEX_MASK_L) {
+            c->idx[0] = val;
+            c->idx_known[0] = true;
+        }
+        if (num & USE_INDEX_MASK_H) {
+            c->idx[1] = val;
+            c->idx_known[1] = true;
+        }
+        use_note(c, "%s = %u", use_index_name(num), val);
+        return true;
+    }
     if (bank == USE_BANK_TEMP && num < USE_NUM_TEMPS) {
         c->r[num] = val;
         c->r_known[num] = true;
@@ -1364,10 +1474,15 @@ static bool use_write(ClarionUseCtx *c, ClarionUseBank bank, uint32_t num,
  * Потрібно там, де «невідоме значення» треба ПРОНЕСТИ далі, а «немає такого
  * банку» мусить спинити виконання: змішувати ці два випадки не можна.
  */
-static bool use_slot_ok(ClarionUseBank bank, uint32_t num)
+static bool use_slot_ok(ClarionUseCtx *c, ClarionUseBank bank, uint32_t num)
 {
+    if (!use_index_resolve(c, &bank, &num)) {
+        return false;
+    }
     switch (bank) {
     case USE_BANK_IMMEDIATE: return true;
+    case USE_BANK_INDEX:
+        return num != 0 && num <= (USE_INDEX_MASK_L | USE_INDEX_MASK_H);
     case USE_BANK_TEMP:      return num < USE_NUM_TEMPS;
     case USE_BANK_SECATTR:   return num < SGX_SA_DWORDS;
     case USE_BANK_PRIMATTR:  return num < SGX_PA_DWORDS;
@@ -1378,6 +1493,21 @@ static bool use_slot_ok(ClarionUseBank bank, uint32_t num)
 /* Зробити слот невідомим — чесна альтернатива запису вигаданого нуля. */
 static bool use_forget(ClarionUseCtx *c, ClarionUseBank bank, uint32_t num)
 {
+    if (!use_index_resolve(c, &bank, &num)) {
+        return false;
+    }
+    if (bank == USE_BANK_INDEX) {
+        if (num == 0 || num > (USE_INDEX_MASK_L | USE_INDEX_MASK_H)) {
+            return false;
+        }
+        if (num & USE_INDEX_MASK_L) {
+            c->idx_known[0] = false;
+        }
+        if (num & USE_INDEX_MASK_H) {
+            c->idx_known[1] = false;
+        }
+        return true;
+    }
     if (bank == USE_BANK_TEMP && num < USE_NUM_TEMPS) {
         c->r_known[num] = false;
         return true;
@@ -1399,12 +1529,16 @@ static ClarionUseBank use_bank_dst(uint32_t w1)
     uint32_t b = (w1 >> USE1_D1BANK_SHIFT) & USE1_D1BANK_MASK;
 
     if (w1 & USE1_DBEXT) {
-        return b == USE_D1EXTBANK_SECATTR ? USE_BANK_SECATTR
-                                          : USE_BANK_UNSUPPORTED;
+        switch (b) {
+        case USE_D1EXTBANK_SECATTR: return USE_BANK_SECATTR;
+        case USE_D1EXTBANK_INDEX:   return USE_BANK_INDEX;
+        default:                    return USE_BANK_UNSUPPORTED;
+        }
     }
     switch (b) {
     case USE_D1STDBANK_TEMP:     return USE_BANK_TEMP;
     case USE_D1STDBANK_PRIMATTR: return USE_BANK_PRIMATTR;
+    case USE_D1STDBANK_INDEXED:  return USE_BANK_INDEXED;
     default:                     return USE_BANK_UNSUPPORTED;
     }
 }
@@ -1490,6 +1624,7 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
     while (steps++ < SGX_USE_MAX_STEPS) {
         uint32_t pa, w0, w1, op, epred, dst, src0, src1, src2;
         bool pred_known, taken, is_end = false;
+        unsigned note;
 
         if (!sgx_translate(pd, pc, &pa)) {
             sgx_pr("[sgx]     %*s%08x: не відображено — спинено\n",
@@ -1508,6 +1643,7 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
 
         sgx_pr("[sgx]     %*s%08x: %08x %08x ", 2 * depth, ind,
                 pc, w0, w1);
+        c.notes = 0;
 
         /*
          * Предикат для LIMM лежить не там, де в решти (`sgxdefs.h:7443`), а
@@ -1592,7 +1728,7 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                         (w1 & USE1_S1BEXT) != 0);
                     uint32_t val;
 
-                    if (!use_slot_ok(sb, src1)) {
+                    if (!use_slot_ok(&c, sb, src1)) {
                         sgx_pr("mov pclink, %s%u  ⚠ банк не підтримано\n",
                                 use_bank_name(sb), src1);
                         c.stop = "банк джерела setl не підтримано";
@@ -1688,7 +1824,31 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                         (((w1 >> USE1_LIMM_IMM3126_SHIFT) &
                           USE1_LIMM_IMM3126_MASK) << 26);
                     ClarionUseBank db = use_bank_dst(w1);
+                    uint32_t lpred = (w1 >> USE1_LIMM_EPRED_SHIFT) &
+                                     USE1_LIMM_EPRED_MASK;
+                    bool lpred_known, lpred_taken;
 
+                    /*
+                     * Предикат LIMM — у власному полі, і його не можна
+                     * пропускати: у лічильнику циклу мікроядра
+                     * (`0x0e402c40`) стоїть саме предикатований `mov`, і без
+                     * перевірки він щоразу затирає лічильник, даючи вічний
+                     * цикл.
+                     */
+                    lpred_taken = use_pred_true(&c, lpred, &lpred_known);
+                    if (!lpred_known) {
+                        sgx_pr("mov #0x%08x  ⚠ предикат %u не моделюємо\n",
+                                imm, lpred);
+                        c.stop = "предикат LIMM не моделюємо";
+                        break;
+                    }
+                    if (!lpred_taken) {
+                        sgx_pr("mov %s%u, #0x%08x"
+                                " (предикат хибний — пропущено)\n",
+                                use_bank_name(db), dst, imm);
+                        pc += USE_INST_SIZE;
+                        continue;
+                    }
                     sgx_pr("mov %s%u, #0x%08x", use_bank_name(db),
                             dst, imm);
                     if (!use_write(&c, db, dst, imm)) {
@@ -2336,6 +2496,11 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
             sgx_pr("опкод %u — не тлумачимо\n", op);
             c.stop = "нетлумачений опкод USE";
             break;
+        }
+
+        for (note = 0; note < c.notes; note++) {
+            sgx_pr("[sgx]     %*s  ↳ %s\n", 2 * depth, ind,
+                    c.note[note]);
         }
 
         if (c.stop) {
