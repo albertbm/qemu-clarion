@@ -1938,7 +1938,13 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                          * мікроядро опитує біти стану в циклі й від нуля
                          * крутилося б вічно.
                          */
-                        ClarionUseBank db = use_bank_dst(w1);
+                        /* LDRSTR overlays the generic D1 bank fields: bit 7
+                         * selects TEMP versus PRIMATTR; bits 1:0 select DRC.
+                         * See SGX540 usedisasm DecodeLDRSTRInstruction and
+                         * T20b. Do not decode this as a generic D1 destination.
+                         */
+                        ClarionUseBank db = (w1 & 0x80)
+                            ? USE_BANK_PRIMATTR : USE_BANK_TEMP;
                         if (off + 4 > CLARION_SGX_SIZE) {
                             sgx_pr("ldr #%u — поза вікном регістрів\n", num);
                             c.stop = "ldr поза вікном регістрів";
@@ -1966,6 +1972,47 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                         }
                         break;
                     }
+                    /* STR operand 0 is the global-register address. It is
+                     * encoded either as an immediate in extended S2 bank 2,
+                     * or as an ordinary S2 source whose runtime value is the
+                     * register index. Do not mistake the encoded source
+                     * register number for that index (T27).
+                     */
+                    {
+                        ClarionUseBank ab = use_bank_s12(
+                            (w0 >> USE0_S2BANK_SHIFT) & USE0_BANK_MASK,
+                            (w1 & USE1_S2BEXT) != 0);
+
+                        if (ab == USE_BANK_IMMEDIATE) {
+                            num |= (((w0 >> USE0_LDRSTR_SRC2EXT_SHIFT) &
+                                     USE0_LDRSTR_SRC2EXT_MASK)
+                                    << USE_LDRSTR_SRC2EXT_INTSHIFT);
+                        } else if (ab == USE_BANK_TEMP ||
+                                   ab == USE_BANK_SECATTR ||
+                                   ab == USE_BANK_PRIMATTR) {
+                            uint32_t addr_value;
+
+                            if (!use_read(&c, ab, src2, &addr_value)) {
+                                sgx_pr("str address %s%u  ⚠ значення невідоме\n",
+                                        use_bank_name(ab), src2);
+                                c.stop = "адреса str невідома";
+                                break;
+                            }
+                            num = addr_value;
+                        } else {
+                            sgx_pr("str address bank %s не підтримано\n",
+                                    use_bank_name(ab));
+                            c.stop = "банк адреси str не підтримано";
+                            break;
+                        }
+                    }
+                    if (num > UINT32_MAX / 4) {
+                        sgx_pr("str register index 0x%08x overflows byte offset\n",
+                                num);
+                        c.stop = "адреса str завелика";
+                        break;
+                    }
+                    off = num * 4;
                     /*
                      * ⚠ Дані для запису беруться з SRC1, а НЕ з поля
                      * призначення: `usedisasm.c:12093..12099` декодує їх саме
