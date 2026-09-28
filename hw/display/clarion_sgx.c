@@ -1618,6 +1618,53 @@ static uint32_t use_next_pc(const ClarionUseCtx *c, uint32_t pc)
     return use_page_pc(c->page_base, index + 1U);
 }
 
+/*
+ * Операнд 0 інструкції LDRSTR — адреса глобального регістра SGX.
+ *
+ * ⚠ Канонічний `DecodeLDRSTRInstruction` (`usedisasm.c:12068..12094`) бере її
+ * ОДНАКОВО для `ldr` і для `str`: безпосередня — лише коли стоїть `S2BEXT` і
+ * банк S2 = IMMEDIATE; інакше це звичайне джерело S2, і індексом регістра є
+ * його **рантайм-значення**, а не номер у полі. Спершу цю рівність порушили
+ * двічі: для `str` (виправлено в T27) і для `ldr` (виправлено тут). Обидва
+ * рази модель читала/писала регістр за НОМЕРОМ джерела — наприклад `+0x000C`
+ * замість значення `r3` у `ldr r7, r3` (`sgx_timer.use.asm:107`), тобто або
+ * спинялась із чужим іменем регістра, або тихо віддавала чуже значення.
+ */
+static bool use_ldrstr_addr(ClarionUseCtx *c, const char *op, uint32_t w0,
+                            uint32_t w1, uint32_t src2, uint32_t *num_out,
+                            ClarionUseBank *bank_out)
+{
+    ClarionUseBank ab = use_bank_s12((w0 >> USE0_S2BANK_SHIFT) & USE0_BANK_MASK,
+                                     (w1 & USE1_S2BEXT) != 0);
+    uint32_t num;
+
+    if (ab == USE_BANK_IMMEDIATE) {
+        num = src2 | (((w0 >> USE0_LDRSTR_SRC2EXT_SHIFT) &
+                       USE0_LDRSTR_SRC2EXT_MASK)
+                      << USE_LDRSTR_SRC2EXT_INTSHIFT);
+    } else if (ab == USE_BANK_TEMP || ab == USE_BANK_SECATTR ||
+               ab == USE_BANK_PRIMATTR) {
+        if (!use_read(c, ab, src2, &num)) {
+            sgx_pr("%s: адреса %s%u  ⚠ значення невідоме\n", op,
+                    use_bank_name(ab), src2);
+            c->stop = "адреса ldr/str невідома";
+            return false;
+        }
+    } else {
+        sgx_pr("%s: банк адреси %s не підтримано\n", op, use_bank_name(ab));
+        c->stop = "банк адреси ldr/str не підтримано";
+        return false;
+    }
+    if (num > UINT32_MAX / 4) {
+        sgx_pr("%s: індекс регістра 0x%08x завеликий для зсуву\n", op, num);
+        c->stop = "адреса ldr/str завелика";
+        return false;
+    }
+    *num_out = num;
+    *bank_out = ab;
+    return true;
+}
+
 static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                         uint32_t page_base, unsigned cbase, unsigned coff,
                         uint32_t entry, unsigned depth)
@@ -1921,14 +1968,25 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                     break;
                 }
                 if (op2 == USE1_OTHER_OP2_LDRSTR) {
-                    uint32_t num = src2 |
-                        (((w0 >> USE0_LDRSTR_SRC2EXT_SHIFT) &
-                          USE0_LDRSTR_SRC2EXT_MASK)
-                         << USE_LDRSTR_SRC2EXT_INTSHIFT);
-                    uint32_t off = num * 4;
-                    uint32_t val;
+                    bool is_store = (w1 & USE1_LDRSTR_DSEL_STORE) != 0;
+                    const char *op_name = is_store ? "str" : "ldr";
+                    ClarionUseBank ab;
+                    uint32_t num, off, val;
+                    char addr_src[32];
 
-                    if (!(w1 & USE1_LDRSTR_DSEL_STORE)) {
+                    if (!use_ldrstr_addr(&c, op_name, w0, w1, src2,
+                                         &num, &ab)) {
+                        break;
+                    }
+                    off = num * 4;
+                    if (ab == USE_BANK_IMMEDIATE) {
+                        addr_src[0] = '\0';
+                    } else {
+                        snprintf(addr_src, sizeof(addr_src), "  (адреса з %s%u)",
+                                 use_bank_name(ab), src2);
+                    }
+
+                    if (!is_store) {
                         /*
                          * `ldr dst, #номер` — читання регістра SGX із того
                          * самого простору, куди пише `str` (T6, docs/sgx/23).
@@ -1946,19 +2004,21 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                         ClarionUseBank db = (w1 & 0x80)
                             ? USE_BANK_PRIMATTR : USE_BANK_TEMP;
                         if (off + 4 > CLARION_SGX_SIZE) {
-                            sgx_pr("ldr #%u — поза вікном регістрів\n", num);
+                            sgx_pr("ldr #%u%s — поза вікном регістрів\n",
+                                    num, addr_src);
                             c.stop = "ldr поза вікном регістрів";
                             break;
                         }
                         if (!s->regs_known[off / 4]) {
-                            sgx_pr("ldr %s%u, #%u  ⚠ рег +0x%04x модель не"
+                            sgx_pr("ldr %s%u, #%u%s  ⚠ рег +0x%04x модель не"
                                     " моделює (ніхто в нього не писав)\n",
-                                    use_bank_name(db), dst, num, off);
+                                    use_bank_name(db), dst, num, addr_src,
+                                    off);
                             c.stop = "значення регістра SGX невідоме";
                             break;
                         }
-                        sgx_pr("ldr %s%u, #%u = %08x  (рег +0x%04x)%s\n",
-                                use_bank_name(db), dst, num,
+                        sgx_pr("ldr %s%u, #%u%s = %08x  (рег +0x%04x)%s\n",
+                                use_bank_name(db), dst, num, addr_src,
                                 s->regs[off / 4], off,
                                 off == SGX_CR_CORE_ID
                                     ? "  ⚠ EUR_CR_CORE_ID: значення без"
@@ -1972,47 +2032,6 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                         }
                         break;
                     }
-                    /* STR operand 0 is the global-register address. It is
-                     * encoded either as an immediate in extended S2 bank 2,
-                     * or as an ordinary S2 source whose runtime value is the
-                     * register index. Do not mistake the encoded source
-                     * register number for that index (T27).
-                     */
-                    {
-                        ClarionUseBank ab = use_bank_s12(
-                            (w0 >> USE0_S2BANK_SHIFT) & USE0_BANK_MASK,
-                            (w1 & USE1_S2BEXT) != 0);
-
-                        if (ab == USE_BANK_IMMEDIATE) {
-                            num |= (((w0 >> USE0_LDRSTR_SRC2EXT_SHIFT) &
-                                     USE0_LDRSTR_SRC2EXT_MASK)
-                                    << USE_LDRSTR_SRC2EXT_INTSHIFT);
-                        } else if (ab == USE_BANK_TEMP ||
-                                   ab == USE_BANK_SECATTR ||
-                                   ab == USE_BANK_PRIMATTR) {
-                            uint32_t addr_value;
-
-                            if (!use_read(&c, ab, src2, &addr_value)) {
-                                sgx_pr("str address %s%u  ⚠ значення невідоме\n",
-                                        use_bank_name(ab), src2);
-                                c.stop = "адреса str невідома";
-                                break;
-                            }
-                            num = addr_value;
-                        } else {
-                            sgx_pr("str address bank %s не підтримано\n",
-                                    use_bank_name(ab));
-                            c.stop = "банк адреси str не підтримано";
-                            break;
-                        }
-                    }
-                    if (num > UINT32_MAX / 4) {
-                        sgx_pr("str register index 0x%08x overflows byte offset\n",
-                                num);
-                        c.stop = "адреса str завелика";
-                        break;
-                    }
-                    off = num * 4;
                     /*
                      * ⚠ Дані для запису беруться з SRC1, а НЕ з поля
                      * призначення: `usedisasm.c:12093..12099` декодує їх саме
@@ -2025,8 +2044,8 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                         (w1 & USE1_S1BEXT) != 0);
 
                     if (!use_read(&c, sb, src1, &val)) {
-                        sgx_pr("str #%u, %s%u  ⚠ джерело невідоме\n",
-                                num, use_bank_name(sb), src1);
+                        sgx_pr("str #%u%s, %s%u  ⚠ джерело невідоме\n",
+                                num, addr_src, use_bank_name(sb), src1);
                         c.stop = "джерело str невідоме";
                         break;
                     }
@@ -2036,8 +2055,8 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                      * у який пише гість через MMIO, і саме там програма
                      * потім шукає task-control.
                      */
-                    sgx_pr("str #%u, %s%u = %08x  -> рег +0x%04x\n",
-                            num, use_bank_name(sb), src1, val, off);
+                    sgx_pr("str #%u%s, %s%u = %08x  -> рег +0x%04x\n",
+                            num, addr_src, use_bank_name(sb), src1, val, off);
                     if (off + 4 <= CLARION_SGX_SIZE) {
                         sgx_set_reg(s, off, val);
                         sgx_reg_side_effects(s, off, val);
