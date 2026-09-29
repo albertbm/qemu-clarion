@@ -78,6 +78,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/error-report.h"
 #include "qemu/cutils.h"
 #include "hw/core/sysbus.h"
 #include "hw/display/clarion_sgx.h"
@@ -222,7 +223,7 @@ static void sgx_set_reg(ClarionSgxState *s, hwaddr off, uint32_t val)
     s->regs_known_mask[off / 4] = UINT32_MAX;
 }
 
-/* Establish only justified bits. EVENT_STATUS has no producer in T29. */
+/* Establish only justified bits; unrelated register bits retain their state. */
 static void G_GNUC_UNUSED sgx_set_known_bits(ClarionSgxState *s, hwaddr off,
                                               uint32_t mask, uint32_t val)
 {
@@ -236,6 +237,20 @@ static void G_GNUC_UNUSED sgx_set_known_bits(ClarionSgxState *s, hwaddr off,
     }
     s->regs[i] = next;
     s->regs_known_mask[i] |= mask;
+}
+
+/* Target USE image writes only SW_EVENT. Reject unsupported bits before mutation. */
+static bool sgx_write_event_status(ClarionSgxState *s, uint32_t val)
+{
+    if (val & ~SGX_CR_EVENT_STATUS_SW_EVENT) {
+        return false;
+    }
+    if (val & SGX_CR_EVENT_STATUS_SW_EVENT) {
+        sgx_set_known_bits(s, SGX_CR_EVENT_STATUS,
+                           SGX_CR_EVENT_STATUS_SW_EVENT,
+                           SGX_CR_EVENT_STATUS_SW_EVENT);
+    }
+    return true;
 }
 
 /*
@@ -257,6 +272,33 @@ static void G_GNUC_UNUSED sgx_set_known_bits(ClarionSgxState *s, hwaddr off,
 static void sgx_reg_side_effects(ClarionSgxState *s, hwaddr off, uint32_t val)
 {
     switch (off) {
+    case SGX_CR_CACHE_CTRL:
+        if (val & SGX_CR_CACHE_CTRL_INVALIDATE) {
+            sgx_set_known_bits(s, SGX_CR_EVENT_STATUS,
+                               SGX_CR_EVENT_STATUS_MADD_INVAL,
+                               SGX_CR_EVENT_STATUS_MADD_INVAL);
+        }
+        break;
+    case SGX_CR_TE_TPCCONTROL:
+        if (val & SGX_CR_TE_TPCCONTROL_FLUSH) {
+            sgx_set_known_bits(s, SGX_CR_EVENT_STATUS,
+                               SGX_CR_EVENT_STATUS_TPC_FLUSH,
+                               SGX_CR_EVENT_STATUS_TPC_FLUSH);
+        }
+        if (val & SGX_CR_TE_TPCCONTROL_CLEAR) {
+            sgx_set_known_bits(s, SGX_CR_EVENT_STATUS,
+                               SGX_CR_EVENT_STATUS_TPC_CLEAR,
+                               SGX_CR_EVENT_STATUS_TPC_CLEAR);
+        }
+        break;
+    case SGX_CR_EVENT_HOST_CLEAR: {
+        uint32_t mask = val & SGX_CR_EVENT_STATUS_MODELED &
+            s->regs_known_mask[SGX_CR_EVENT_STATUS / 4];
+        if (mask) {
+            sgx_set_known_bits(s, SGX_CR_EVENT_STATUS, mask, 0);
+        }
+        break;
+    }
     case SGX_CR_PDS_INV0:
     case SGX_CR_PDS_INV1:
     case SGX_CR_PDS_INV3:
@@ -2336,8 +2378,19 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                     sgx_pr("str #%u%s, %s%u = %08x  -> рег +0x%04x\n",
                             num, addr_src, use_bank_name(sb), src1, val, off);
                     if (off + 4 <= CLARION_SGX_SIZE) {
-                        sgx_set_reg(s, off, val);
-                        sgx_reg_side_effects(s, off, val);
+                        if (off == SGX_CR_EVENT_STATUS) {
+                            if (!sgx_write_event_status(s, val)) {
+                                sgx_pr("str EUR_CR_EVENT_STATUS +0x%04x = %08x"
+                                       " unsupported mask %08x USE PC %08x\n",
+                                       off, val,
+                                       val & ~SGX_CR_EVENT_STATUS_SW_EVENT,
+                                       pc);
+                                c.stop = "unsupported EVENT_STATUS write";
+                            }
+                        } else {
+                            sgx_set_reg(s, off, val);
+                            sgx_reg_side_effects(s, off, val);
+                        }
                     } else {
                         c.stop = "str поза вікном регістрів";
                     }
@@ -3199,8 +3252,20 @@ static void sgx_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
                           " ідентичності 0x%04" HWADDR_PRIx
                           " — проігноровано\n", addr);
         } else {
-            sgx_set_reg(s, addr, (uint32_t)val);
-            sgx_reg_side_effects(s, addr, (uint32_t)val);
+            if (addr == SGX_CR_EVENT_STATUS) {
+                if (val > UINT32_MAX ||
+                    !sgx_write_event_status(s, (uint32_t)val)) {
+                    error_report("clarion-sgx: EUR_CR_EVENT_STATUS +0x%04x"
+                                 " value 0x%08" PRIx64 " unsupported mask"
+                                 " 0x%08" PRIx64 " origin MMIO",
+                                 (unsigned)addr, val,
+                                 val & ~((uint64_t)SGX_CR_EVENT_STATUS_SW_EVENT));
+                    abort();
+                }
+            } else {
+                sgx_set_reg(s, addr, (uint32_t)val);
+                sgx_reg_side_effects(s, addr, (uint32_t)val);
+            }
         }
         if (s->nwr < SGX_WR_JOURNAL) {
             s->wr[s->nwr].off = (uint32_t)addr;
