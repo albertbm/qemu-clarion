@@ -92,6 +92,8 @@
 #define SGX_USE_QUEUE       16
 #define SGX_MAX_DEPTH       8
 #define SGX_USE_MAX_STEPS   4096
+#define SGX_USE_POLL_REPEATS 256 /* diagnostic threshold, not hardware timing */
+#define SGX_USE_POLL_SPAN    64  /* maximum instructions between poll reads */
 #define SGX_PDS_MAX_STEPS   4096
 #define SGX_PDS_MAX_PROG    0x2000
 
@@ -113,13 +115,14 @@ struct ClarionSgxState {
     /* Усе, що гість записав. Ніщо тут не має власної семантики. */
     uint32_t regs[SGX_NREGS];
     /*
-     * Чи має модель ПІДСТАВУ вважати, що знає значення регістра. Підстава —
-     * рівно одна: хтось у нього писав (гість через MMIO або мікроядро через
-     * `str`). Без цього прапорця `ldr` віддавав би нуль там, де залізо
-     * повертає біти стану, — і мікроядро крутилося б у порожньому очікуванні,
-     * а ми б думали, що це його власна логіка.
+     * Які саме біти значення мають підставу бути відомими. Повний запис
+     * гостя/USE робить усі 32 відомими; вибіркова апаратна побічна дія може
+     * обґрунтувати тільки окремі біти. Невідомі біти ніколи не стають
+     * неявними нулями під час `ldr` чи подальшого TEST.
      */
-    bool regs_known[SGX_NREGS];
+    uint32_t regs_known_mask[SGX_NREGS];
+    uint32_t regs_version[SGX_NREGS];
+    uint32_t regs_epoch;
 
     uint32_t kicks;             /* скільки разів прийшов EVENT_KICK2 */
     uint32_t kick_reports;      /* скільки з них розбирати докладно */
@@ -151,6 +154,7 @@ struct ClarionSgxState {
      */
     uint32_t sa[SGX_SA_DWORDS];
     bool sa_known[SGX_SA_DWORDS];
+    uint32_t sa_known_mask[SGX_SA_DWORDS];
     unsigned sa_count;
 
     /*
@@ -159,6 +163,7 @@ struct ClarionSgxState {
      */
     uint32_t pa[SGX_PA_DWORDS];
     bool pa_known[SGX_PA_DWORDS];
+    uint32_t pa_known_mask[SGX_PA_DWORDS];
     unsigned pa_count;
     uint32_t sa_sbase;          /* SBASE останнього DOUTD — для самоперевірки */
 
@@ -208,8 +213,29 @@ static uint32_t sgx_reg(ClarionSgxState *s, hwaddr off)
 
 static void sgx_set_reg(ClarionSgxState *s, hwaddr off, uint32_t val)
 {
+    if (s->regs_known_mask[off / 4] != UINT32_MAX ||
+        s->regs[off / 4] != val) {
+        s->regs_version[off / 4]++;
+        s->regs_epoch++;
+    }
     s->regs[off / 4] = val;
-    s->regs_known[off / 4] = true;
+    s->regs_known_mask[off / 4] = UINT32_MAX;
+}
+
+/* Establish only justified bits. EVENT_STATUS has no producer in T29. */
+static void G_GNUC_UNUSED sgx_set_known_bits(ClarionSgxState *s, hwaddr off,
+                                              uint32_t mask, uint32_t val)
+{
+    uint32_t i = off / 4;
+    uint32_t next = (s->regs[i] & ~mask) | (val & mask);
+
+    if ((s->regs_known_mask[i] & mask) != mask ||
+        ((s->regs[i] ^ next) & mask)) {
+        s->regs_version[i]++;
+        s->regs_epoch++;
+    }
+    s->regs[i] = next;
+    s->regs_known_mask[i] |= mask;
 }
 
 /*
@@ -253,7 +279,7 @@ static void sgx_reg_side_effects(ClarionSgxState *s, hwaddr off, uint32_t val)
         }
         break;
     case SGX_CR_PDS_CACHE_HOST_CLEAR:
-        if (s->regs_known[SGX_CR_PDS_CACHE_STATUS / 4]) {
+        if (s->regs_known_mask[SGX_CR_PDS_CACHE_STATUS / 4]) {
             sgx_set_reg(s, SGX_CR_PDS_CACHE_STATUS,
                         sgx_reg(s, SGX_CR_PDS_CACHE_STATUS) &
                         ~(val & SGX_CR_PDS_CACHE_STATUS_MASK));
@@ -1267,8 +1293,14 @@ typedef struct ClarionUseCtx {
 
     uint32_t r[USE_NUM_TEMPS];
     bool r_known[USE_NUM_TEMPS];
+    uint32_t r_known_mask[USE_NUM_TEMPS];
     bool pred[USE_NUM_PREDICATES];
     bool pred_known[USE_NUM_PREDICATES];
+
+    uint32_t poll_pc, poll_off, poll_value, poll_mask;
+    uint32_t poll_version, poll_epoch;
+    unsigned poll_steps, poll_repeats, poll_stores;
+    bool poll_valid;
 
     /*
      * Індексні регістри задачі. На вході НЕВІДОМІ: модель не знає, що лишив у
@@ -1483,11 +1515,13 @@ static bool use_write(ClarionUseCtx *c, ClarionUseBank bank, uint32_t num,
     if (bank == USE_BANK_TEMP && num < USE_NUM_TEMPS) {
         c->r[num] = val;
         c->r_known[num] = true;
+        c->r_known_mask[num] = UINT32_MAX;
         return true;
     }
     if (bank == USE_BANK_PRIMATTR && num < SGX_PA_DWORDS) {
         c->s->pa[num] = val;
         c->s->pa_known[num] = true;
+        c->s->pa_known_mask[num] = UINT32_MAX;
         if (num + 1 > c->s->pa_count) {
             c->s->pa_count = num + 1;
         }
@@ -1496,12 +1530,172 @@ static bool use_write(ClarionUseCtx *c, ClarionUseBank bank, uint32_t num,
     if (bank == USE_BANK_SECATTR && num < SGX_SA_DWORDS) {
         c->s->sa[num] = val;
         c->s->sa_known[num] = true;
+        c->s->sa_known_mask[num] = UINT32_MAX;
         if (num + 1 > c->s->sa_count) {
             c->s->sa_count = num + 1;
         }
         return true;
     }
     return false;
+}
+
+typedef struct ClarionUseBits {
+    uint32_t value;
+    uint32_t known;
+} ClarionUseBits;
+
+static ClarionUseBits use_bits(uint32_t value, uint32_t known)
+{
+    return (ClarionUseBits) { value, known };
+}
+
+static bool use_read_bits(ClarionUseCtx *c, ClarionUseBank bank, uint32_t num,
+                          ClarionUseBits *out)
+{
+    if (!use_index_resolve(c, &bank, &num)) {
+        return false;
+    }
+    switch (bank) {
+    case USE_BANK_IMMEDIATE:
+        *out = use_bits(num, UINT32_MAX);
+        return true;
+    case USE_BANK_TEMP:
+        if (num >= USE_NUM_TEMPS) { return false; }
+        *out = use_bits(c->r[num], c->r_known[num] ? UINT32_MAX
+                                                   : c->r_known_mask[num]);
+        return true;
+    case USE_BANK_SECATTR:
+        if (num >= SGX_SA_DWORDS) { return false; }
+        *out = use_bits(c->s->sa[num], c->s->sa_known[num] ? UINT32_MAX
+                                      : c->s->sa_known_mask[num]);
+        return true;
+    case USE_BANK_PRIMATTR:
+        if (num >= SGX_PA_DWORDS) { return false; }
+        *out = use_bits(c->s->pa[num], c->s->pa_known[num] ? UINT32_MAX
+                                      : c->s->pa_known_mask[num]);
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool use_write_bits(ClarionUseCtx *c, ClarionUseBank bank, uint32_t num,
+                           ClarionUseBits val)
+{
+    if (val.known == UINT32_MAX) {
+        return use_write(c, bank, num, val.value);
+    }
+    if (!use_index_resolve(c, &bank, &num)) {
+        return false;
+    }
+    switch (bank) {
+    case USE_BANK_TEMP:
+        if (num >= USE_NUM_TEMPS) { return false; }
+        c->r[num] = val.value;
+        c->r_known[num] = false;
+        c->r_known_mask[num] = val.known;
+        return true;
+    case USE_BANK_SECATTR:
+        if (num >= SGX_SA_DWORDS) { return false; }
+        c->s->sa[num] = val.value;
+        c->s->sa_known[num] = false;
+        c->s->sa_known_mask[num] = val.known;
+        if (num + 1 > c->s->sa_count) { c->s->sa_count = num + 1; }
+        return true;
+    case USE_BANK_PRIMATTR:
+        if (num >= SGX_PA_DWORDS) { return false; }
+        c->s->pa[num] = val.value;
+        c->s->pa_known[num] = false;
+        c->s->pa_known_mask[num] = val.known;
+        if (num + 1 > c->s->pa_count) { c->s->pa_count = num + 1; }
+        return true;
+    default:
+        return false;
+    }
+}
+
+static ClarionUseBits use_bits_and(ClarionUseBits a, ClarionUseBits b)
+{
+    uint32_t az = a.known & ~a.value, bz = b.known & ~b.value;
+    uint32_t ao = a.known & a.value, bo = b.known & b.value;
+
+    return use_bits(a.value & b.value, az | bz | (ao & bo));
+}
+
+static ClarionUseBits use_bits_or(ClarionUseBits a, ClarionUseBits b)
+{
+    uint32_t az = a.known & ~a.value, bz = b.known & ~b.value;
+    uint32_t ao = a.known & a.value, bo = b.known & b.value;
+
+    return use_bits(a.value | b.value, ao | bo | (az & bz));
+}
+
+static ClarionUseBits use_bits_xor(ClarionUseBits a, ClarionUseBits b)
+{
+    return use_bits(a.value ^ b.value, a.known & b.known);
+}
+
+static ClarionUseBits use_bits_shl(ClarionUseBits a, unsigned n)
+{
+    uint32_t zeros = n ? UINT32_MAX >> (32 - n) : 0;
+
+    return use_bits(a.value << n, (a.known << n) | zeros);
+}
+
+static ClarionUseBits use_bits_shr(ClarionUseBits a, unsigned n)
+{
+    uint32_t zeros = n ? UINT32_MAX << (32 - n) : 0;
+
+    return use_bits(a.value >> n, (a.known >> n) | zeros);
+}
+
+static ClarionUseBits use_bits_asr(ClarionUseBits a, unsigned n)
+{
+    uint32_t high = n && (a.known & 0x80000000U)
+        ? UINT32_MAX << (32 - n) : 0;
+
+    return use_bits((uint32_t)((int32_t)a.value >> n),
+                    (a.known >> n) | high);
+}
+
+static ClarionUseBits use_bits_rol(ClarionUseBits a, unsigned n)
+{
+    if (!n) { return a; }
+    return use_bits((a.value << n) | (a.value >> (32 - n)),
+                    (a.known << n) | (a.known >> (32 - n)));
+}
+
+/* A known one proves nonzero even when other bits are unknown. */
+static uint32_t use_test_zero_unknown(ClarionUseBits result)
+{
+    return (result.value & result.known) || result.known == UINT32_MAX
+        ? 0 : ~result.known;
+}
+
+static bool use_test_require_known(ClarionUseCtx *c, uint32_t pc,
+                                   const char *name, ClarionUseBits a,
+                                   ClarionUseBits b, ClarionUseBits result,
+                                   bool zero_check, bool sign_check)
+{
+    uint32_t missing = zero_check ? use_test_zero_unknown(result) : 0;
+
+    if (missing) {
+        sgx_pr("cannot evaluate TEST pc=%08x %s:"
+               " a=%08x/%08x b=%08x/%08x result=%08x/%08x"
+               " required-unknown=%08x\n", pc, name,
+               a.value, a.known, b.value, b.known,
+               result.value, result.known, missing);
+        c->stop = "невідомі біти в TEST";
+        return false;
+    }
+    if (sign_check && !(result.known & 0x80000000U)) {
+        sgx_pr("cannot evaluate TEST pc=%08x %s:"
+               " sign bit unknown result=%08x/%08x\n",
+               pc, name, result.value, result.known);
+        c->stop = "невідомий знак у TEST";
+        return false;
+    }
+    return true;
 }
 
 /*
@@ -1545,14 +1739,17 @@ static bool use_forget(ClarionUseCtx *c, ClarionUseBank bank, uint32_t num)
     }
     if (bank == USE_BANK_TEMP && num < USE_NUM_TEMPS) {
         c->r_known[num] = false;
+        c->r_known_mask[num] = 0;
         return true;
     }
     if (bank == USE_BANK_PRIMATTR && num < SGX_PA_DWORDS) {
         c->s->pa_known[num] = false;
+        c->s->pa_known_mask[num] = 0;
         return true;
     }
     if (bank == USE_BANK_SECATTR && num < SGX_SA_DWORDS) {
         c->s->sa_known[num] = false;
+        c->s->sa_known_mask[num] = 0;
         return true;
     }
     return false;
@@ -1604,12 +1801,13 @@ static bool use_pred_true(ClarionUseCtx *c, uint32_t epred, bool *known)
  * `usedisasm.c:1932..1938`). Це ІНШЕ поле, ніж EPRED, і в ньому лише чотири
  * значення — жодного «не моделюємо» тут бути не може.
  */
-static bool use_spred_true(ClarionUseCtx *c, uint32_t spred)
+static bool use_spred_true(ClarionUseCtx *c, uint32_t spred, bool *known)
 {
+    *known = true;
     switch (spred) {
-    case USE1_SPRED_P0:    return c->pred[0];
-    case USE1_SPRED_P1:    return c->pred[1];
-    case USE1_SPRED_NOTP0: return !c->pred[0];
+    case USE1_SPRED_P0:    *known = c->pred_known[0]; return c->pred[0];
+    case USE1_SPRED_P1:    *known = c->pred_known[1]; return c->pred[1];
+    case USE1_SPRED_NOTP0: *known = c->pred_known[0]; return !c->pred[0];
     default:               return true;   /* ALWAYS */
     }
 }
@@ -1644,6 +1842,45 @@ static uint32_t use_next_pc(const ClarionUseCtx *c, uint32_t pc)
     uint32_t index = (pc - c->page_base) / USE_INST_SIZE;
 
     return use_page_pc(c->page_base, index + 1U);
+}
+
+/* Model-safety detector. It does not change SGX or guest-visible state. */
+static bool use_poll_observe(ClarionUseCtx *c, uint32_t pc, uint32_t off,
+                             ClarionUseBits value, unsigned steps)
+{
+    uint32_t i = off / 4;
+    bool same = c->poll_valid && c->poll_pc == pc && c->poll_off == off &&
+        c->poll_value == value.value && c->poll_mask == value.known &&
+        c->poll_version == c->s->regs_version[i] &&
+        c->poll_epoch == c->s->regs_epoch &&
+        c->poll_stores == c->s->nstores &&
+        steps - c->poll_steps <= SGX_USE_POLL_SPAN;
+
+    if (same) {
+        c->poll_repeats++;
+    } else if (!c->poll_valid || c->poll_pc == pc) {
+        c->poll_repeats = 1;
+    } else {
+        /* A different LDR may be part of the same short polling loop. */
+        return false;
+    }
+    c->poll_valid = true;
+    c->poll_pc = pc;
+    c->poll_off = off;
+    c->poll_value = value.value;
+    c->poll_mask = value.known;
+    c->poll_version = c->s->regs_version[i];
+    c->poll_epoch = c->s->regs_epoch;
+    c->poll_stores = c->s->nstores;
+    c->poll_steps = steps;
+    if (c->poll_repeats >= SGX_USE_POLL_REPEATS) {
+        sgx_pr("[sgx] ⛔ repeated-LDR poll pc=%08x reg=+0x%04x"
+               " repeats=%u value=%08x known=%08x\n", pc, off,
+               c->poll_repeats, value.value, value.known);
+        c->stop = "повторний LDR без зміни стану регістра";
+        return true;
+    }
+    return false;
 }
 
 /*
@@ -1727,6 +1964,14 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
         uint32_t pa, w0, w1, op, epred, dst, src0, src1, src2;
         bool pred_known, taken, is_end = false;
         unsigned note;
+
+        if (c.poll_valid &&
+            ((pc > c.poll_pc &&
+              pc - c.poll_pc > SGX_USE_POLL_SPAN * USE_INST_SIZE) ||
+             (pc < c.poll_pc &&
+              c.poll_pc - pc > SGX_USE_POLL_SPAN * USE_INST_SIZE))) {
+            c.poll_valid = false;
+        }
 
         if (!sgx_translate(pd, pc, &pa)) {
             sgx_pr("[sgx]     %*s%08x: не відображено — спинено\n",
@@ -2037,7 +2282,7 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                             c.stop = "ldr поза вікном регістрів";
                             break;
                         }
-                        if (!s->regs_known[off / 4]) {
+                        if (!s->regs_known_mask[off / 4]) {
                             sgx_pr("ldr %s%u, #%u%s  ⚠ рег +0x%04x модель не"
                                     " моделює (ніхто в нього не писав)\n",
                                     use_bank_name(db), dst, num, addr_src,
@@ -2055,7 +2300,12 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                                     ? "  EUR_CR_CORE_REVISION: константа, яку"
                                       " називає сама прошивка"
                                     : "");
-                        if (!use_write(&c, db, dst, s->regs[off / 4])) {
+                        ClarionUseBits loaded = use_bits(
+                            s->regs[off / 4], s->regs_known_mask[off / 4]);
+                        if (use_poll_observe(&c, pc, off, loaded, steps)) {
+                            break;
+                        }
+                        if (!use_write_bits(&c, db, dst, loaded)) {
                             c.stop = "приймач ldr не підтримано";
                         }
                         break;
@@ -2156,7 +2406,7 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
             ClarionUseBank b2 = use_bank_s12((w0 >> USE0_S2BANK_SHIFT) &
                                              USE0_BANK_MASK,
                                              (w1 & USE1_S2BEXT) != 0);
-            uint32_t a, b, res;
+            ClarionUseBits a, b, res;
             const char *name;
 
             if (alusel != USE0_TEST_ALUSEL_BITWISE &&
@@ -2167,7 +2417,8 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                 c.stop = "нетлумачений ALUSEL у TEST";
                 break;
             }
-            if (!use_read(&c, b1, src1, &a) || !use_read(&c, b2, src2, &b)) {
+            if (!use_read_bits(&c, b1, src1, &a) ||
+                !use_read_bits(&c, b2, src2, &b)) {
                 sgx_pr("test  ⚠ джерело невідоме\n");
                 c.stop = "джерело TEST невідоме";
                 break;
@@ -2184,20 +2435,33 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                     c.stop = "нетлумачений канал I16 TEST";
                     break;
                 }
-                res = (uint32_t)(int32_t)(int16_t)(uint16_t)(a - b);
+                if (a.known != UINT32_MAX || b.known != UINT32_MAX) {
+                    sgx_pr("isub16.test pc=%08x unknown source masks"
+                           " a=%08x/%08x b=%08x/%08x\n", pc,
+                           a.value, a.known, b.value, b.known);
+                    c.stop = "невідомі біти в TEST арифметиці";
+                    break;
+                }
+                res = use_bits((uint32_t)(int32_t)(int16_t)
+                               (uint16_t)(a.value - b.value), UINT32_MAX);
                 name = "isub16";
             } else switch (aluop) {
-            case USE0_TEST_ALUOP_BW_AND: res = a & b;  name = "and"; break;
-            case USE0_TEST_ALUOP_BW_OR:  res = a | b;  name = "or";  break;
-            case USE0_TEST_ALUOP_BW_XOR: res = a ^ b;  name = "xor"; break;
-            case USE0_TEST_ALUOP_BW_SHL: res = a << (b & 31); name = "shl"; break;
-            case USE0_TEST_ALUOP_BW_SHR: res = a >> (b & 31); name = "shr"; break;
+            case USE0_TEST_ALUOP_BW_AND: res = use_bits_and(a, b); name = "and"; break;
+            case USE0_TEST_ALUOP_BW_OR:  res = use_bits_or(a, b);  name = "or"; break;
+            case USE0_TEST_ALUOP_BW_XOR: res = use_bits_xor(a, b); name = "xor"; break;
+            case USE0_TEST_ALUOP_BW_SHL:
+                if (b.known != UINT32_MAX) { c.stop = "зсув TEST невідомий"; break; }
+                res = use_bits_shl(a, b.value & 31); name = "shl"; break;
+            case USE0_TEST_ALUOP_BW_SHR:
+                if (b.known != UINT32_MAX) { c.stop = "зсув TEST невідомий"; break; }
+                res = use_bits_shr(a, b.value & 31); name = "shr"; break;
             case USE0_TEST_ALUOP_BW_ASR:
-                res = (uint32_t)((int32_t)a >> (b & 31)); name = "asr"; break;
+                if (b.known != UINT32_MAX) { c.stop = "зсув TEST невідомий"; break; }
+                res = use_bits_asr(a, b.value & 31); name = "asr"; break;
             default:
                 sgx_pr("test aluop=%u — не тлумачимо\n", aluop);
                 c.stop = "нетлумачена операція TEST";
-                res = 0; name = "?";
+                res = use_bits(0, 0); name = "?";
                 break;
             }
             if (c.stop) {
@@ -2216,9 +2480,9 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                 case USE1_TEST_ZTST_NONE:
                     zt = true;  zn = "-";   break;
                 case USE1_TEST_ZTST_ZERO:
-                    zt = res == 0; zn = "==0"; break;
+                    zt = res.value == 0; zn = "==0"; break;
                 case USE1_TEST_ZTST_NOTZERO:
-                    zt = res != 0; zn = "!=0"; break;
+                    zt = res.value != 0; zn = "!=0"; break;
                 default:
                     sgx_pr("  ⚠ зарезервована умова нуля\n");
                     c.stop = "зарезервована умова нуля в TEST";
@@ -2232,9 +2496,9 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                 case USE1_TEST_STST_NONE:
                     st = true; sn = "-"; break;
                 case USE1_TEST_STST_NEGATIVE:
-                    st = (int32_t)res < 0;  sn = "знак"; break;
+                    st = (int32_t)res.value < 0;  sn = "знак"; break;
                 case USE1_TEST_STST_POSITIVE:
-                    st = (int32_t)res >= 0; sn = "!знак"; break;
+                    st = (int32_t)res.value >= 0; sn = "!знак"; break;
                 default:
                     sgx_pr("  ⚠ зарезервована умова знака\n");
                     c.stop = "зарезервована умова знака в TEST";
@@ -2244,17 +2508,22 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                 if (c.stop) {
                     break;
                 }
+                if (!use_test_require_known(&c, pc, name, a, b, res,
+                                            ztst != USE1_TEST_ZTST_NONE,
+                                            stst != USE1_TEST_STST_NONE)) {
+                    break;
+                }
                 c.pred[pdst] = comb_and ? (zt && st) : (zt || st);
                 c.pred_known[pdst] = true;
                 sgx_pr("%s.test %s%u, %s%u = %08x -> p%u=%u (%s %s %s)\n",
                         name, use_bank_name(b1), src1, use_bank_name(b2),
-                        src2, res, pdst, c.pred[pdst], sn,
+                        src2, res.value, pdst, c.pred[pdst], sn,
                         comb_and ? "і" : "або", zn);
             }
             if (w0 & USE0_TEST_WBEN) {
                 ClarionUseBank db = use_bank_dst(w1);
 
-                if (!use_write(&c, db, dst, res)) {
+                if (!use_write_bits(&c, db, dst, res)) {
                     c.stop = "приймач TEST не підтримано";
                 }
             }
@@ -2268,7 +2537,7 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                                              USE0_BANK_MASK,
                                              (w1 & USE1_S1BEXT) != 0);
             ClarionUseBank db = use_bank_dst(w1);
-            uint32_t val;
+            ClarionUseBits val;
 
             if (tst != USE1_MOVC_TSTDTYPE_UNCOND) {
                 sgx_pr("movc з умовою (tstdtype=%u) — не тлумачимо\n",
@@ -2276,7 +2545,7 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                 c.stop = "умовний movc";
                 break;
             }
-            if (!use_read(&c, b1, src1, &val)) {
+            if (!use_read_bits(&c, b1, src1, &val)) {
                 sgx_pr("mov %s%u, %s%u  ⚠ джерело невідоме\n",
                         use_bank_name(db), dst, use_bank_name(b1), src1);
                 c.stop = "джерело mov невідоме";
@@ -2284,9 +2553,9 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
             }
             is_end = (w1 & USE1_END) != 0;
             sgx_pr("mov %s%u, %s%u = %08x%s\n", use_bank_name(db),
-                    dst, use_bank_name(b1), src1, val,
+                    dst, use_bank_name(b1), src1, val.value,
                     is_end ? "  .end" : "");
-            if (!use_write(&c, db, dst, val)) {
+            if (!use_write_bits(&c, db, dst, val)) {
                 c.stop = "приймач mov не підтримано";
             }
             break;
@@ -2307,7 +2576,8 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                                              USE0_BANK_MASK,
                                              (w1 & USE1_S2BEXT) != 0);
             ClarionUseBank db = use_bank_dst(w1);
-            uint32_t a, b, res = 0;
+            uint32_t b;
+            ClarionUseBits a, bv, res;
             const char *name = "?";
 
             if (w1 & USE1_BITWISE_PARTIAL) {
@@ -2315,7 +2585,7 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                 c.stop = "PARTIAL у бітовій операції";
                 break;
             }
-            if (!use_read(&c, b1, src1, &a)) {
+            if (!use_read_bits(&c, b1, src1, &a)) {
                 sgx_pr("бітова операція  ⚠ джерело невідоме\n");
                 c.stop = "джерело бітової операції невідоме";
                 break;
@@ -2337,49 +2607,62 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                 if (rot) {
                     b = (b << rot) | (b >> (32 - rot));
                 }
-            } else if (!use_read(&c, b2, src2, &b)) {
-                sgx_pr("бітова операція  ⚠ джерело невідоме\n");
-                c.stop = "джерело бітової операції невідоме";
-                break;
+                bv = use_bits(b, UINT32_MAX);
+            } else {
+                if (!use_read_bits(&c, b2, src2, &bv)) {
+                    sgx_pr("бітова операція  ⚠ джерело не підтримано\n");
+                    c.stop = "джерело бітової операції не підтримано";
+                    break;
+                }
+                b = bv.value;
             }
             if (w1 & USE1_BITWISE_SRC2INV) {
-                b = ~b;
+                bv.value = ~bv.value;
+                b = bv.value;
             }
             switch (op) {
             case USE1_OP_ANDOR:
-                res = op2 ? (a | b) : (a & b);
+                res = op2 ? use_bits_or(a, bv) : use_bits_and(a, bv);
                 name = op2 ? "or" : "and";
                 break;
             case USE1_OP_XOR:
-                res = a ^ b;
+                res = use_bits_xor(a, bv);
                 name = "xor";
                 break;
             case USE1_OP_SHLROL:
+                if (bv.known != UINT32_MAX) {
+                    c.stop = "зсув бітової операції невідомий";
+                    break;
+                }
                 if (op2) {
-                    res = (b & 31) ? (a << (b & 31)) | (a >> (32 - (b & 31)))
-                                   : a;
+                    res = use_bits_rol(a, b & 31);
                     name = "rol";
                 } else {
-                    res = (b & 31) ? a << (b & 31) : a;
+                    res = use_bits_shl(a, b & 31);
                     name = "shl";
                 }
                 break;
             default:
-                res = op2 ? (uint32_t)((int32_t)a >> (b & 31))
-                          : (a >> (b & 31));
+                if (bv.known != UINT32_MAX) {
+                    c.stop = "зсув бітової операції невідомий";
+                    break;
+                }
+                res = op2 ? use_bits_asr(a, b & 31)
+                          : use_bits_shr(a, b & 31);
                 name = op2 ? "asr" : "shr";
                 break;
             }
+            if (c.stop) { break; }
             if (b2 == USE_BANK_IMMEDIATE) {
                 sgx_pr("%s %s%u, %s%u, #0x%x = %08x\n", name,
                        use_bank_name(db), dst, use_bank_name(b1), src1,
-                       b, res);
+                       b, res.value);
             } else {
                 sgx_pr("%s %s%u, %s%u, %s%u = %08x\n", name,
                        use_bank_name(db), dst, use_bank_name(b1), src1,
-                       use_bank_name(b2), src2, res);
+                       use_bank_name(b2), src2, res.value);
             }
-            if (!use_write(&c, db, dst, res)) {
+            if (!use_write_bits(&c, db, dst, res)) {
                 c.stop = "приймач бітової операції не підтримано";
             }
             break;
@@ -2585,8 +2868,15 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                                              (w1 & USE1_S2BEXT) != 0);
             ClarionUseBank db = use_bank_dst(w1);
             uint32_t a, b, acc, res;
+            bool spred_known, spred_taken;
 
-            if (!use_spred_true(&c, spred)) {
+            spred_taken = use_spred_true(&c, spred, &spred_known);
+            if (!spred_known) {
+                sgx_pr("imae  ⚠ short predicate %u unknown\n", spred);
+                c.stop = "предикат IMAE невідомий";
+                break;
+            }
+            if (!spred_taken) {
                 sgx_pr("imae (предикат хибний — пропущено)\n");
                 break;
             }
@@ -2964,14 +3254,19 @@ static void clarion_sgx_reset_hold(Object *obj, ResetType type)
     ClarionSgxState *s = CLARION_SGX(obj);
 
     memset(s->regs, 0, sizeof(s->regs));
+    memset(s->regs_known_mask, 0, sizeof(s->regs_known_mask));
+    memset(s->regs_version, 0, sizeof(s->regs_version));
+    s->regs_epoch = 0;
     s->kicks = 0;
     s->nwr = 0;
     s->wr_overflow = false;
     memset(s->sa, 0, sizeof(s->sa));
     memset(s->sa_known, 0, sizeof(s->sa_known));
+    memset(s->sa_known_mask, 0, sizeof(s->sa_known_mask));
     s->sa_count = 0;
     memset(s->pa, 0, sizeof(s->pa));
     memset(s->pa_known, 0, sizeof(s->pa_known));
+    memset(s->pa_known_mask, 0, sizeof(s->pa_known_mask));
     s->pa_count = 0;
     s->sa_sbase = 0;
     s->nuse = 0;
@@ -2982,9 +3277,9 @@ static void clarion_sgx_reset_hold(Object *obj, ResetType type)
      * просто є. Тому після скидання вони ВІДОМІ, на відміну від решти вікна.
      */
     s->regs[SGX_CR_CORE_REVISION / 4] = s->core_rev;
-    s->regs_known[SGX_CR_CORE_REVISION / 4] = true;
+    s->regs_known_mask[SGX_CR_CORE_REVISION / 4] = UINT32_MAX;
     s->regs[SGX_CR_CORE_ID / 4] = s->core_id;
-    s->regs_known[SGX_CR_CORE_ID / 4] = true;
+    s->regs_known_mask[SGX_CR_CORE_ID / 4] = UINT32_MAX;
     s->core_id_warned = false;
 }
 
