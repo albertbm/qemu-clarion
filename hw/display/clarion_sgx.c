@@ -214,7 +214,7 @@ static void sgx_set_reg(ClarionSgxState *s, hwaddr off, uint32_t val)
 
 /*
  * Побічні дії запису в регістр — те саме, хто б не писав: гість через MMIO чи
- * мікроядро інструкцією `str`. Поки що тут лише вузол системного кешу MNE.
+ * мікроядро інструкцією `str`. Тут вузли системного кешу MNE і PDS.
  *
  * Чому це чесно. Кеша в моделі немає, тому «інвалідувати все» справді
  * виконується миттєво й повністю — ми не вдаємо завершення, воно настало.
@@ -231,6 +231,34 @@ static void sgx_set_reg(ClarionSgxState *s, hwaddr off, uint32_t val)
 static void sgx_reg_side_effects(ClarionSgxState *s, hwaddr off, uint32_t val)
 {
     switch (off) {
+    case SGX_CR_PDS_INV0:
+    case SGX_CR_PDS_INV1:
+    case SGX_CR_PDS_INV3:
+    case SGX_CR_PDS_INV_CSC:
+        if (val & SGX_CR_PDS_INV_REQUEST) {
+            uint32_t bit = off == SGX_CR_PDS_INV0
+                ? SGX_CR_PDS_CACHE_STATUS_DSC_INV0
+                : off == SGX_CR_PDS_INV1
+                ? SGX_CR_PDS_CACHE_STATUS_DSC_INV1
+                : off == SGX_CR_PDS_INV3
+                ? SGX_CR_PDS_CACHE_STATUS_DSC_INV3
+                : SGX_CR_PDS_CACHE_STATUS_CSC_INV;
+
+            /* No modeled PDS cache: completion is immediate for level polling.
+             * The physical latency and internal state machine are unknown.
+             * First request establishes knownness; reset value stays unknown.
+             */
+            sgx_set_reg(s, SGX_CR_PDS_CACHE_STATUS,
+                        sgx_reg(s, SGX_CR_PDS_CACHE_STATUS) | bit);
+        }
+        break;
+    case SGX_CR_PDS_CACHE_HOST_CLEAR:
+        if (s->regs_known[SGX_CR_PDS_CACHE_STATUS / 4]) {
+            sgx_set_reg(s, SGX_CR_PDS_CACHE_STATUS,
+                        sgx_reg(s, SGX_CR_PDS_CACHE_STATUS) &
+                        ~(val & SGX_CR_PDS_CACHE_STATUS_MASK));
+        }
+        break;
     case SGX_CR_MNE_CTRL:
         if (val & SGX_CR_MNE_CTRL_INVAL_ALL) {
             sgx_set_reg(s, SGX_CR_MNE_EVENT_STATUS,
