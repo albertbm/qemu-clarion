@@ -377,6 +377,31 @@ static void sgx_phys_st32(uint32_t pa, uint32_t val)
 }
 
 /*
+ * Те саме для півслова (T34). Ширина 2 Б і порядок байтів доведені:
+ * DTYPE=16 у `sgxdefs.h`, декодер/кодер IMG дають `ldaw`/`staw`, а на QY8
+ * молодший байт лежить за молодшою адресою (T31, `docs/sgx/65`).
+ *
+ * ⚠ Запис іде рівно двома байтами — сусіднє півслово модель не чіпає взагалі,
+ * тож питання «чи зберігає залізо сусіда» тут навіть не виникає.
+ */
+static uint32_t sgx_phys_ld16(uint32_t pa)
+{
+    uint16_t v = 0;
+
+    address_space_read(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED,
+                       &v, sizeof(v));
+    return le16_to_cpu(v);
+}
+
+static void sgx_phys_st16(uint32_t pa, uint16_t val)
+{
+    uint16_t v = cpu_to_le16(val);
+
+    address_space_write(&address_space_memory, pa, MEMTXATTRS_UNSPECIFIED,
+                        &v, sizeof(v));
+}
+
+/*
  * Перекласти device-VA у фізичну адресу за каталогом pd_pa.
  * Повертає false, якщо PDE або PTE невалідний — і тоді НІЧОГО не вигадує.
  */
@@ -2775,10 +2800,23 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                 break;
             }
             scale = use_ldst_scale(w1);
-            if (scale != 4) {
+            if (scale != 4 && scale != 2) {
                 sgx_pr("ld/st шириною %u Б — не тлумачимо\n", scale);
                 c.stop = "ширина доступу ld/st";
                 break;
+            }
+            if (scale == 2) {
+                /* Ті самі OP/AMODE, інший DTYPE — і в IMG це інші мнемоніки. */
+                mnem = store ? "staw" : "ldaw";
+                if (count > 1) {
+                    /*
+                     * Скільки регістрів заповнює вибірка півслів і як саме
+                     * вони пакуються — ми не міряли. Один доступ — чесно.
+                     */
+                    sgx_pr("%s з лічильником ×%u — не міряно\n", mnem, count);
+                    c.stop = "лічильник halfword ld/st";
+                    break;
+                }
             }
             if (!use_read(&c, b0, src0, &base) ||
                 !use_read(&c, b1, src1, &off)) {
@@ -2811,6 +2849,17 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
             addr = (imode == USE1_LDST_IMODE_PRE)  ? base + step :
                    (imode == USE1_LDST_IMODE_POST) ? base :
                                                      base + off * scale;
+            if (scale == 2 && (addr & 1)) {
+                /*
+                 * Що робить залізо на непарній адресі — UNKNOWN (docs/sgx/65).
+                 * Ні регістра, ні пам'яті не чіпаємо: краще зупинка, ніж
+                 * вигадана семантика вирівнювання.
+                 */
+                sgx_pr("%s ⚠ непарна адреса VA %08x — семантика не доведена\n",
+                        mnem, addr);
+                c.stop = "непарна адреса halfword ld/st";
+                break;
+            }
             if (fetch && count > 1 && imode != USE1_LDST_IMODE_NONE &&
                 step != 0) {
                 /*
@@ -2834,47 +2883,102 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
             }
 
             if (store) {
-                if (!use_read(&c, b2, src2, &val)) {
+                if (scale == 2) {
+                    /*
+                     * `staw` бере рівно один 16-бітний канал джерела — це
+                     * PROVEN за USC (`dce.c:3074..3143`, docs/sgx/65). Тому
+                     * старші 16 бітів можуть бути невідомі: на записане
+                     * півслово вони не впливають.
+                     */
+                    ClarionUseBits sval;
+
+                    if (!use_read_bits(&c, b2, src2, &sval) ||
+                        (sval.known & 0xffff) != 0xffff) {
+                        sgx_pr("staw ⚠ молодше півслово джерела невідоме\n");
+                        c.stop = "значення staw невідоме";
+                        break;
+                    }
+                    val = sval.value & 0xffff;
+                } else if (!use_read(&c, b2, src2, &val)) {
                     sgx_pr("stad  ⚠ значення невідоме\n");
                     c.stop = "значення stad невідоме";
                     break;
                 }
                 if (!sgx_translate(pd, addr, &pa2)) {
-                    sgx_pr("stad%s [%s%u,+#%u] -> VA %08x НЕ відображено\n",
-                            suffix, use_bank_name(b0), src0, off, addr);
+                    sgx_pr("%s%s [%s%u,+#%u] -> VA %08x НЕ відображено\n",
+                            mnem, suffix, use_bank_name(b0), src0, off, addr);
                     c.stop = "ціль ld/st не відображена";
                     break;
                 }
-                sgx_pr("stad%s [%s%u,+#%u] <- %08x  (VA %08x, PA %08x)",
-                        suffix, use_bank_name(b0), src0, off, val, addr, pa2);
-                sgx_phys_st32(pa2, val);
+                sgx_pr("%s%s [%s%u,+#%u] <- %0*x  (VA %08x, PA %08x)",
+                        mnem, suffix, use_bank_name(b0), src0, off,
+                        scale == 2 ? 4 : 8, val, addr, pa2);
+                if (scale == 2) {
+                    sgx_phys_st16(pa2, (uint16_t)val);
+                } else {
+                    sgx_phys_st32(pa2, val);
+                }
                 s->nstores++;
                 sgx_pr("  ✔ ЗАПИСАНО В ПАМ'ЯТЬ ГОСТЯ\n");
             } else {
                 ClarionUseBank db = (w1 & USE1_LDST_DBANK_PRIMATTR)
                                     ? USE_BANK_PRIMATTR : USE_BANK_TEMP;
 
-                sgx_pr("ldad%s %s%u..+%u <- [%s%u,+#%u]  (VA %08x)\n",
-                        suffix, use_bank_name(db), dst, count - 1,
-                        use_bank_name(b0), src0, off, addr);
-                for (i = 0; i < count; i++) {
-                    if (!sgx_translate(pd, addr + i * 4, &pa2)) {
-                        sgx_pr("[sgx]     %*s  VA %08x НЕ відображено\n",
-                                2 * depth, ind, addr + i * 4);
+                if (scale == 2) {
+                    /*
+                     * ⚠⚠ ГОЛОВНЕ МІСЦЕ T34. Доведено (docs/sgx/65, T32) лише
+                     * те, що біти 15:0 приймача отримують вибране півслово.
+                     * Що стає з бітами 31:16 — zero-extend, sign-extend,
+                     * збереження старого чи взагалі невизначеність — джерел
+                     * не існує: T33 (docs/sgx/66) закрився як Outcome E.
+                     *
+                     * Тому модель НЕ розширює нічого. Вона пише відомими рівно
+                     * 16 бітів, а старшу половину лишає невідомою — механізмом
+                     * побітової відомості T29. Якщо мікроядро колись обіпреться
+                     * на старшу половину, інтерпретатор зупиниться голосно і
+                     * назве місце; вигаданий нуль таку зупинку приховав би.
+                     */
+                    uint32_t hw;
+
+                    if (!sgx_translate(pd, addr, &pa2)) {
+                        sgx_pr("ldaw%s %s%u <- [%s%u,+#%u] -> VA %08x НЕ"
+                                " відображено\n", suffix, use_bank_name(db),
+                                dst, use_bank_name(b0), src0, off, addr);
                         c.stop = "ціль ld/st не відображена";
                         break;
                     }
-                    val = sgx_phys_ld32(pa2);
-                    sgx_pr("[sgx]     %*s  %s%u = %08x  (VA %08x)\n",
-                            2 * depth, ind, use_bank_name(db), dst + i, val,
-                            addr + i * 4);
-                    if (!use_write(&c, db, dst + i, val)) {
-                        c.stop = "приймач ldad не підтримано";
+                    hw = sgx_phys_ld16(pa2);
+                    sgx_pr("ldaw%s %s%u <- [%s%u,+#%u] = %04x  (VA %08x,"
+                            " PA %08x; біти 31:16 НЕВІДОМІ)\n",
+                            suffix, use_bank_name(db), dst,
+                            use_bank_name(b0), src0, off, hw, addr, pa2);
+                    if (!use_write_bits(&c, db, dst, use_bits(hw, 0xffff))) {
+                        c.stop = "приймач ldaw не підтримано";
                         break;
                     }
-                }
-                if (c.stop) {
-                    break;
+                } else {
+                    sgx_pr("ldad%s %s%u..+%u <- [%s%u,+#%u]  (VA %08x)\n",
+                            suffix, use_bank_name(db), dst, count - 1,
+                            use_bank_name(b0), src0, off, addr);
+                    for (i = 0; i < count; i++) {
+                        if (!sgx_translate(pd, addr + i * 4, &pa2)) {
+                            sgx_pr("[sgx]     %*s  VA %08x НЕ відображено\n",
+                                    2 * depth, ind, addr + i * 4);
+                            c.stop = "ціль ld/st не відображена";
+                            break;
+                        }
+                        val = sgx_phys_ld32(pa2);
+                        sgx_pr("[sgx]     %*s  %s%u = %08x  (VA %08x)\n",
+                                2 * depth, ind, use_bank_name(db), dst + i,
+                                val, addr + i * 4);
+                        if (!use_write(&c, db, dst + i, val)) {
+                            c.stop = "приймач ldad не підтримано";
+                            break;
+                        }
+                    }
+                    if (c.stop) {
+                        break;
+                    }
                 }
             }
 
