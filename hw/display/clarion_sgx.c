@@ -45,12 +45,10 @@
  * — `usedefs.h:70`. Повний розбір і критерії — docs/sgx/09, 22 і 24
  * репозиторію nissan-can-explore.
  *
- * Що вже реалізовано (M3-B1) і чого ще немає (M3-B2). Під QY8_SGX_EXEC модель
- * ВИКОНУЄ програми PDS: MOV32, TSTZ/TSTN, BRA/CALL/RTN, HALT, DOUTD (справжнє
- * копіювання у банк вторинних атрибутів) і DOUTU (постановка точки входу
- * задачі USE в чергу). Інтерпретатора USE ще немає, тому ланка `emitpds`
- * поки розімкнена, і `ui32InitStatus` модель не чіпає: навіть із
- * QY8_SGX_EXEC=1 гість бачить рівно те саме, що й без нього.
+ * Під QY8_SGX_EXEC модель виконує підтримані програми PDS і USE. Зокрема,
+ * диспетчер kernel-CCB є джерелом live-входів B2. Лише додатковий прапорець
+ * QY8_SGX_NULLRENDER вмикає синтетичний запис одного доведеного sync word;
+ * звичайний SGX_EXEC без нього не додає B2-записів.
  *
  * Звідки взято базу, розмір, зсуви й маски — див. clarion_sgx.h; жодне
  * число тут не вгадане з аналогії з іншим SoC.
@@ -64,9 +62,9 @@
  *                            досліду, не для звичайних прогонів.
  *   QY8_SGX_DUMP=VA:LEN,...  додатково показувати ці діапазони GPU-VA на kick
  *   QY8_SGX_EXEC=1           виконувати програми PDS, а не лише розбирати.
- *                            Наслідки лишаються в стані МОДЕЛІ (банк вторинних
- *                            атрибутів, черга задач USE); у пам'ять гостя
- *                            модель не пише, тож бут A/B не змінюється.
+ *                            Разом із QY8_SGX_NULLRENDER запускає live B2.
+ *   QY8_SGX_NULLRENDER=1     синтетично завершити доведений TA+3D sync word;
+ *                            растеризації немає, пікселі не визначені.
  *   QY8_SGX_PDS_RUN=VA[:рядків[:ir0]]
  *                            ⚠ діагностика, не ланка чесного ланцюга: виконати
  *                            названу програму PDS. Потрібне, доки немає
@@ -97,6 +95,23 @@
 #define SGX_USE_POLL_SPAN    64  /* maximum instructions between poll reads */
 #define SGX_PDS_MAX_STEPS   4096
 #define SGX_PDS_MAX_PROG    0x2000
+#define SGX_B2_SYNTH_MAX    8
+#define SGX_B2_STORE_HISTORY 512
+
+typedef struct ClarionSgxSyntheticWord {
+    uint32_t dva;
+    uint32_t pa;
+    uint32_t value;
+    bool valid;
+} ClarionSgxSyntheticWord;
+
+typedef struct ClarionSgxGuestStore {
+    uint32_t dva;
+    uint32_t pa;
+    uint32_t value;
+    uint8_t size;
+    bool synthetic;
+} ClarionSgxGuestStore;
 
 typedef struct ClarionSgxDump {
     uint32_t va;
@@ -128,6 +143,13 @@ struct ClarionSgxState {
     uint32_t kicks;             /* скільки разів прийшов EVENT_KICK2 */
     uint32_t kick_reports;      /* скільки з них розбирати докладно */
     bool readback;              /* ⚠ віддавати записане на читання */
+    bool nullrender;            /* QY8_SGX_NULLRENDER: synthetic scene completion */
+    bool b2_disabled;           /* image guard failed; disabled for this run */
+    ClarionSgxSyntheticWord b2_synthetic[SGX_B2_SYNTH_MAX];
+    unsigned nb2_synthetic;
+    ClarionSgxGuestStore b2_stores[SGX_B2_STORE_HISTORY];
+    unsigned nb2_stores;
+    bool b2_store_overflow;
 
     ClarionSgxDump dump[SGX_DUMP_RANGES];
     unsigned ndump;
@@ -421,6 +443,307 @@ static bool sgx_translate(uint32_t pd_pa, uint32_t va, uint32_t *pa_out)
     }
     *pa_out = (pte & SGX_MMU_ENTRY_ADDR_MASK) | (va & (SGX_MMU_PAGE_SIZE - 1));
     return true;
+}
+
+static bool sgx_b2_read32(uint32_t pd, uint32_t dva, uint32_t *value,
+                          uint32_t *pa)
+{
+    if ((dva & 3) || !sgx_translate(pd, dva, pa)) {
+        return false;
+    }
+    *value = sgx_phys_ld32(*pa);
+    return true;
+}
+
+static bool sgx_b2_prior_writer(ClarionSgxState *s, uint32_t pa,
+                                unsigned size);
+static void sgx_b2_record_store(ClarionSgxState *s, uint32_t dva,
+                               uint32_t pa, uint32_t value, unsigned size,
+                               bool synthetic);
+static bool sgx_b2_model_store_conflict(ClarionSgxState *s, uint32_t dva,
+                                        uint32_t pa, unsigned size);
+
+static void sgx_b2_skip(uint32_t kick, const char *reason, uint32_t dva)
+{
+    static const char banner[] = "render completion is SYNTHETIC; no rasterization occurred; pixel contents are undefined";
+
+    fprintf(stderr, "{\"kind\":\"b2_skip\",\"kick\":%u,"
+            "\"reason\":\"%s\",\"dva\":\"0x%08x\","
+            "\"banner\":\"%s\"}\n", kick, reason, dva, banner);
+}
+
+/*
+ * Minimal B2 at the target dispatcher. This consumes only live USE attributes
+ * and the selected record/context/list chain; it never advances a queue.
+ */
+static void sgx_b2_dispatch(ClarionSgxState *s, uint32_t pd,
+                            uint32_t code_base, uint32_t dispatch_pc,
+                            uint32_t target, uint32_t context, uint32_t kick)
+{
+    static const char banner[] = "render completion is SYNTHETIC; no rasterization occurred; pixel contents are undefined";
+    uint32_t dispatch_pa, target_pa, word, record_base, read_offset;
+    uint32_t kernel_ccb_slot, ccb_read_offset;
+    uint32_t kernel_ccb_base, ccb_pa;
+    uint32_t record_dva, record_pa, record_context;
+    uint32_t ctl_dva, ctl_pa, base_dva, cmdta, cmdta_pa;
+    uint32_t ctx_ctl_pa, ctx_base_pa;
+    uint32_t ready, ready_pa, list_dva = 0, pending, pending_pa;
+    uint32_t dva, dva_pa, before, sync_pa, after;
+    char chain[2048];
+    size_t used = 0;
+
+    if (!s->nullrender || dispatch_pc != code_base + 0x458) {
+        return;
+    }
+    if (s->b2_disabled) {
+        sgx_b2_skip(kick, "image_mismatch", dispatch_pc);
+        return;
+    }
+    if (!sgx_b2_read32(pd, code_base + 0x458, &word, &dispatch_pa) ||
+        word != 0x00000200 ||
+        !sgx_b2_read32(pd, code_base + 0x45c, &word, &target_pa) ||
+        word != 0xf80000c0) {
+        s->b2_disabled = true;
+        sgx_b2_skip(kick, "image_mismatch", code_base + 0x458);
+        return;
+    }
+    if (target != code_base + 0x728) {
+        sgx_b2_skip(kick, "unsupported_class", target);
+        return;
+    }
+    if (!sgx_b2_read32(pd, code_base + 0x728, &word, &target_pa) ||
+        word != 0x20200380 ||
+        !sgx_b2_read32(pd, code_base + 0x72c, &word, &target_pa) ||
+        word != 0x28011000 ||
+        !sgx_b2_read32(pd, code_base + 0x730, &word, &target_pa) ||
+        word != 0xa0404280 ||
+        !sgx_b2_read32(pd, code_base + 0x734, &word, &target_pa) ||
+        word != 0xe82b0000) {
+        s->b2_disabled = true;
+        sgx_b2_skip(kick, "image_mismatch", code_base + 0x728);
+        return;
+    }
+    if (!context || !s->sa_known[SGX_SA_TA3DCTL] ||
+        !s->sa_known[SGX_SA_CCBCTL]) {
+        sgx_b2_skip(kick, "missing_live_attributes", context);
+        return;
+    }
+    if (s->sa[SGX_SA_TA3DCTL] > UINT32_MAX - 0x88 ||
+        s->sa[SGX_SA_CCBCTL] > UINT32_MAX - 4 ||
+        !sgx_b2_read32(pd, s->sa[SGX_SA_TA3DCTL] + 0x88,
+                       &kernel_ccb_base, &kernel_ccb_slot) ||
+        !sgx_b2_read32(pd, s->sa[SGX_SA_CCBCTL] + 4,
+                       &ccb_read_offset, &ccb_pa)) {
+        sgx_b2_skip(kick, "live_ccb_inputs_unmapped", context);
+        return;
+    }
+    if (ccb_read_offset > (UINT32_MAX - kernel_ccb_base) / 32) {
+        sgx_b2_skip(kick, "record_address_overflow", kernel_ccb_base);
+        return;
+    }
+    record_base = kernel_ccb_base;
+    read_offset = ccb_read_offset;
+    record_dva = record_base + read_offset * 32;
+    if (record_dva > UINT32_MAX - 0x0c) {
+        sgx_b2_skip(kick, "record_address_overflow", record_dva);
+        return;
+    }
+    if (!sgx_b2_read32(pd, record_dva + 0x0c, &record_context,
+                       &record_pa) || record_context != context) {
+        sgx_b2_skip(kick, "record_context_unmapped_or_mismatch",
+                    record_dva + 0x0c);
+        return;
+    }
+    if (context > UINT32_MAX - 0x10 ||
+        !sgx_b2_read32(pd, context + 0x10, &ctl_dva, &ctx_ctl_pa) ||
+        !sgx_b2_read32(pd, context + 0x0c, &base_dva, &ctx_base_pa) ||
+        ctl_dva > UINT32_MAX - 4 ||
+        !sgx_b2_read32(pd, ctl_dva + 4, &read_offset, &ctl_pa)) {
+        sgx_b2_skip(kick, "context_or_ctl_unmapped", context);
+        return;
+    }
+    if (read_offset > UINT32_MAX - base_dva) {
+        sgx_b2_skip(kick, "cmdta_address_overflow", base_dva);
+        return;
+    }
+    cmdta = base_dva + read_offset;
+    if (cmdta > UINT32_MAX - 0x50) {
+        sgx_b2_skip(kick, "cmdta_address_overflow", cmdta);
+        return;
+    }
+    if (!sgx_b2_read32(pd, cmdta + 0x50, &ready, &ready_pa)) {
+        sgx_b2_skip(kick, "cmdta_not_mapped", cmdta + 0x50);
+        return;
+    }
+    if (!(ready & 1)) {
+        sgx_b2_skip(kick, "not_ready", cmdta + 0x50);
+        return;
+    }
+    if (!sgx_b2_read32(pd, cmdta + 0x3c, &list_dva, &cmdta_pa)) {
+        sgx_b2_skip(kick, "list_pointer_unmapped", cmdta + 0x3c);
+        return;
+    }
+    if (!list_dva) {
+        sgx_b2_skip(kick, "null_list", cmdta + 0x3c);
+        return;
+    }
+    if (list_dva > UINT32_MAX - 0x14) {
+        sgx_b2_skip(kick, "list_address_overflow", list_dva);
+        return;
+    }
+    if (!sgx_b2_read32(pd, list_dva + 0x10, &pending, &pending_pa) ||
+        !sgx_b2_read32(pd, list_dva + 0x14, &dva, &dva_pa)) {
+        sgx_b2_skip(kick, "list_unmapped", list_dva);
+        return;
+    }
+    if (!dva) {
+        sgx_b2_skip(kick, "null_sync_dva", list_dva + 0x14);
+        return;
+    }
+    if (!sgx_b2_read32(pd, dva, &before, &sync_pa)) {
+        sgx_b2_skip(kick, "sync_unmapped", dva);
+        return;
+    }
+    if (before != pending) {
+        sgx_b2_skip(kick, "unexpected_complete", dva);
+        return;
+    }
+    if (s->b2_store_overflow) {
+        sgx_b2_skip(kick, "store_history_overflow", dva);
+        return;
+    }
+    if (sgx_b2_prior_writer(s, sync_pa, 4)) {
+        sgx_b2_skip(kick, "prior_model_writer", dva);
+        return;
+    }
+    if (s->nb2_synthetic >= SGX_B2_SYNTH_MAX) {
+        sgx_b2_skip(kick, "synthetic_provenance_full", dva);
+        return;
+    }
+    after = pending + 1;
+    sgx_phys_st32(sync_pa, after);
+    sgx_b2_record_store(s, dva, sync_pa, after, 4, true);
+    {
+        ClarionSgxSyntheticWord *sw = &s->b2_synthetic[s->nb2_synthetic++];
+        *sw = (ClarionSgxSyntheticWord) { dva, sync_pa, after, true };
+    }
+    s->nstores++;
+    used += snprintf(chain + used, sizeof(chain) - used,
+                     "[{\"step\":\"sa0+0x88 kernel CCB base\",\"dva\":\"0x%08x\",\"pa\":\"0x%08x\",\"value\":\"0x%08x\"},",
+                     s->sa[SGX_SA_TA3DCTL] + 0x88, kernel_ccb_slot,
+                     kernel_ccb_base);
+    used += snprintf(chain + used, sizeof(chain) - used,
+                     "{\"step\":\"sa2+4 ReadOffset\",\"dva\":\"0x%08x\",\"pa\":\"0x%08x\",\"value\":\"0x%08x\"},",
+                     s->sa[SGX_SA_CCBCTL] + 4, ccb_pa, ccb_read_offset);
+    used += snprintf(chain + used, sizeof(chain) - used,
+                     "{\"step\":\"record+0x0c\",\"dva\":\"0x%08x\",\"pa\":\"0x%08x\",\"value\":\"0x%08x\"},",
+                     record_dva + 0x0c, record_pa, record_context);
+    used += snprintf(chain + used, sizeof(chain) - used,
+                     "{\"step\":\"ctx+0x10\",\"dva\":\"0x%08x\",\"pa\":\"0x%08x\",\"value\":\"0x%08x\"},",
+                     context + 0x10, ctx_ctl_pa, ctl_dva);
+    used += snprintf(chain + used, sizeof(chain) - used,
+                     "{\"step\":\"ctx+0x0c\",\"dva\":\"0x%08x\",\"pa\":\"0x%08x\",\"value\":\"0x%08x\"},",
+                     context + 0x0c, ctx_base_pa, base_dva);
+    used += snprintf(chain + used, sizeof(chain) - used,
+                     "{\"step\":\"ctl+4\",\"dva\":\"0x%08x\",\"pa\":\"0x%08x\",\"value\":\"0x%08x\"},",
+                     ctl_dva + 4, ctl_pa, read_offset);
+    used += snprintf(chain + used, sizeof(chain) - used,
+                     "{\"step\":\"CMDTA+0x50\",\"dva\":\"0x%08x\",\"pa\":\"0x%08x\",\"value\":\"0x%08x\"},",
+                     cmdta + 0x50, ready_pa, ready);
+    used += snprintf(chain + used, sizeof(chain) - used,
+                     "{\"step\":\"CMDTA+0x3c\",\"dva\":\"0x%08x\",\"pa\":\"0x%08x\",\"value\":\"0x%08x\"},",
+                     cmdta + 0x3c, cmdta_pa, list_dva);
+    used += snprintf(chain + used, sizeof(chain) - used,
+                     "{\"step\":\"list+0x10\",\"dva\":\"0x%08x\",\"pa\":\"0x%08x\",\"value\":\"0x%08x\"},",
+                     list_dva + 0x10, pending_pa, pending);
+    used += snprintf(chain + used, sizeof(chain) - used,
+                     "{\"step\":\"list+0x14\",\"dva\":\"0x%08x\",\"pa\":\"0x%08x\",\"value\":\"0x%08x\"},",
+                     list_dva + 0x14, dva_pa, dva);
+    snprintf(chain + used, sizeof(chain) - used,
+             "{\"step\":\"sync\",\"dva\":\"0x%08x\",\"pa\":\"0x%08x\",\"before\":\"0x%08x\",\"after\":\"0x%08x\"}]",
+             dva, sync_pa, before, after);
+    fprintf(stderr, "{\"kind\":\"b2_write\",\"kick\":%u,"
+            "\"class\":\"TA\",\"class_index\":0,\"image_entry\":\"0x%08x\","
+            "\"chain\":%s,\"field_dva\":\"0x%08x\",\"field_pa\":\"0x%08x\","
+            "\"before\":\"0x%08x\",\"after\":\"0x%08x\","
+            "\"rule\":\"0x0e4206b8..0x0e4206e8\","
+            "\"list_source\":\"CMDTA+0x3c directly; RD+0xa8 not observed live\","
+            "\"synthetic\":true,\"banner\":\"%s\"}\n",
+            kick, code_base + 0x728, chain, dva, sync_pa, before, after, banner);
+}
+
+static bool sgx_b2_synthetic_pa(ClarionSgxState *s, uint32_t pa,
+                                uint32_t *value)
+{
+    unsigned i;
+
+    for (i = 0; i < s->nb2_synthetic; i++) {
+        ClarionSgxSyntheticWord *sw = &s->b2_synthetic[i];
+        if (sw->valid && sw->pa == pa) {
+            *value = sw->value;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool sgx_b2_store_overlap(uint32_t pa, unsigned size,
+                                 uint32_t other_pa, unsigned other_size)
+{
+    return (uint64_t)pa < (uint64_t)other_pa + other_size &&
+           (uint64_t)other_pa < (uint64_t)pa + size;
+}
+
+static bool sgx_b2_prior_writer(ClarionSgxState *s, uint32_t pa,
+                                unsigned size)
+{
+    unsigned i;
+
+    if (s->b2_store_overflow) {
+        return true;
+    }
+    for (i = 0; i < s->nb2_stores; i++) {
+        ClarionSgxGuestStore *st = &s->b2_stores[i];
+        if (sgx_b2_store_overlap(pa, size, st->pa, st->size)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void sgx_b2_record_store(ClarionSgxState *s, uint32_t dva,
+                               uint32_t pa, uint32_t value, unsigned size,
+                               bool synthetic)
+{
+    if (!s->nullrender) {
+        return;
+    }
+    if (s->nb2_stores >= SGX_B2_STORE_HISTORY) {
+        s->b2_store_overflow = true;
+        return;
+    }
+    s->b2_stores[s->nb2_stores++] = (ClarionSgxGuestStore) {
+        dva, pa, value, size, synthetic
+    };
+}
+
+static bool sgx_b2_model_store_conflict(ClarionSgxState *s, uint32_t dva,
+                                        uint32_t pa, unsigned size)
+{
+    unsigned i;
+
+    for (i = 0; i < s->nb2_synthetic; i++) {
+        ClarionSgxSyntheticWord *sw = &s->b2_synthetic[i];
+        if (sw->valid && sgx_b2_store_overlap(pa, size, sw->pa, 4)) {
+            fprintf(stderr,
+                    "{\"kind\":\"b2_conflict\",\"kick\":%u,"
+                    "\"dva\":\"0x%08x\",\"pa\":\"0x%08x\","
+                    "\"reason\":\"model_store_overlaps_synthetic_completion\"}\n",
+                    s->kicks, dva, pa);
+            return true;
+        }
+    }
+    return false;
 }
 
 /* Перелік валідних PDE з кількістю відображених сторінок у кожному. */
@@ -912,9 +1235,9 @@ static void pds_douta(ClarionPdsCtx *c, const uint32_t *emit, unsigned n)
 }
 
 /*
- * DOUTU — запуск задачі USE. У M3-B1 інтерпретатора USE ще немає, тому ми
- * лише називаємо точку входу й кладемо її в чергу: її забере M3-B2.
- * Вигадувати виконання задачі тут було б гірше, ніж не виконувати її зовсім.
+ * DOUTU — запуск задачі USE. Інтерпретатор виконує підтримані інструкції;
+ * непідтриманий шлях зупиняється з явною причиною. B2 виконується лише на
+ * доведеній точці диспетчера й лише за QY8_SGX_NULLRENDER=1.
  */
 static void pds_doutu(ClarionPdsCtx *c, const uint32_t *emit, unsigned n)
 {
@@ -2190,6 +2513,13 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                     c.link_known = true;
                     sgx_pr("mov pclink, %s%u = %08x  -> link=%08x\n",
                             use_bank_name(sb), src1, val, c.link);
+                    if (c.r_known[7]) {
+                        sgx_b2_dispatch(s, pd, c.code_base, pc, c.link,
+                                        c.r[7], s->kicks);
+                    } else if (s->nullrender &&
+                               pc == c.code_base + 0x458) {
+                        sgx_b2_skip(s->kicks, "context_unknown", pc);
+                    }
                     break;
                 }
                 if (op2 == USE1_FLOWCTRL_OP2_SAVL) {
@@ -2913,11 +3243,17 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                 sgx_pr("%s%s [%s%u,+#%u] <- %0*x  (VA %08x, PA %08x)",
                         mnem, suffix, use_bank_name(b0), src0, off,
                         scale == 2 ? 4 : 8, val, addr, pa2);
+                if (s->nullrender &&
+                    sgx_b2_model_store_conflict(s, addr, pa2, scale)) {
+                    c.stop = "model store conflicts with synthetic completion";
+                    break;
+                }
                 if (scale == 2) {
                     sgx_phys_st16(pa2, (uint16_t)val);
                 } else {
                     sgx_phys_st32(pa2, val);
                 }
+                sgx_b2_record_store(s, addr, pa2, val, scale, false);
                 s->nstores++;
                 sgx_pr("  ✔ ЗАПИСАНО В ПАМ'ЯТЬ ГОСТЯ\n");
             } else {
@@ -2971,6 +3307,18 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                         sgx_pr("[sgx]     %*s  %s%u = %08x  (VA %08x)\n",
                                 2 * depth, ind, use_bank_name(db), dst + i,
                                 val, addr + i * 4);
+                        {
+                            uint32_t synthetic_value;
+                            if (sgx_b2_synthetic_pa(s, pa2,
+                                                    &synthetic_value)) {
+                                sgx_pr("[sgx]     %*s  T29 provenance:"
+                                       " synthetic B2 completion%s\n",
+                                       2 * depth, ind,
+                                       val == synthetic_value
+                                           ? " (value matches)"
+                                           : " (value changed since B2)");
+                            }
+                        }
                         if (!use_write(&c, db, dst + i, val)) {
                             c.stop = "приймач ldad не підтримано";
                             break;
@@ -3197,6 +3545,9 @@ static void sgx_report_kick(ClarionSgxState *s)
 
     sgx_pr("[sgx] EVENT_KICK2 #%u — розбір видимого стану\n",
             s->kicks);
+    if (s->nullrender && !s->exec) {
+        sgx_b2_skip(s->kicks, "no_exec", 0);
+    }
     sgx_pr("[sgx]   EVENT_HOST_ENABLE  = %08x   (біт 14 = SW event)\n",
             sgx_reg(s, SGX_CR_EVENT_HOST_ENABLE));
     sgx_pr("[sgx]   EVENT_KICKER       = %08x   device-VA лічильника\n",
@@ -3440,6 +3791,12 @@ static void clarion_sgx_reset_hold(Object *obj, ResetType type)
     s->sa_sbase = 0;
     s->nuse = 0;
     s->nstores = 0;
+    memset(s->b2_synthetic, 0, sizeof(s->b2_synthetic));
+    s->nb2_synthetic = 0;
+    memset(s->b2_stores, 0, sizeof(s->b2_stores));
+    s->nb2_stores = 0;
+    s->b2_store_overflow = false;
+    s->b2_disabled = false;
 
     /*
      * Регістри ідентичності апарат тримає завжди — їх ніхто не «пише», вони
@@ -3539,6 +3896,8 @@ static void clarion_sgx_realize(DeviceState *dev, Error **errp)
     e = getenv("QY8_SGX_KICKS");
     s->kick_reports = e ? (uint32_t)atoi(e) : 2;
     s->readback = getenv("QY8_SGX_READBACK") != NULL;
+    e = getenv("QY8_SGX_NULLRENDER");
+    s->nullrender = e && !strcmp(e, "1");
     s->show_writes = getenv("QY8_SGX_WRITES") != NULL;
     s->graph = getenv("QY8_SGX_GRAPH") != NULL;
     s->exec = getenv("QY8_SGX_EXEC") != NULL;
@@ -3555,19 +3914,29 @@ static void clarion_sgx_realize(DeviceState *dev, Error **errp)
             s->core_id == SGX_CORE_ID_UNKNOWN
                 ? " ⚠ ПІДСТАВИ НЕМАЄ (жодна перевірка його не читає)" : "");
 
+    if (s->nullrender) {
+        fprintf(stderr, "[sgx] QY8_SGX_NULLRENDER: render completion is"
+                " SYNTHETIC; no rasterization occurred; pixel contents are"
+                " undefined\n");
+    }
+
     sgx_parse_dump(s, getenv("QY8_SGX_DUMP"));
     sgx_parse_find(s, getenv("QY8_SGX_FIND"));
     sgx_parse_pds_run(s, getenv("QY8_SGX_PDS_RUN"));
 
     if (s->exec) {
         /*
-         * M3-B1 виконує програми PDS, але наслідки лишаються всередині
-         * моделі: DOUTD наповнює наш банк вторинних атрибутів, DOUTU лише
-         * ставить точку входу в чергу. У пам'ять гостя модель не пише і
-         * `ui32InitStatus` не чіпає, тож бут A/B і далі мусить збігатися.
+         * DOUTD/USE працюють у моделі. Гостьову пам'ять змінюють лише
+         * змодельовані USE store та, за окремим прапорцем, мінімальний B2.
+         * Реальну растеризацію ця опція не виконує.
          */
-        fprintf(stderr, "[sgx] QY8_SGX_EXEC: програми PDS ВИКОНУЮТЬСЯ"
-                " (наслідки — лише в стані моделі; гість змін не бачить)\n");
+        if (s->nullrender) {
+            fprintf(stderr, "[sgx] QY8_SGX_EXEC: програми PDS/USE"
+                    " ВИКОНУЮТЬСЯ (B2 може синтетично завершити sync word)\n");
+        } else {
+            fprintf(stderr, "[sgx] QY8_SGX_EXEC: програми PDS ВИКОНУЮТЬСЯ"
+                    " (наслідки — лише в стані моделі; гість змін не бачить)\n");
+        }
     }
     if (s->readback) {
         fprintf(stderr, "[sgx] ⚠ QY8_SGX_READBACK: читання віддають записане — "
