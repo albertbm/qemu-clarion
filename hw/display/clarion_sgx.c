@@ -463,6 +463,85 @@ static void sgx_b2_record_store(ClarionSgxState *s, uint32_t dva,
 static bool sgx_b2_model_store_conflict(ClarionSgxState *s, uint32_t dva,
                                         uint32_t pa, unsigned size);
 
+/* S3/E2 read-only dispatch snapshot. Keep this outside the B2 decision path. */
+static void sgx_e2_ta_dispatch(uint32_t pd, ClarionSgxState *s,
+                               uint32_t context, uint32_t kick)
+{
+    uint32_t slot, base, ro, wo, ctxctl, ctxbase, ctlwo, ctlro;
+    uint32_t pa, list, pending, sync, syncv;
+    uint32_t off, size, cmd, ready, stop = 0;
+    unsigned i, j;
+
+    if (!s->nullrender) return;
+    if (s->sa_known[SGX_SA_TA3DCTL] && s->sa_known[SGX_SA_CCBCTL] &&
+        sgx_b2_read32(pd, s->sa[SGX_SA_TA3DCTL] + 0x88, &base, &slot) &&
+        sgx_b2_read32(pd, s->sa[SGX_SA_CCBCTL], &wo, &pa) &&
+        sgx_b2_read32(pd, s->sa[SGX_SA_CCBCTL] + 4, &ro, &pa)) {
+        fprintf(stderr, "{\"kind\":\"e2_ta_dispatch\",\"kick\":%u,"
+                "\"kernel_ccb\":{\"slot_dva\":\"0x%08x\","
+                "\"write_offset\":\"0x%08x\",\"read_offset\":\"0x%08x\",\"words\":[",
+                kick, s->sa[SGX_SA_TA3DCTL] + 0x88, wo, ro);
+        for (i = 0; i < 8; i++) {
+            uint32_t w = 0;
+            bool ok = sgx_b2_read32(pd, base + ro * 32 + i * 4, &w, &pa);
+            fprintf(stderr, "%s{\"ok\":%s,\"value\":\"0x%08x\"}",
+                    i ? "," : "", ok ? "true" : "false", w);
+        }
+        fprintf(stderr, "]},\"context\":\"0x%08x\",\"context_raw\":\"",
+                context);
+        for (i = 0; context && i < 0x48; i += 4) {
+            uint32_t w = 0;
+            bool ok = sgx_b2_read32(pd, context + i, &w, &pa);
+            if (!ok) break;
+            for (j = 0; j < 4; j++) fprintf(stderr, "%02x", (w >> (8*j)) & 0xff);
+        }
+        fprintf(stderr, "\",\"ta_ccb\":");
+        if (!context) {
+            fprintf(stderr, "null");
+        } else if (sgx_b2_read32(pd, context + 0x10, &ctxctl, &pa) &&
+            sgx_b2_read32(pd, context + 0x0c, &ctxbase, &pa) &&
+            sgx_b2_read32(pd, ctxctl, &ctlwo, &pa) &&
+            sgx_b2_read32(pd, ctxctl + 4, &ctlro, &pa)) {
+            fprintf(stderr, "{\"ctl_dva\":\"0x%08x\",\"base_dva\":\"0x%08x\","
+                    "\"write_offset\":\"0x%08x\",\"read_offset\":\"0x%08x\",\"commands\":[",
+                    ctxctl, ctxbase, ctlwo, ctlro);
+            off = ctlro;
+            if (ctlwo < ctlro) stop = 4;
+            for (i = 0; !stop && off != ctlwo && i < 8; i++) {
+                cmd = ctxbase + off;
+                if (!sgx_b2_read32(pd, cmd, &size, &pa)) { stop = 5; break; }
+                if (i) fputc(',', stderr);
+                fprintf(stderr, "{\"offset\":\"0x%08x\",\"raw\":\"", off);
+                for (j = 0; j < 0x60; j += 4) {
+                    uint32_t w = 0;
+                    if (!sgx_b2_read32(pd, cmd + j, &w, &pa)) break;
+                    for (unsigned b = 0; b < 4; b++)
+                        fprintf(stderr, "%02x", (w >> (8*b)) & 0xff);
+                }
+                ready = list = pending = sync = syncv = 0;
+                sgx_b2_read32(pd, cmd + 0x50, &ready, &pa);
+                if (sgx_b2_read32(pd, cmd + 0x3c, &list, &pa) && list) {
+                    sgx_b2_read32(pd, list + 0x10, &pending, &pa);
+                    if (sgx_b2_read32(pd, list + 0x14, &sync, &pa) && sync)
+                        sgx_b2_read32(pd, sync, &syncv, &pa);
+                }
+                fprintf(stderr, "\",\"ready\":\"0x%08x\",\"list\":\"0x%08x\","
+                        "\"pending\":\"0x%08x\",\"sync_dva\":\"0x%08x\","
+                        "\"sync_word\":\"0x%08x\",\"size\":\"0x%08x\"}",
+                        ready, list, pending, sync, syncv, size);
+                if (!size) { stop = 1; break; }
+                if (size & 3) { stop = 2; break; }
+                if (off > ctlwo || size > ctlwo - off) { stop = 3; break; }
+                off += size;
+            }
+            fprintf(stderr, "],\"walk_stop\":%u,\"walk_end\":\"0x%08x\"}", stop, off);
+        } else fprintf(stderr, "null");
+        fprintf(stderr, "}\n");
+    } else {
+        fprintf(stderr, "{\"kind\":\"e2_ta_dispatch\",\"kick\":%u,\"read_error\":true}\n", kick);
+    }
+}
+
 static void sgx_b2_skip(uint32_t kick, const char *reason, uint32_t dva)
 {
     static const char banner[] = "render completion is SYNTHETIC; no rasterization occurred; pixel contents are undefined";
@@ -511,6 +590,7 @@ static void sgx_b2_dispatch(ClarionSgxState *s, uint32_t pd,
         sgx_b2_skip(kick, "unsupported_class", target);
         return;
     }
+    sgx_e2_ta_dispatch(pd, s, context, kick);
     if (!sgx_b2_read32(pd, code_base + 0x728, &word, &target_pa) ||
         word != 0x20200380 ||
         !sgx_b2_read32(pd, code_base + 0x72c, &word, &target_pa) ||
@@ -2518,6 +2598,7 @@ static void sgx_use_run(ClarionSgxState *s, uint32_t pd, uint32_t code_base,
                                         c.r[7], s->kicks);
                     } else if (s->nullrender &&
                                pc == c.code_base + 0x458) {
+                        sgx_e2_ta_dispatch(pd, s, 0, s->kicks);
                         sgx_b2_skip(s->kicks, "context_unknown", pc);
                     }
                     break;
