@@ -14,6 +14,7 @@ void qy8r_program_destroy(void *ctx, void *program);
 void *qy8r_target_create(void *ctx, int width, int height, int rgba32f);
 void qy8r_target_destroy(void *ctx, void *target);
 int qy8r_target_bind(void *ctx, void *target);
+int qy8r_viewport(void *ctx, int x, int y, int width, int height);
 int qy8r_clear(void *ctx, float r, float g, float b, float a);
 int qy8r_use_program(void *ctx, void *program);
 int qy8r_uniform_f32(void *ctx, void *program, const char *name, const float *values, int count);
@@ -21,9 +22,12 @@ int qy8r_uniform_i32(void *ctx, void *program, const char *name, const int *valu
 int qy8r_texture_rgba32f(void *ctx, void *program, const char *sampler, const float *rgba, int unit);
 int qy8r_begin_draw(void *ctx, void *program);
 int qy8r_attribute_f32(void *ctx, void *program, const char *name, const float *values, int components, int count);
+int qy8r_draw_arrays(void *ctx, int mode, int first, int count);
+int qy8r_blend_state(void *ctx, int enable, int src_rgb, int dst_rgb, int src_alpha, int dst_alpha, const float color[4]);
 int qy8r_draw_points(void *ctx, int count);
 int qy8r_draw_transform_feedback(void *ctx, int count, float *out, size_t float_count);
 int qy8r_read_rgba8(void *ctx, void *target, unsigned char rgba[4]);
+int qy8r_read_rgba8_rect(void *ctx, void *target, unsigned char *rgba, size_t byte_count);
 int qy8r_read_rgba32f(void *ctx, void *target, float rgba[4]);
 const char *qy8r_last_error(void *ctx);
 #ifdef __cplusplus
