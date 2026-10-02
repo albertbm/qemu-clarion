@@ -328,7 +328,10 @@ static void qy8_scif_update_irq(Qy8Scif *s)
      * такого джерела на цьому SCIF драйвер не знає. Передавач у нас завжди
      * порожній, тож TIE не зводимо — інакше лінія висіла б вічно.
      */
-    qemu_set_irq(s->irq, (qy8_scif_rdf(s) || s->dr) && (s->scscr & SCSCR_RIE));
+    /* TDFE завжди 1, тож TXI = TIE; драйвер сам гасить TIE, коли черга порожня */
+    qemu_set_irq(s->irq,
+                 ((qy8_scif_rdf(s) || s->dr) && (s->scscr & SCSCR_RIE)) ||
+                 (s->scscr & SCSCR_TIE));
 }
 
 /*
