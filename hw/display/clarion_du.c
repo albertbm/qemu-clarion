@@ -21,19 +21,20 @@
  *   +0x30000  канал 1: та сама мапа, що й у каналу 0 (DU1_REG_OFFSET)
  *   +0x31000  ESCR13 / OTAR13 — регістри синхронізації каналу 1
  *
- * Що робить завантажувач плати (знято з -d unimp, див. docs/20 «M4»):
- * вмикає 800x480 (повний кадр 1055x524) на обох каналах, DOOR = 0,
- * DORCR = PG1T|DK1S|PG1D_DS1, DSYSR каналу 0 = DEN. Канал 1 лишається
- * вимкненим. Жодного регістра ПЛОЩИНИ він не пише — кадр програмує вже
- * ddi_ncg.dll із користувацької частини WinCE. Тому вікно до M3b чорне,
- * і це стан системи, а не вада моделі.
+ * Завантажувач плати вмикає 800x480 (повний кадр 1055x524) на обох
+ * каналах, DOOR = 0, DORCR = PG1T|DK1S|PG1D_DS1, DSYSR каналу 0 = DEN;
+ * канал 1 лишається вимкненим. Площини пізніше програмує ddi_ncg.dll у
+ * користувацькій частині WinCE. T132 зафіксував register programming P1/P2/P8,
+ * а T133 перевірив діагностичне відображення інжектованих кадрів; це не
+ * підтверджує поведінку фізичного QY8 DU чи реальний scanout.
  *
- * ⚠ Межа чесності. Усе, що стосується ЧИТАННЯ КАДРУ З ПЛОЩИН, написане за
- * rcar_du_regs.h і за кодом драйвера Linux, але НЕ ПЕРЕВІРЕНЕ: гість поки
- * не програмує жодної площини, тож валідувати нічим. Позначені нижче
- * коментарем «НЕПЕРЕВІРЕНО». Чого немає в заголовку драйвера, того тут
- * немає й поготів: ні DPPR, ні кольорового ключа, ні альфа-змішування, ні
- * PnSWAPR, ні переривання кадрової синхронізації (див. нижче).
+ * ⚠ Межа чесності. Рендер площин, DPPR та програмування регістрів
+ * реалізовані за rcar_du_regs.h і драйвером Linux. T133 також додав
+ * діагностичні color-key та alpha правила за encoding Linux v6.6
+ * (перемикач blend); ABIT_1 є inference. Ці результати перевірені лише у
+ * QEMU diagnostic captures, а color key/alpha та решта відповідної DU
+ * поведінки НЕ ПЕРЕВІРЕНІ на фізичному QY8 hardware. Де поведінка не
+ * підтверджена апаратурою, це позначено коментарями біля реалізації.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -108,6 +109,14 @@
 
 #define PnMR                0x000
 #define PnMR_CPSL_SHIFT     8
+#define PnMR_SPIM_SHIFT     12
+#define PnMR_SPIM_MASK      (3u << PnMR_SPIM_SHIFT)
+#define PnMR_SPIM_TP         (0u << PnMR_SPIM_SHIFT)
+#define PnMR_SPIM_ALP        (1u << PnMR_SPIM_SHIFT)
+#define PnMR_SPIM_EOR        (2u << PnMR_SPIM_SHIFT)
+#define PnMR_SPIM_TP_OFF     (1u << 14)
+#define PnMR_TC              (1u << 17)
+#define PnMR_WAE             (1u << 16)
 #define PnMR_DDDF_MASK      3
 #define PnMR_DDDF_8BPP      0
 #define PnMR_DDDF_16BPP     1
@@ -120,6 +129,16 @@
 #define PnDPYR              0x01c
 #define PnDSA0R             0x020
 #define PnDSA_MASK          0xfffffff0
+#define PnALPHAR            0x008
+#define PnALPHAR_ALPHA_MASK 0xff
+#define PnALPHAR_ABIT_SHIFT 12
+#define PnALPHAR_ABIT_MASK  (3u << PnALPHAR_ABIT_SHIFT)
+#define PnALPHAR_ABIT_1     (0u << PnALPHAR_ABIT_SHIFT)
+#define PnALPHAR_ABIT_0     (1u << PnALPHAR_ABIT_SHIFT)
+#define PnALPHAR_ABIT_X     (2u << PnALPHAR_ABIT_SHIFT)
+#define PnTC1R              0x044
+#define PnTC2R              0x048
+#define PnTC3R              0x04c
 #define PnSPXR              0x030
 #define PnSPYR              0x034
 #define PnSWAPR             0x080
@@ -170,6 +189,8 @@ struct ClarionDuState {
     bool warned_swap;
     bool warned_dppr;
     bool warned_bpp;
+    bool warned_du_semantics;
+    bool blend;
 };
 
 static inline uint32_t du_rd(ClarionDuState *s, hwaddr off)
@@ -355,7 +376,7 @@ static int du_plane_list(ClarionDuState *s, int sp, int *order)
     return n;
 }
 
-/* НЕПЕРЕВІРЕНО: малювання однієї площини поверх уже готового рядка кадру. */
+/* Малювання однієї площини поверх уже готового рядка кадру. */
 static void du_draw_plane(ClarionDuState *s, int plane,
                           uint32_t *fb, int cols, int rows)
 {
@@ -363,6 +384,10 @@ static void du_draw_plane(ClarionDuState *s, int plane,
     int bpp;
     DuFormat fmt = du_plane_format(s, plane, &bpp);
     uint32_t dsa = du_rd(s, pb + PnDSA0R) & PnDSA_MASK;
+    uint32_t pnmr = du_rd(s, pb + PnMR);
+    uint32_t spim = pnmr & PnMR_SPIM_MASK;
+    uint32_t alphar = du_rd(s, pb + PnALPHAR);
+    uint32_t tc2 = du_rd(s, pb + PnTC2R);
     uint32_t mwr = du_rd(s, pb + PnMWR);        /* крок рядка в пікселях */
     int dsx = du_rd(s, pb + PnDSXR);
     int dsy = du_rd(s, pb + PnDSYR);
@@ -381,6 +406,16 @@ static void du_draw_plane(ClarionDuState *s, int plane,
                           plane, du_rd(s, pb + PnMR), du_rd(s, pb + PnDDCR4));
         }
         return;
+    }
+    /* Поля/режими нижче мають підтримку лише за Linux v6.6 driver encoding;
+     * поведінка кремнію QY8 цим не підтверджується. */
+    if (!s->warned_du_semantics &&
+        ((pnmr & (PnMR_TC | PnMR_WAE)) || spim == PnMR_SPIM_EOR ||
+         ((pnmr & PnMR_DDDF_MASK) == PnMR_DDDF_8BPP) ||
+         fmt == DU_FMT_XRGB8888 || fmt == DU_FMT_ARGB8888)) {
+        s->warned_du_semantics = true;
+        qemu_log_mask(LOG_UNIMP, "clarion-du: частина семантики DU "
+                      "(TC/WAE/EOR, 8/32bpp key) не моделюється\n");
     }
     if (du_rd(s, pb + PnSWAPR) && !s->warned_swap) {
         s->warned_swap = true;
@@ -427,7 +462,45 @@ static void du_draw_plane(ClarionDuState *s, int plane,
             if (dx < 0 || dx >= cols) {
                 continue;
             }
-            dst[dx] = du_decode_pixel(s, fmt, line + (size_t)x * bpp, palette);
+            const uint8_t *pixel = line + (size_t)x * bpp;
+            uint32_t src = du_decode_pixel(s, fmt, pixel, palette);
+
+            if (s->blend && !(pnmr & PnMR_SPIM_TP_OFF) &&
+                (fmt == DU_FMT_ARGB1555 || fmt == DU_FMT_RGB565)) {
+                /* За драйвером Linux v6.6; на фізичному QY8 hardware
+                 * не перевірено.
+                 * Чинність ключа в SPIM=ALP лишається окремим питанням. */
+                uint16_t raw = pixel[0] | ((uint16_t)pixel[1] << 8);
+                uint16_t key_mask = fmt == DU_FMT_ARGB1555 ? 0x7fff : 0xffff;
+                if ((raw & key_mask) == (tc2 & key_mask)) {
+                    continue;
+                }
+            }
+
+            if (s->blend && fmt == DU_FMT_ARGB1555 &&
+                spim == PnMR_SPIM_ALP) {
+                /* За драйвером Linux v6.6, на фізичному QY8 hardware не
+                 * перевірено: коефіцієнт PnALPHAR і ABIT_0; ABIT_1 —
+                 * симетрична inference. */
+                uint32_t abit = alphar & PnALPHAR_ABIT_MASK;
+                bool a_bit = !!(pixel[1] & 0x80);
+                bool blend_pixel =
+                    (abit == PnALPHAR_ABIT_X) ||
+                    (abit == PnALPHAR_ABIT_1 && a_bit) ||
+                    (abit == PnALPHAR_ABIT_0 && !a_bit);
+                if (blend_pixel) {
+                    uint32_t a = alphar & PnALPHAR_ALPHA_MASK;
+                    uint32_t dstc = dst[dx];
+                    uint32_t r = (((src >> 16) & 0xff) * a +
+                                  ((dstc >> 16) & 0xff) * (255 - a)) / 255;
+                    uint32_t g = (((src >> 8) & 0xff) * a +
+                                  ((dstc >> 8) & 0xff) * (255 - a)) / 255;
+                    uint32_t b = ((src & 0xff) * a +
+                                  (dstc & 0xff) * (255 - a)) / 255;
+                    src = (r << 16) | (g << 8) | b;
+                }
+            }
+            dst[dx] = src;
         }
     }
 }
@@ -610,6 +683,12 @@ static const char *du_reg_name(hwaddr addr)
         switch (po) {
         case PnMR:     r = "MR";     break;
         case PnMWR:    r = "MWR";    break;
+        case PnALPHAR: r = "ALPHAR"; break;
+        case PnTC1R:   r = "TC1R";   break;
+        case PnTC2R:   r = "TC2R";   break;
+        case PnTC3R:   r = "TC3R";   break;
+        case 0x084:    r = "DDCR";   break;
+        case 0x088:    r = "DDCR2";  break;
         case PnDSXR:   r = "DSXR";   break;
         case PnDSYR:   r = "DSYR";   break;
         case PnDPXR:   r = "DPXR";   break;
@@ -780,6 +859,8 @@ static void clarion_du_realize(DeviceState *dev, Error **errp)
 }
 
 static const Property clarion_du_props[] = {
+    /* Diagnostic renderer switch; Linux v6.6 field semantics are not QY8 verified. */
+    DEFINE_PROP_BOOL("blend", ClarionDuState, blend, true),
     /*
      * Точкова частота DCLKIN у герцах — період кадру = (HCR+1)*(VCR+1)/dotclk.
      * У регістрах DU її немає: ESCR02 = 0, тобто такт зовнішній, від TCON
