@@ -109,6 +109,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RenesasSDHIState, RENESAS_SDHI)
 #define CMD_DATA            0x0800
 #define CMD_READ            0x1000
 #define CMD_MULTI           0x2000
+#define CMD_NOAUTOSTOP      0x4000      /* 0 = controller sends CMD12 itself */
 
 /* SD_STOP */
 #define STOP_STP            0x0001
@@ -410,11 +411,14 @@ static void sdhi_send_command(RenesasSDHIState *s)
         s->rsp[1] = v >> 16;
     } else if (rlen == 16) {
         /*
-         * R2: SD_RSP0 тримає молодші 32 біти 136-бітної відповіді разом із
-         * CRC у наймолодшому байті — так само, як це читає tmio_mmc.
+         * R2: the registers hold bits [127:8] without the CRC, right-aligned;
+         * tmio_mmc_cmd_irq() shifts them back left by 8 bits.
          */
+        uint8_t r2[16] = { 0 };
+
+        memcpy(&r2[1], rsp, 15);
         for (i = 0; i < 4; i++) {
-            uint32_t v = ldl_be_p(&rsp[12 - 4 * i]);
+            uint32_t v = ldl_be_p(&r2[12 - 4 * i]);
 
             s->rsp[2 * i] = v & 0xffff;
             s->rsp[2 * i + 1] = v >> 16;
@@ -446,6 +450,13 @@ static void sdhi_block_done(RenesasSDHIState *s)
             s->pos = 0;
         }
         return;
+    }
+    if ((s->cmd & CMD_MULTI) && (s->stop & STOP_SEC) &&
+        !(s->cmd & CMD_NOAUTOSTOP)) {
+        SDRequest req = { .cmd = 12, .arg = 0 };
+        uint8_t rsp[16];
+
+        sdbus_do_command(&s->sdbus, &req, rsp, sizeof(rsp));
     }
     sdhi_abort_data(s);
     s->info1 |= INFO1_ACCEND;
@@ -711,6 +722,8 @@ static void sdhi_init(Object *obj)
               DEVICE(s), "sd-bus");
     memory_region_init_io(&s->iomem, obj, &sdhi_ops, s,
                           TYPE_RENESAS_SDHI, RENESAS_SDHI_SIZE);
+    /* an SD_CMD write wakes the DMAC, which reads SD_BUF0 inside that write */
+    s->iomem.disable_reentrancy_guard = true;
     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq);
 }
