@@ -50,6 +50,12 @@
  *   QY8_SGX_EXEC=off         вимкнути PDS/USE execution (типово увімкнено).
  *   QY8_SGX_NULLRENDER=off   вимкнути live B2 (типово увімкнено);
  *                            completion синтетичний, пікселів немає.
+ *   QY8_SGX_NULLRENDER=all   ⚠ лише для фази MIRROR (docs/sgx/137): те саме
+ *                            правило dst-sync застосувати до КОЖНОЇ READY
+ *                            TA-команди між ReadOffset і WriteOffset TA-CCB.
+ *                            Offset-ів, замків render details і черг не
+ *                            чіпає. Типова поведінка без цього значення
+ *                            не змінюється.
  *   QY8_SGX_PDS_RUN=VA[:рядків[:ir0]]
  *                            ⚠ діагностика, не ланка чесного ланцюга: виконати
  *                            названу програму PDS. Потрібне, доки немає
@@ -81,6 +87,8 @@
 #define SGX_PDS_MAX_STEPS   4096
 #define SGX_PDS_MAX_PROG    0x2000
 #define SGX_B2_SYNTH_MAX    8
+#define SGX_B2_WALK_MAX     8       /* команд TA-CCB за один kick у режимі all */
+#define SGX_B2_CMDTA_SIZE   0x280   /* розмір TA-команди, виміряний live (docs/sgx/89) */
 #define SGX_B2_STORE_HISTORY 512
 
 typedef struct ClarionSgxSyntheticWord {
@@ -129,6 +137,7 @@ struct ClarionSgxState {
     uint32_t kick_reports;      /* скільки з них розбирати докладно */
     bool readback;              /* ⚠ віддавати записане на читання */
     bool nullrender;            /* QY8_SGX_NULLRENDER: synthetic scene completion */
+    bool nullrender_all;        /* =all: правило dst-sync для кожної READY TA-команди */
     bool b2_disabled;           /* image guard failed; disabled for this run */
     ClarionSgxSyntheticWord b2_synthetic[SGX_B2_SYNTH_MAX];
     unsigned nb2_synthetic;
@@ -537,6 +546,113 @@ static void sgx_b2_skip(uint32_t kick, const char *reason, uint32_t dva)
 }
 
 /*
+ * Правило dst-sync для однієї TA-команди: READY, list, PendingVal + 1 із
+ * перевіркою поточного complete. true — обхід команд можна продовжувати
+ * (слово записано або вже завершене); false — fail-closed, далі не йти.
+ */
+static bool sgx_b2_complete_cmd(ClarionSgxState *s, uint32_t pd,
+                                uint32_t code_base, uint32_t kick,
+                                uint32_t cmdta, const char *prefix,
+                                const char *extra)
+{
+    static const char banner[] = "render completion is SYNTHETIC; no rasterization occurred; pixel contents are undefined";
+    uint32_t cmdta_pa;
+    uint32_t ready, ready_pa, list_dva = 0, pending, pending_pa;
+    uint32_t dva, dva_pa, before, sync_pa, after;
+    char chain[2048];
+    size_t used = 0;
+
+    if (cmdta > UINT32_MAX - 0x50) {
+        sgx_b2_skip(kick, "cmdta_address_overflow", cmdta);
+        return false;
+    }
+    if (!sgx_b2_read32(pd, cmdta + 0x50, &ready, &ready_pa)) {
+        sgx_b2_skip(kick, "cmdta_not_mapped", cmdta + 0x50);
+        return false;
+    }
+    if (!(ready & 1)) {
+        sgx_b2_skip(kick, "not_ready", cmdta + 0x50);
+        return false;
+    }
+    if (!sgx_b2_read32(pd, cmdta + 0x3c, &list_dva, &cmdta_pa)) {
+        sgx_b2_skip(kick, "list_pointer_unmapped", cmdta + 0x3c);
+        return false;
+    }
+    if (!list_dva) {
+        sgx_b2_skip(kick, "null_list", cmdta + 0x3c);
+        return false;
+    }
+    if (list_dva > UINT32_MAX - 0x14) {
+        sgx_b2_skip(kick, "list_address_overflow", list_dva);
+        return false;
+    }
+    if (!sgx_b2_read32(pd, list_dva + 0x10, &pending, &pending_pa) ||
+        !sgx_b2_read32(pd, list_dva + 0x14, &dva, &dva_pa)) {
+        sgx_b2_skip(kick, "list_unmapped", list_dva);
+        return false;
+    }
+    if (!dva) {
+        sgx_b2_skip(kick, "null_sync_dva", list_dva + 0x14);
+        return false;
+    }
+    if (!sgx_b2_read32(pd, dva, &before, &sync_pa)) {
+        sgx_b2_skip(kick, "sync_unmapped", dva);
+        return false;
+    }
+    if (before != pending) {
+        sgx_b2_skip(kick, "unexpected_complete", dva);
+        return true;
+    }
+    if (s->b2_store_overflow) {
+        sgx_b2_skip(kick, "store_history_overflow", dva);
+        return false;
+    }
+    if (sgx_b2_prior_writer(s, sync_pa, 4)) {
+        sgx_b2_skip(kick, "prior_model_writer", dva);
+        return false;
+    }
+    if (s->nb2_synthetic >= SGX_B2_SYNTH_MAX) {
+        sgx_b2_skip(kick, "synthetic_provenance_full", dva);
+        return false;
+    }
+    after = pending + 1;
+    sgx_phys_st32(sync_pa, after);
+    sgx_b2_record_store(s, dva, sync_pa, after, 4, true);
+    {
+        ClarionSgxSyntheticWord *sw = &s->b2_synthetic[s->nb2_synthetic++];
+        *sw = (ClarionSgxSyntheticWord) { dva, sync_pa, after, true };
+    }
+    s->nstores++;
+    used += snprintf(chain + used, sizeof(chain) - used, "%s", prefix);
+    used += snprintf(chain + used, sizeof(chain) - used,
+                     "{\"step\":\"CMDTA+0x50\",\"dva\":\"0x%08x\",\"pa\":\"0x%08x\",\"value\":\"0x%08x\"},",
+                     cmdta + 0x50, ready_pa, ready);
+    used += snprintf(chain + used, sizeof(chain) - used,
+                     "{\"step\":\"CMDTA+0x3c\",\"dva\":\"0x%08x\",\"pa\":\"0x%08x\",\"value\":\"0x%08x\"},",
+                     cmdta + 0x3c, cmdta_pa, list_dva);
+    used += snprintf(chain + used, sizeof(chain) - used,
+                     "{\"step\":\"list+0x10\",\"dva\":\"0x%08x\",\"pa\":\"0x%08x\",\"value\":\"0x%08x\"},",
+                     list_dva + 0x10, pending_pa, pending);
+    used += snprintf(chain + used, sizeof(chain) - used,
+                     "{\"step\":\"list+0x14\",\"dva\":\"0x%08x\",\"pa\":\"0x%08x\",\"value\":\"0x%08x\"},",
+                     list_dva + 0x14, dva_pa, dva);
+    snprintf(chain + used, sizeof(chain) - used,
+             "{\"step\":\"sync\",\"dva\":\"0x%08x\",\"pa\":\"0x%08x\",\"before\":\"0x%08x\",\"after\":\"0x%08x\"}]",
+             dva, sync_pa, before, after);
+    fprintf(stderr, "{\"kind\":\"b2_write\",\"kick\":%u,"
+            "\"class\":\"TA\",\"class_index\":0,\"image_entry\":\"0x%08x\","
+            "\"chain\":%s,\"field_dva\":\"0x%08x\",\"field_pa\":\"0x%08x\","
+            "\"before\":\"0x%08x\",\"after\":\"0x%08x\","
+            "\"rule\":\"0x0e4206b8..0x0e4206e8\","
+            "\"list_source\":\"CMDTA+0x3c directly; RD+0xa8 not observed live\","
+            "\"synthetic\":true,%s\"banner\":\"%s\"}\n",
+            kick, code_base + 0x728, chain, dva, sync_pa, before, after,
+            extra, banner);
+    return true;
+}
+
+
+/*
  * Minimal B2 at the target dispatcher. This consumes only live USE attributes
  * and the selected record/context/list chain; it never advances a queue.
  */
@@ -544,16 +660,15 @@ static void sgx_b2_dispatch(ClarionSgxState *s, uint32_t pd,
                             uint32_t code_base, uint32_t dispatch_pc,
                             uint32_t target, uint32_t context, uint32_t kick)
 {
-    static const char banner[] = "render completion is SYNTHETIC; no rasterization occurred; pixel contents are undefined";
     uint32_t dispatch_pa, target_pa, word, record_base, read_offset;
     uint32_t kernel_ccb_slot, ccb_read_offset;
     uint32_t kernel_ccb_base, ccb_pa;
     uint32_t record_dva, record_pa, record_context;
-    uint32_t ctl_dva, ctl_pa, base_dva, cmdta, cmdta_pa;
+    uint32_t ctl_dva, ctl_pa, base_dva;
     uint32_t ctx_ctl_pa, ctx_base_pa;
-    uint32_t ready, ready_pa, list_dva = 0, pending, pending_pa;
-    uint32_t dva, dva_pa, before, sync_pa, after;
-    char chain[2048];
+    uint32_t write_offset, ctl_wo_pa, off, size = 0, size_pa;
+    unsigned n;
+    char chain[1024];
     size_t used = 0;
 
     if (!s->nullrender || dispatch_pc != code_base + 0x458) {
@@ -627,72 +742,6 @@ static void sgx_b2_dispatch(ClarionSgxState *s, uint32_t pd,
         sgx_b2_skip(kick, "context_or_ctl_unmapped", context);
         return;
     }
-    if (read_offset > UINT32_MAX - base_dva) {
-        sgx_b2_skip(kick, "cmdta_address_overflow", base_dva);
-        return;
-    }
-    cmdta = base_dva + read_offset;
-    if (cmdta > UINT32_MAX - 0x50) {
-        sgx_b2_skip(kick, "cmdta_address_overflow", cmdta);
-        return;
-    }
-    if (!sgx_b2_read32(pd, cmdta + 0x50, &ready, &ready_pa)) {
-        sgx_b2_skip(kick, "cmdta_not_mapped", cmdta + 0x50);
-        return;
-    }
-    if (!(ready & 1)) {
-        sgx_b2_skip(kick, "not_ready", cmdta + 0x50);
-        return;
-    }
-    if (!sgx_b2_read32(pd, cmdta + 0x3c, &list_dva, &cmdta_pa)) {
-        sgx_b2_skip(kick, "list_pointer_unmapped", cmdta + 0x3c);
-        return;
-    }
-    if (!list_dva) {
-        sgx_b2_skip(kick, "null_list", cmdta + 0x3c);
-        return;
-    }
-    if (list_dva > UINT32_MAX - 0x14) {
-        sgx_b2_skip(kick, "list_address_overflow", list_dva);
-        return;
-    }
-    if (!sgx_b2_read32(pd, list_dva + 0x10, &pending, &pending_pa) ||
-        !sgx_b2_read32(pd, list_dva + 0x14, &dva, &dva_pa)) {
-        sgx_b2_skip(kick, "list_unmapped", list_dva);
-        return;
-    }
-    if (!dva) {
-        sgx_b2_skip(kick, "null_sync_dva", list_dva + 0x14);
-        return;
-    }
-    if (!sgx_b2_read32(pd, dva, &before, &sync_pa)) {
-        sgx_b2_skip(kick, "sync_unmapped", dva);
-        return;
-    }
-    if (before != pending) {
-        sgx_b2_skip(kick, "unexpected_complete", dva);
-        return;
-    }
-    if (s->b2_store_overflow) {
-        sgx_b2_skip(kick, "store_history_overflow", dva);
-        return;
-    }
-    if (sgx_b2_prior_writer(s, sync_pa, 4)) {
-        sgx_b2_skip(kick, "prior_model_writer", dva);
-        return;
-    }
-    if (s->nb2_synthetic >= SGX_B2_SYNTH_MAX) {
-        sgx_b2_skip(kick, "synthetic_provenance_full", dva);
-        return;
-    }
-    after = pending + 1;
-    sgx_phys_st32(sync_pa, after);
-    sgx_b2_record_store(s, dva, sync_pa, after, 4, true);
-    {
-        ClarionSgxSyntheticWord *sw = &s->b2_synthetic[s->nb2_synthetic++];
-        *sw = (ClarionSgxSyntheticWord) { dva, sync_pa, after, true };
-    }
-    s->nstores++;
     used += snprintf(chain + used, sizeof(chain) - used,
                      "[{\"step\":\"sa0+0x88 kernel CCB base\",\"dva\":\"0x%08x\",\"pa\":\"0x%08x\",\"value\":\"0x%08x\"},",
                      s->sa[SGX_SA_TA3DCTL] + 0x88, kernel_ccb_slot,
@@ -712,29 +761,58 @@ static void sgx_b2_dispatch(ClarionSgxState *s, uint32_t pd,
     used += snprintf(chain + used, sizeof(chain) - used,
                      "{\"step\":\"ctl+4\",\"dva\":\"0x%08x\",\"pa\":\"0x%08x\",\"value\":\"0x%08x\"},",
                      ctl_dva + 4, ctl_pa, read_offset);
-    used += snprintf(chain + used, sizeof(chain) - used,
-                     "{\"step\":\"CMDTA+0x50\",\"dva\":\"0x%08x\",\"pa\":\"0x%08x\",\"value\":\"0x%08x\"},",
-                     cmdta + 0x50, ready_pa, ready);
-    used += snprintf(chain + used, sizeof(chain) - used,
-                     "{\"step\":\"CMDTA+0x3c\",\"dva\":\"0x%08x\",\"pa\":\"0x%08x\",\"value\":\"0x%08x\"},",
-                     cmdta + 0x3c, cmdta_pa, list_dva);
-    used += snprintf(chain + used, sizeof(chain) - used,
-                     "{\"step\":\"list+0x10\",\"dva\":\"0x%08x\",\"pa\":\"0x%08x\",\"value\":\"0x%08x\"},",
-                     list_dva + 0x10, pending_pa, pending);
-    used += snprintf(chain + used, sizeof(chain) - used,
-                     "{\"step\":\"list+0x14\",\"dva\":\"0x%08x\",\"pa\":\"0x%08x\",\"value\":\"0x%08x\"},",
-                     list_dva + 0x14, dva_pa, dva);
-    snprintf(chain + used, sizeof(chain) - used,
-             "{\"step\":\"sync\",\"dva\":\"0x%08x\",\"pa\":\"0x%08x\",\"before\":\"0x%08x\",\"after\":\"0x%08x\"}]",
-             dva, sync_pa, before, after);
-    fprintf(stderr, "{\"kind\":\"b2_write\",\"kick\":%u,"
-            "\"class\":\"TA\",\"class_index\":0,\"image_entry\":\"0x%08x\","
-            "\"chain\":%s,\"field_dva\":\"0x%08x\",\"field_pa\":\"0x%08x\","
-            "\"before\":\"0x%08x\",\"after\":\"0x%08x\","
-            "\"rule\":\"0x0e4206b8..0x0e4206e8\","
-            "\"list_source\":\"CMDTA+0x3c directly; RD+0xa8 not observed live\","
-            "\"synthetic\":true,\"banner\":\"%s\"}\n",
-            kick, code_base + 0x728, chain, dva, sync_pa, before, after, banner);
+    if (!s->nullrender_all) {
+        if (read_offset > UINT32_MAX - base_dva) {
+            sgx_b2_skip(kick, "cmdta_address_overflow", base_dva);
+            return;
+        }
+        sgx_b2_complete_cmd(s, pd, code_base, kick, base_dva + read_offset,
+                            chain, "");
+        return;
+    }
+    /*
+     * Режим all (docs/sgx/137): пройти команди від ReadOffset до WriteOffset,
+     * нічого не записуючи в ctl. Будь-яка несподіванка зупиняє обхід.
+     */
+    if (!sgx_b2_read32(pd, ctl_dva, &write_offset, &ctl_wo_pa)) {
+        sgx_b2_skip(kick, "ctl_write_offset_unmapped", ctl_dva);
+        return;
+    }
+    if (write_offset < read_offset) {
+        sgx_b2_skip(kick, "ta_ccb_wrapped", ctl_dva);
+        return;
+    }
+    for (off = read_offset, n = 0; off != write_offset; off += size, n++) {
+        char extra[96];
+
+        if (n >= SGX_B2_WALK_MAX) {
+            sgx_b2_skip(kick, "walk_limit", base_dva + off);
+            return;
+        }
+        if (off > UINT32_MAX - base_dva) {
+            sgx_b2_skip(kick, "cmdta_address_overflow", base_dva);
+            return;
+        }
+        if (!sgx_b2_read32(pd, base_dva + off, &size, &size_pa)) {
+            sgx_b2_skip(kick, "cmdta_size_unmapped", base_dva + off);
+            return;
+        }
+        if (size != SGX_B2_CMDTA_SIZE) {
+            sgx_b2_skip(kick, "unexpected_command_size", base_dva + off);
+            return;
+        }
+        if (size > write_offset - off) {
+            sgx_b2_skip(kick, "command_past_write_offset", base_dva + off);
+            return;
+        }
+        snprintf(extra, sizeof(extra),
+                 "\"mode\":\"all\",\"ta_ccb_offset\":\"0x%08x\","
+                 "\"ta_ccb_write_offset\":\"0x%08x\",", off, write_offset);
+        if (!sgx_b2_complete_cmd(s, pd, code_base, kick, base_dva + off,
+                                 chain, extra)) {
+            return;
+        }
+    }
 }
 
 static bool sgx_b2_synthetic_pa(ClarionSgxState *s, uint32_t pa,
@@ -3964,6 +4042,7 @@ static void clarion_sgx_realize(DeviceState *dev, Error **errp)
     s->readback = getenv("QY8_SGX_READBACK") != NULL;
     e = getenv("QY8_SGX_NULLRENDER");
     s->nullrender = !e || (strcmp(e, "off") && strcmp(e, "0"));
+    s->nullrender_all = e && !strcmp(e, "all");
     s->show_writes = getenv("QY8_SGX_WRITES") != NULL;
     s->graph = getenv("QY8_SGX_GRAPH") != NULL;
     e = getenv("QY8_SGX_EXEC");
@@ -3985,6 +4064,11 @@ static void clarion_sgx_realize(DeviceState *dev, Error **errp)
         fprintf(stderr, "[sgx] QY8_SGX_NULLRENDER: render completion is"
                 " SYNTHETIC; no rasterization occurred; pixel contents are"
                 " undefined\n");
+    }
+    if (s->nullrender_all) {
+        fprintf(stderr, "[sgx] QY8_SGX_NULLRENDER=all: MIRROR-only; dst-sync"
+                " completion for every READY TA command (docs/sgx/137);"
+                " no queue offset is advanced\n");
     }
 
     sgx_parse_dump(s, getenv("QY8_SGX_DUMP"));
