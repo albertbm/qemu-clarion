@@ -2,6 +2,9 @@
 #include "qy8r.h"
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
+#ifdef __APPLE__
+#include <EGL/eglext_angle.h>
+#endif
 #include <GLES3/gl3.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,7 +23,11 @@ static void copyerr(char *dst,size_t n,const char *s){if(dst&&n)snprintf(dst,n,"
 void *qy8r_open(char *error,size_t error_size){
     qy8r_context *c=calloc(1,sizeof *c);if(!c){copyerr(error,error_size,"out of memory");return NULL;}
     PFNEGLGETPLATFORMDISPLAYEXTPROC getp=(PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
-    if(getp)c->dpy=getp(EGL_PLATFORM_SURFACELESS_MESA,EGL_DEFAULT_DISPLAY,NULL);else c->dpy=eglGetDisplay(EGL_DEFAULT_DISPLAY);
+#ifdef __APPLE__
+    if(getp){const EGLint angle_attrs[]={EGL_PLATFORM_ANGLE_TYPE_ANGLE,EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE,EGL_NONE};c->dpy=getp(EGL_PLATFORM_ANGLE_ANGLE,EGL_DEFAULT_DISPLAY,angle_attrs);}
+#endif
+    if(c->dpy==EGL_NO_DISPLAY&&getp)c->dpy=getp(EGL_PLATFORM_SURFACELESS_MESA,EGL_DEFAULT_DISPLAY,NULL);
+    if(c->dpy==EGL_NO_DISPLAY)c->dpy=eglGetDisplay(EGL_DEFAULT_DISPLAY);
     EGLint major=0,minor=0;
     if(c->dpy==EGL_NO_DISPLAY||!eglInitialize(c->dpy,&major,&minor)||major<1||(major==1&&minor<4)){seterr(c,"EGL 1.4+ initialization failed");goto bad;}
     if(!eglBindAPI(EGL_OPENGL_ES_API)){seterr(c,"eglBindAPI GLES failed");goto bad;}
@@ -64,7 +71,7 @@ int qy8r_use_program(void*p,void*q){qy8r_context*c=p;qy8r_program*x=q;if(!c||!x)
 int qy8r_uniform_f32(void*p,void*q,const char*name,const float*v,int count){qy8r_context*c=p;qy8r_program*x=q;if(!c||!x||!name||!v)return 0;GLint l=glGetUniformLocation(x->id,name);if(l<0){snprintf(c->error,sizeof c->error,"required uniform not active: %s",name);return 0;}if(count==1)glUniform1fv(l,1,v);else if(count==2)glUniform2fv(l,1,v);else if(count==3)glUniform3fv(l,1,v);else if(count==4)glUniform4fv(l,1,v);else if(count==16)glUniformMatrix4fv(l,1,GL_FALSE,v);else return 0;return glok(c,"set float uniform");}
 int qy8r_uniform_i32(void*p,void*q,const char*name,const int*v,int count){qy8r_context*c=p;qy8r_program*x=q;if(!c||!x||!name||!v)return 0;GLint l=glGetUniformLocation(x->id,name);if(l<0){snprintf(c->error,sizeof c->error,"required uniform not active: %s",name);return 0;}if(count==1)glUniform1iv(l,1,v);else if(count==2)glUniform2iv(l,1,v);else if(count==3)glUniform3iv(l,1,v);else if(count==4)glUniform4iv(l,1,v);else return 0;return glok(c,"set integer uniform");}
 int qy8r_texture_rgba32f(void*p,void*q,const char*sampler,const float*rgba,int unit){qy8r_context*c=p;qy8r_program*x=q;if(!c||!x||!sampler||!rgba||unit<0)return 0;if(unit>=c->max_texture_units){snprintf(c->error,sizeof c->error,"texture unit %d exceeds backend limit %d",unit,c->max_texture_units);return 0;}GLint l=glGetUniformLocation(x->id,sampler);if(l<0){snprintf(c->error,sizeof c->error,"required sampler not active: %s",sampler);return 0;}if(!c->textures[unit])glGenTextures(1,&c->textures[unit]);glActiveTexture(GL_TEXTURE0+unit);glBindTexture(GL_TEXTURE_2D,c->textures[unit]);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA32F,1,1,0,GL_RGBA,GL_FLOAT,rgba);glUniform1i(l,unit);return glok(c,"upload float texture");}
-int qy8r_begin_draw(void*p,void*q){qy8r_context*c=p;qy8r_program*x=q;if(!c||!x)return 0;for(int i=0;i<c->n_buffers;i++)glDeleteBuffers(1,&c->buffers[i]);c->n_buffers=0;glBindVertexArray(c->vao);glUseProgram(x->id);glDisable(GL_BLEND);glDisable(GL_DEPTH_TEST);glDisable(GL_STENCIL_TEST);glDisable(GL_DITHER);return glok(c,"begin draw");}
+int qy8r_begin_draw(void*p,void*q){qy8r_context*c=p;qy8r_program*x=q;if(!c||!x)return 0;glBindVertexArray(c->vao);GLint n=0;glGetIntegerv(GL_MAX_VERTEX_ATTRIBS,&n);for(GLint i=0;i<n;i++)glDisableVertexAttribArray((GLuint)i);for(int i=0;i<c->n_buffers;i++)glDeleteBuffers(1,&c->buffers[i]);c->n_buffers=0;glUseProgram(x->id);glDisable(GL_BLEND);glDisable(GL_DEPTH_TEST);glDisable(GL_STENCIL_TEST);glDisable(GL_DITHER);return glok(c,"begin draw");}
 int qy8r_attribute_f32(void*p,void*q,const char*name,const float*v,int comps,int count){qy8r_context*c=p;qy8r_program*x=q;if(!c||!x||!name||!v||comps<1||comps>4||count<1||c->n_buffers>=16)return 0;GLint loc=glGetAttribLocation(x->id,name);if(loc<0){snprintf(c->error,sizeof c->error,"required attribute not active: %s",name);return 0;}GLuint b;glGenBuffers(1,&b);c->buffers[c->n_buffers++]=b;glBindBuffer(GL_ARRAY_BUFFER,b);glBufferData(GL_ARRAY_BUFFER,(GLsizeiptr)(sizeof(float)*comps*count),v,GL_STREAM_DRAW);glEnableVertexAttribArray((GLuint)loc);glVertexAttribPointer((GLuint)loc,comps,GL_FLOAT,GL_FALSE,0,0);return glok(c,"set attribute");}
 int qy8r_draw_arrays(void*p,int mode,int first,int count){qy8r_context*c=p;if(!c||first<0||count<1||(mode!=GL_TRIANGLES&&mode!=GL_TRIANGLE_STRIP&&mode!=GL_TRIANGLE_FAN)){if(c)snprintf(c->error,sizeof c->error,"unsupported draw mode/arguments");return 0;}glDrawArrays((GLenum)mode,first,count);glFinish();return glok(c,"draw arrays");}
 int qy8r_blend_state(void*p,int enable,int sr,int dr,int sa,int da,const float color[4]){qy8r_context*c=p;if(!c||!color)return 0;if(enable){glEnable(GL_BLEND);glBlendFuncSeparate((GLenum)sr,(GLenum)dr,(GLenum)sa,(GLenum)da);glBlendColor(color[0],color[1],color[2],color[3]);}else glDisable(GL_BLEND);return glok(c,"set blend state");}
