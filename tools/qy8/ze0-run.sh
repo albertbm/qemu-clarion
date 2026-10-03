@@ -1,21 +1,21 @@
 #!/bin/bash
 # Boot the ZE0 unit headless for a while and summarise how far it got.
 # Usage: ze0-run.sh SECS OUTDIR [extra qemu args...]
-# Env: ZE0_NAND, ZE0_CARD (defaults below), QEMU (binary), BOARD (ze0), DIPSW (1),
+# Env: ZE0_NAND, ZE0_CARD (required), QEMU (binary), BOARD (ze0), DIPSW (1),
 #      GL=FILE.syms to software-render the AUI with the qy8gl bridge
 set -u
 secs=$1; out=$2; shift 2
 here=$(cd "$(dirname "$0")/../.." && pwd)
 qemu=${QEMU:-$here/build/qemu-system-arm}
-nand=${ZE0_NAND:-$QY8_NAND}
-card=${ZE0_CARD:-$QY8_CARD}
+nand=${ZE0_NAND:?set ZE0_NAND to the unit's NAND dump}
+card=${ZE0_CARD:?set ZE0_CARD to the unit's map card image}
 mkdir -p "$out"
 rm -f "$out"/q.sock "$out"/*.log "$out"/screen.png
 
 # copies only: the guest writes flash and card. Clear VEUP's update request.
 cp "$nand" "$out/nand.bin"
 printf '\x00\x00' | dd of="$out/nand.bin" bs=1 seek=$((0x100010)) conv=notrunc 2>/dev/null
-[ -f "$out/card.img" ] || { cp -c "$card" "$out/card.img" 2>/dev/null || cp "$card" "$out/card.img"; truncate -s 16G "$out/card.img"; }
+[ -f "$out/card.img" ] || { cp -c "$card" "$out/card.img" 2>/dev/null || cp --reflink=auto "$card" "$out/card.img"; truncate -s 16G "$out/card.img"; }
 
 cat "$here/contrib/plugins/qy8dbg.syms" > "$out/syms"
 if [ -n "${GL:-}" ]; then
@@ -28,7 +28,7 @@ fi
     -drive if=sd,index=0,format=raw,file="$out/card.img" \
     -display none -serial file:"$out/console.log" \
     -qmp unix:"$out/q.sock",server,nowait \
-    -plugin "$here/build/contrib/plugins/libqy8gl.dylib,syms=$out/syms,log=$out/dbg.log" \
+    -plugin "$here/build/contrib/plugins/libqy8gl.$([ "$(uname)" = Darwin ] && echo dylib || echo so),syms=$out/syms,log=$out/dbg.log" \
     -d guest_errors,unimp -D "$out/guest.log" "$@" > "$out/qemu.log" 2>&1 &
 pid=$!
 sleep "$secs"

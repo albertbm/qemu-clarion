@@ -4,7 +4,7 @@ Local tooling for the Clarion QY8 (Nissan Leaf ZE1) emulator. Boot it with `../.
 
 | tool | what it does |
 |---|---|
-| `exports.py IMAGE MODULE...` | lists a ROM module's exports as `ordinal address name`. Needs `ximg.py` from a CE ROM extractor (`$NANDX`). |
+| `exports.py IMAGE MODULE...` | lists a ROM module's exports as `ordinal address name`. Needs a Windows CE ROM extractor that provides `ximg.py` (not included); point `$NANDX` at its directory. |
 | `qmp.py SOCK 'hmp cmd'...` | runs monitor commands over a QMP socket, e.g. `screendump out.png -f png` |
 | `shell.py SOCK SECS cmd...` | waits for boot output, then types debug-shell commands and prints the replies |
 | `tap.py SOCK X Y` | taps screen pixel X,Y (800x480) through QMP input events; the touch panel model turns it into a touch |
