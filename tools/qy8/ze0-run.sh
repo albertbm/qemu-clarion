@@ -1,7 +1,8 @@
 #!/bin/bash
 # Boot the ZE0 unit headless for a while and summarise how far it got.
 # Usage: ze0-run.sh SECS OUTDIR [extra qemu args...]
-# Env: ZE0_NAND, ZE0_CARD (defaults below), QEMU (binary), BOARD (ze0), DIPSW (1)
+# Env: ZE0_NAND, ZE0_CARD (defaults below), QEMU (binary), BOARD (ze0), DIPSW (1),
+#      GL=FILE.syms to software-render the AUI with the qy8gl bridge
 set -u
 secs=$1; out=$2; shift 2
 here=$(cd "$(dirname "$0")/../.." && pwd)
@@ -17,6 +18,11 @@ printf '\x00\x00' | dd of="$out/nand.bin" bs=1 seek=$((0x100010)) conv=notrunc 2
 [ -f "$out/card.img" ] || { cp -c "$card" "$out/card.img" 2>/dev/null || cp "$card" "$out/card.img"; truncate -s 16G "$out/card.img"; }
 
 cat "$here/contrib/plugins/qy8dbg.syms" > "$out/syms"
+if [ -n "${GL:-}" ]; then
+    cat "$GL" >> "$out/syms"
+    export QY8_GL_FRAME="$out/glframe.bin"
+    rm -f "$QY8_GL_FRAME"
+fi
 "$qemu" -M clarion-qy8,board=${BOARD:-ze0},dipsw=${DIPSW:-1},du-dotclk=33333333 \
     -drive if=pflash,format=raw,file="$out/nand.bin" \
     -drive if=sd,index=0,format=raw,file="$out/card.img" \

@@ -1,10 +1,19 @@
 #!/bin/bash
-# Boot the ZE1 bench unit in NORM(EVA) and attach the debug shell to this terminal.
+# Boot a head unit in NORM(EVA) and attach the debug shell to this terminal.
 # Usage: ./qy8-shell.sh [NAND] [CARD] [DIPSW]
+# BOARD=ze0 boots the 2014-2017 unit: same NAND and card arguments.
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
-nand=${1:-$QY8_NAND}
-card=${2:-$QY8_CARD}
+board=${BOARD:-ze1}
+if [ "$board" = ze0 ]; then
+    nand=${1:-$QY8_NAND}
+    card=${2:-$QY8_CARD}
+    glsyms=$here/contrib/plugins/qy8gl-g214.syms
+else
+    nand=${1:-$QY8_NAND}
+    card=${2:-$QY8_CARD}
+    glsyms=$here/contrib/plugins/qy8gl.syms
+fi
 mode=${3:-1}
 work=$(mktemp -d /tmp/qy8.XXXXXX)
 
@@ -24,11 +33,11 @@ display=cocoa
 gl=()
 if [ -z "$NOGL" ]; then
     export QY8_GL_FRAME="$work/glframe.bin"
-    gl=(-plugin "$here/build/contrib/plugins/libqy8gl.dylib,syms=$here/contrib/plugins/qy8gl.syms,log=$work/gl.log")
+    gl=(-plugin "$here/build/contrib/plugins/libqy8gl.dylib,syms=$glsyms,log=$work/gl.log")
 fi
 
 echo "work dir: $work   (Ctrl-A X quits)"
-exec "$here/build/qemu-system-arm" -M clarion-qy8,dipsw="$mode",du-dotclk=33333333 \
+exec "$here/build/qemu-system-arm" -M clarion-qy8,board="$board",dipsw="$mode",du-dotclk=33333333 \
     -drive if=pflash,format=raw,file="$work/nand.bin" \
     -drive if=sd,index=0,format=raw,file="$work/card.img" \
     "${gl[@]}" -display "$display" -serial mon:stdio 2>"$work/qemu.log"
