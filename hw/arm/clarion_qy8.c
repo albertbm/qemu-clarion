@@ -35,6 +35,7 @@
 #include "hw/arm/boot.h"
 #include "hw/intc/arm_gic.h"
 #include "hw/display/clarion_du.h"
+#include "monitor/qdev.h"
 #include "hw/display/clarion_sgx.h"
 #include "hw/misc/clarion_micom.h"
 #include "hw/misc/clarion_dispmicom.h"
@@ -2342,8 +2343,12 @@ static void qy8_init(MachineState *machine)
      * `dotclk` (ESCR02 = 0, такт зовнішній, у регістрах його немає).
      */
     s->du = qdev_new(TYPE_CLARION_DU);
+    qdev_set_id(s->du, g_strdup("qy8-du"), &error_fatal);
     qdev_prop_set_uint32(s->du, "dotclk", s->du_dotclk);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(s->du), &error_fatal);
+    if (s->tma460 && s->tma460_synthetic_profile_on) {
+        clarion_tma460_bind_pointer_input(s->tma460, "qy8-du", &error_fatal);
+    }
     sysbus_mmio_map(SYS_BUS_DEVICE(s->du), 0, QY8_DU_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(s->du), 0,
                        qemu_allocate_irq(qy8_du_irq, s, 0));
@@ -2665,10 +2670,10 @@ static void qy8_machine_instance_init(Object *obj)
         "вбудований МК панелі дисплея на SCIF1 (off — щоб причепити свій "
         "відповідач через -serial)");
 
-    s->i2c4_on = false;
+    s->i2c4_on = true;
     object_property_add_bool(obj, "i2c4", qy8_i2c4_get, qy8_i2c4_set);
     object_property_set_description(obj, "i2c4",
-        "opt-in обмежена модель I2C4 @0xffc73000 (типово вимкнена)");
+        "Bounded I2C4 controller model at 0xffc73000 (on by default; off disables it)");
 
     s->i2c4_recorder_on = false;
     object_property_add_bool(obj, "i2c4-recorder", qy8_i2c4_recorder_get,
@@ -2683,18 +2688,18 @@ static void qy8_machine_instance_init(Object *obj)
         "opt-in діагностика: I2C0..I2C2 з порожньою шиною (NACK замість "
         "3-секундного таймауту)");
 
-    s->tma460_on = false;
+    s->tma460_on = true;
     object_property_add_bool(obj, "tma460", qy8_tma460_get,
                              qy8_tma460_set);
     object_property_set_description(obj, "tma460",
-        "opt-in bounded TMA460 bootloader model на I2C4 address 0x24");
+        "Bounded TMA460 bootloader model at I2C4 address 0x24 (on by default; requires i2c4=on)");
 
-    s->tma460_synthetic_profile_on = false;
+    s->tma460_synthetic_profile_on = true;
     object_property_add_bool(obj, "tma460-profile",
                              qy8_tma460_profile_get,
                              qy8_tma460_profile_set);
     object_property_set_description(obj, "tma460-profile",
-        "opt-in мінімальний synthetic System Mode profile");
+        "Minimal synthetic TMA460 System Mode profile with pointer-to-touch input (on by default)");
 }
 
 static void qy8_machine_class_init(ObjectClass *oc, const void *data)

@@ -85,16 +85,20 @@ the same command line is merged with the first.
 | `du-dotclk` | `0` | display dot clock in Hz; `0` means no frame tick. Use `33333333` for the window |
 | `du-spi` | `31` | GIC line of the display frame interrupt |
 | `i2c-empty` | `off` | I2C0..I2C2 as empty buses: an immediate NACK instead of a bus timeout |
-| `i2c4` | `off` | I2C4 controller model (the touchscreen bus) |
+| `i2c4` | `on` | Bounded I2C4 controller model at `0xffc73000` (the touchscreen bus) |
 | `i2c4-recorder` | `off` | transaction recorder on I2C4, address `0x24` |
-| `tma460` | `off` | TMA460 touchscreen controller model on I2C4 (requires `i2c4=on`) |
-| `tma460-profile` | `off` | synthetic TMA460 register profile; a click in the window is reported as a touch |
+| `tma460` | `on` | TMA460 touchscreen controller model on I2C4 (requires `i2c4=on`) |
+| `tma460-profile` | `on` | Synthetic TMA460 register profile with pointer-to-touch input |
 
 A typical configuration with touch:
 
 ```
--M clarion-qy8,du-dotclk=33333333,i2c-empty=on,i2c4=on,tma460=on,tma460-profile=on
+-M clarion-qy8,du-dotclk=33333333,i2c-empty=on
 ```
+
+The touchscreen bus, controller, and synthetic profile are enabled by default.
+Disable them explicitly with `i2c4=off,tma460=off,tma460-profile=off` when a
+test needs the original no-touch behavior. `i2c-empty` remains opt-in.
 
 ## 5. Serial ports and SD cards
 
@@ -110,10 +114,20 @@ SCIF4 and SCIF1 are taken by the built-in models.
 
 ## 6. Pointer input
 
-With `tma460-profile=on`, a left click in the window is reported by the
-TMA460 model as a touch at the same point. The same can be scripted over
-QMP (`-qmp unix:path,server=on,wait=off`), with coordinates on the
-`0..0x7fff` scale:
+With `tma460-profile=on`, pointer events are reported only after the
+controller exits bootloader and enters working mode. Button transitions are
+preserved until the previous report is read; intermediate movement can be
+coalesced. Raw report coordinates use the target profile offsets `X + 14`
+and `Y + 9`.
+
+| Pointer event | TMA460 event ID | Queue state |
+|---|---:|---|
+| Left button down | 1 | Pressed |
+| Movement while held | 2 | Pressed |
+| Left button up | 3 | Released |
+
+The same input path can be scripted over QMP (`-qmp
+unix:path,server=on,wait=off`), with coordinates on the `0..0x7fff` scale:
 
 ```json
 {"execute": "qmp_capabilities"}

@@ -6,6 +6,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qapi/error.h"
 #include "qemu/log.h"
 #include "hw/core/sysbus.h"
 #include "hw/core/qdev-properties.h"
@@ -13,8 +14,12 @@
 #include "hw/i2c/i2c.h"
 #include "hw/i2c/clarion_rcar_i2c.h"
 #include "qemu/module.h"
+#include "ui/input.h"
 
 #define RCAR_I2C4_MMIO_SIZE 0x1000
+#define TMA460_PROFILE_POINT_SIZE 10
+#define TMA460_TOUCH_X_OFFSET 14
+#define TMA460_TOUCH_Y_OFFSET 9
 
 #define ICMCR  0x04
 #define ICMSR  0x0c
@@ -81,77 +86,156 @@ struct ClarionTma460 {
     bool system_header_active;
     bool profile_read_active;
     bool mode_write_pending;
+    QemuInputHandlerState *pointer_input;
+    int pointer_x;
+    int pointer_y;
+    bool pointer_valid;
+    bool pointer_dirty;
+    bool pointer_button_down;
+    bool reported_button_down;
+    bool reported_pointer_valid;
+    bool ignore_pointer_until_release;
+    uint16_t reported_pointer_x;
+    uint16_t reported_pointer_y;
+    bool touch_report_pending;
+    uint8_t touch_report[TMA460_PROFILE_POINT_SIZE];
     uint8_t mode_register;
     uint8_t mode_write_value;
 };
 
-/* Profile values accepted by the target-side System Mode parser. */
-static const uint8_t clarion_tma460_profile_sysinfo[16] = {
-    0x10, 0x00, 0x00, 0x01, 0x00, 0x20, 0x00, 0x4a,
-    0x00, 0x50, 0x00, 0x60, 0x00, 0x70, 0x00, 0x71,
+#define TMA460_PROFILE_A1 0x20 /* SYNTHETIC: selected first block address. */
+#define TMA460_PROFILE_L  0x10 /* TARGET: block length used by derived reads. */
+#define TMA460_PROFILE_A2 0x4a /* SYNTHETIC: second block address. */
+#define TMA460_PROFILE_A3 0x50 /* SYNTHETIC: third block address. */
+#define TMA460_PROFILE_A4 0x60 /* SYNTHETIC: configuration block address. */
+#define TMA460_PROFILE_A5 0x70 /* SYNTHETIC: cfg[0] selector. */
+#define TMA460_PROFILE_A6 0x71 /* SYNTHETIC: cfg[1] selector. */
+#define TMA460_PROFILE_TOUCH_COUNT 0x90 /* SYNTHETIC: separate count selector. */
+#define TMA460_PROFILE_TOUCH_DATA (TMA460_PROFILE_TOUCH_COUNT + 1)
+#define TMA460_PROFILE_MODE_ANY 0xff
+#define TMA460_PROFILE_MODE_SYSTEM 0x10
+#define TMA460_PROFILE_MODE_WORKING 0x00
+
+G_STATIC_ASSERT(TMA460_PROFILE_TOUCH_DATA + 100 < 0x100);
+
+/* TARGET: bit 0x10 selects System Mode; other fields satisfy parser constraints. */
+static const uint8_t clarion_tma460_profile_sysinfo[] = {
+    0x10, 0x00, 0x00, 0x01, 0x00, TMA460_PROFILE_A1,
+    0x00, TMA460_PROFILE_A2, 0x00, TMA460_PROFILE_A3,
+    0x00, TMA460_PROFILE_A4, 0x00, TMA460_PROFILE_A5,
+    0x00, TMA460_PROFILE_A6,
 };
 
-#define TMA460_PROFILE_A1 0x20
-#define TMA460_PROFILE_L  0x10
-#define TMA460_PROFILE_A2 0x4a
-#define TMA460_PROFILE_A4 0x60
-#define TMA460_PROFILE_A5 0x70
-#define TMA460_PROFILE_A6 0x71
-
-static const uint8_t clarion_tma460_profile_registers[256] = {
-    [TMA460_PROFILE_A1 + 0x12] = TMA460_PROFILE_L,
-    [TMA460_PROFILE_A4] = TMA460_PROFILE_A5,
-    [TMA460_PROFILE_A4 + 1] = TMA460_PROFILE_A6,
-    [TMA460_PROFILE_A4 + 8] = 0x0a,
-};
+typedef enum ClarionTma460ProfileData {
+    TMA460_PROFILE_REGISTER_DATA,
+    TMA460_PROFILE_MODE_DATA,
+    TMA460_PROFILE_TOUCH_COUNT_DATA,
+    TMA460_PROFILE_TOUCH_REPORT_DATA,
+} ClarionTma460ProfileData;
 
 typedef struct ClarionTma460ProfileMap {
     uint8_t selector;
+    uint8_t mode;
     uint8_t length;
+    ClarionTma460ProfileData kind;
     const uint8_t *data;
-    bool mode_register;
     const uint8_t *system_header;
     uint8_t system_header_length;
 } ClarionTma460ProfileMap;
 
-/* The sole selector/length/data table for the synthetic profile. */
+/* SYNTHETIC register bytes; TARGET constraints are marked at each field. */
+static const uint8_t clarion_tma460_profile_registers[256] = {
+    [TMA460_PROFILE_A1 + 0x12] = TMA460_PROFILE_L, /* TARGET: L input. */
+    [TMA460_PROFILE_A4] = TMA460_PROFILE_A5, /* SYNTHETIC: cfg[0]. */
+    [TMA460_PROFILE_A4 + 1] = TMA460_PROFILE_A6, /* SYNTHETIC: cfg[1]. */
+    [TMA460_PROFILE_A4 + 4] = 0x00, /* TARGET: cfg[4] avoids extra reads. */
+    [TMA460_PROFILE_A4 + 5] = TMA460_PROFILE_TOUCH_COUNT, /* SYNTHETIC: cfg[5]. */
+    [TMA460_PROFILE_A4 + 6] = 0x00, /* TARGET: cfg[6] disables gesture path. */
+    [TMA460_PROFILE_A4 + 8] = 0x0a, /* TARGET: cfg[8] is record stride. */
+};
+
+static const uint8_t clarion_tma460_profile_zero[256];
+
+/* One selector/length/data table serves System Mode and working-mode reads. */
 static const ClarionTma460ProfileMap clarion_tma460_profile_map[] = {
-    { 0x00, 2, NULL, true, clarion_tma460_profile_sysinfo,
-      sizeof(clarion_tma460_profile_sysinfo) },
-    { TMA460_PROFILE_A1, 0x2a,
-      clarion_tma460_profile_registers + TMA460_PROFILE_A1, false },
-    { TMA460_PROFILE_A1 + 0x13, 0x10,
-      clarion_tma460_profile_registers + TMA460_PROFILE_A1 + 0x13, false },
-    { TMA460_PROFILE_A1 + TMA460_PROFILE_L + 0x15, 5,
+    { 0x00, TMA460_PROFILE_MODE_ANY, 2, TMA460_PROFILE_MODE_DATA, NULL,
+      clarion_tma460_profile_sysinfo, sizeof(clarion_tma460_profile_sysinfo) },
+    { TMA460_PROFILE_A1, TMA460_PROFILE_MODE_SYSTEM,
+      TMA460_PROFILE_A2 - TMA460_PROFILE_A1, TMA460_PROFILE_REGISTER_DATA,
+      clarion_tma460_profile_registers + TMA460_PROFILE_A1 },
+    { TMA460_PROFILE_A1 + 0x13, TMA460_PROFILE_MODE_SYSTEM,
+      TMA460_PROFILE_L, TMA460_PROFILE_REGISTER_DATA,
+      clarion_tma460_profile_registers + TMA460_PROFILE_A1 + 0x13 },
+    { TMA460_PROFILE_A1 + TMA460_PROFILE_L + 0x15,
+      TMA460_PROFILE_MODE_SYSTEM, 5, TMA460_PROFILE_REGISTER_DATA,
       clarion_tma460_profile_registers + TMA460_PROFILE_A1 +
-          TMA460_PROFILE_L + 0x15, false },
-    { TMA460_PROFILE_A2, 2,
-      clarion_tma460_profile_registers + TMA460_PROFILE_A2, false },
-    { TMA460_PROFILE_A4 - 0x10, 0x0d,
-      clarion_tma460_profile_registers + TMA460_PROFILE_A4 - 0x10, false },
-    { TMA460_PROFILE_A4, 0x22,
-      clarion_tma460_profile_registers + TMA460_PROFILE_A4, false },
-    { TMA460_PROFILE_A5, 1,
-      clarion_tma460_profile_registers + TMA460_PROFILE_A5, false },
-    { TMA460_PROFILE_A6, 2,
-      clarion_tma460_profile_registers + TMA460_PROFILE_A6, false },
-    { 0x01, 1, clarion_tma460_profile_registers + 0x01, false },
-    { 0x02, 10, clarion_tma460_profile_registers + 0x02, false },
-    { 0x03, 0x80, clarion_tma460_profile_registers + 0x03, false },
+          TMA460_PROFILE_L + 0x15 },
+    { TMA460_PROFILE_A2, TMA460_PROFILE_MODE_SYSTEM, 2,
+      TMA460_PROFILE_REGISTER_DATA,
+      clarion_tma460_profile_registers + TMA460_PROFILE_A2 },
+    { TMA460_PROFILE_A4 - 0x10, TMA460_PROFILE_MODE_SYSTEM, 0x0d,
+      TMA460_PROFILE_REGISTER_DATA,
+      clarion_tma460_profile_registers + TMA460_PROFILE_A4 - 0x10 },
+    { TMA460_PROFILE_A4, TMA460_PROFILE_MODE_SYSTEM, 0x22,
+      TMA460_PROFILE_REGISTER_DATA,
+      clarion_tma460_profile_registers + TMA460_PROFILE_A4 },
+    { TMA460_PROFILE_A5, TMA460_PROFILE_MODE_SYSTEM, 1,
+      TMA460_PROFILE_REGISTER_DATA,
+      clarion_tma460_profile_registers + TMA460_PROFILE_A5 },
+    { TMA460_PROFILE_A6, TMA460_PROFILE_MODE_SYSTEM, 2,
+      TMA460_PROFILE_REGISTER_DATA,
+      clarion_tma460_profile_registers + TMA460_PROFILE_A6 },
+    { 0x01, TMA460_PROFILE_MODE_ANY, 1, TMA460_PROFILE_REGISTER_DATA,
+      clarion_tma460_profile_zero + 0x01 },
+    { 0x02, TMA460_PROFILE_MODE_ANY, 10, TMA460_PROFILE_REGISTER_DATA,
+      clarion_tma460_profile_zero + 0x02 },
+    { 0x03, TMA460_PROFILE_MODE_ANY, 0x80, TMA460_PROFILE_REGISTER_DATA,
+      clarion_tma460_profile_zero + 0x03 },
+    { TMA460_PROFILE_A5, TMA460_PROFILE_MODE_WORKING, 1,
+      TMA460_PROFILE_REGISTER_DATA,
+      clarion_tma460_profile_registers + TMA460_PROFILE_A5 },
+    { TMA460_PROFILE_A6, TMA460_PROFILE_MODE_WORKING, 2,
+      TMA460_PROFILE_REGISTER_DATA,
+      clarion_tma460_profile_registers + TMA460_PROFILE_A6 },
+    { TMA460_PROFILE_A6 + 3, TMA460_PROFILE_MODE_WORKING, 10,
+      TMA460_PROFILE_REGISTER_DATA,
+      clarion_tma460_profile_zero + TMA460_PROFILE_A6 + 3 },
+    { TMA460_PROFILE_TOUCH_COUNT, TMA460_PROFILE_MODE_WORKING, 1,
+      TMA460_PROFILE_TOUCH_COUNT_DATA, NULL },
+    { TMA460_PROFILE_TOUCH_DATA, TMA460_PROFILE_MODE_WORKING,
+      TMA460_PROFILE_POINT_SIZE, TMA460_PROFILE_TOUCH_REPORT_DATA, NULL },
 };
 
 static const ClarionTma460ProfileMap *
-clarion_tma460_profile_map_find(uint8_t selector)
+clarion_tma460_profile_map_find(uint8_t selector, uint8_t mode)
 {
+    const ClarionTma460ProfileMap *fallback = NULL;
     size_t i;
 
     for (i = 0; i < ARRAY_SIZE(clarion_tma460_profile_map); i++) {
-        if (clarion_tma460_profile_map[i].selector == selector) {
-            return &clarion_tma460_profile_map[i];
+        const ClarionTma460ProfileMap *entry =
+            &clarion_tma460_profile_map[i];
+
+        if (entry->selector != selector) {
+            continue;
+        }
+        if (entry->mode == mode) {
+            return entry;
+        }
+        if (entry->mode == TMA460_PROFILE_MODE_ANY) {
+            fallback = entry;
         }
     }
-    return NULL;
+    return fallback;
 }
+
+static bool clarion_tma460_pointer_mode_ready(const ClarionTma460 *s)
+{
+    return s->synthetic_profile && s->exit_response_delivered &&
+           s->mode_register == TMA460_PROFILE_MODE_WORKING;
+}
+
+static void clarion_tma460_pointer_sync_state(ClarionTma460 *s);
 
 static const uint8_t clarion_tma460_enter_active[9] = {
     0x00, 0xff, 0x01, 0x38, 0x00, 0x00, 0xa0, 0x09, 0x17,
@@ -226,6 +310,7 @@ static const TypeInfo clarion_i2c4_recorder_type_info = {
 static int clarion_tma460_event(I2CSlave *slave, enum i2c_event event)
 {
     ClarionTma460 *s = CLARION_TMA460(slave);
+    bool touch_report_consumed = false;
 
     switch (event) {
     case I2C_START_SEND:
@@ -275,7 +360,7 @@ static int clarion_tma460_event(I2CSlave *slave, enum i2c_event event)
             s->response_len = s->command[3] == 0x3b ? 7 : 15;
         } else if (s->profile_read_active) {
             const ClarionTma460ProfileMap *entry =
-                clarion_tma460_profile_map_find(s->selector);
+                clarion_tma460_profile_map_find(s->selector, s->mode_register);
 
             if (!entry) {
                 qemu_log_mask(LOG_UNIMP,
@@ -283,8 +368,13 @@ static int clarion_tma460_event(I2CSlave *slave, enum i2c_event event)
                               s->selector);
                 return 1;
             }
-            s->response_len = s->system_header_active ?
-                entry->system_header_length : entry->length;
+            if (s->system_header_active) {
+                s->response_len = entry->system_header_length;
+            } else if (entry->kind == TMA460_PROFILE_TOUCH_REPORT_DATA) {
+                s->response_len = s->touch_report_pending ? entry->length : 0;
+            } else {
+                s->response_len = entry->length;
+            }
         } else {
             s->response_len = 1;
         }
@@ -303,6 +393,19 @@ static int clarion_tma460_event(I2CSlave *slave, enum i2c_event event)
             s->command_pending = false;
             s->response_active = false;
         }
+        if (s->profile_read_active && s->touch_report_pending) {
+            const ClarionTma460ProfileMap *entry =
+                clarion_tma460_profile_map_find(s->selector,
+                                                s->mode_register);
+
+            if (entry && entry->kind == TMA460_PROFILE_TOUCH_REPORT_DATA &&
+                s->response_index == s->response_len) {
+                s->touch_report_pending = false;
+                touch_report_consumed = true;
+                qemu_log_mask(LOG_UNIMP,
+                              "clarion-tma460: touch report consumed\n");
+            }
+        }
         if (s->mode_write_pending) {
             uint8_t mode = s->mode_write_value & 0x78;
 
@@ -320,6 +423,9 @@ static int clarion_tma460_event(I2CSlave *slave, enum i2c_event event)
                               "clarion-tma460: profile mode-change IRQ pulse\n");
             }
             s->mode_write_pending = false;
+        }
+        if (touch_report_consumed) {
+            clarion_tma460_pointer_sync_state(s);
         }
         qemu_log_mask(LOG_UNIMP, "clarion-tma460: finish\n");
         break;
@@ -349,7 +455,7 @@ static int clarion_tma460_send(I2CSlave *slave, uint8_t data)
     if (!s->command_len) {
         if (data != 0x00 && data != 0x01 &&
             !(s->synthetic_profile &&
-              clarion_tma460_profile_map_find(data))) {
+              clarion_tma460_profile_map_find(data, s->mode_register))) {
             qemu_log_mask(LOG_UNIMP,
                           "clarion-tma460: NACK unsupported selector=0x%02x\n",
                           data);
@@ -454,13 +560,20 @@ static uint8_t clarion_tma460_recv(I2CSlave *slave)
 
     if (s->synthetic_profile && s->profile_read_active) {
         const ClarionTma460ProfileMap *entry =
-            clarion_tma460_profile_map_find(s->selector);
+            clarion_tma460_profile_map_find(s->selector, s->mode_register);
         uint8_t value = 0;
 
         if (s->system_header_active && entry && entry->system_header) {
             value = entry->system_header[s->response_index];
-        } else if (entry && entry->mode_register) {
+        } else if (entry && entry->kind == TMA460_PROFILE_MODE_DATA) {
             value = s->response_index == 0 ? s->mode_register : 0;
+        } else if (entry &&
+                   entry->kind == TMA460_PROFILE_TOUCH_COUNT_DATA) {
+            value = s->touch_report_pending ? 1 : 0;
+        } else if (entry &&
+                   entry->kind == TMA460_PROFILE_TOUCH_REPORT_DATA &&
+                   s->touch_report_pending) {
+            value = s->touch_report[s->response_index];
         } else if (entry && entry->data) {
             value = entry->data[s->response_index];
         }
@@ -477,6 +590,159 @@ static uint8_t clarion_tma460_recv(I2CSlave *slave)
                   s->selector, s->response_index);
     s->response_index++;
     return 0x00;
+}
+
+static bool clarion_tma460_emit_touch(ClarionTma460 *s, uint8_t event_id,
+                                      int pointer_x, int pointer_y)
+{
+    uint16_t x = pointer_x + TMA460_TOUCH_X_OFFSET;
+    uint16_t y = pointer_y + TMA460_TOUCH_Y_OFFSET;
+
+    if (!clarion_tma460_pointer_mode_ready(s)) {
+        qemu_log_mask(LOG_UNIMP,
+                      "clarion-tma460: pointer report ignored before working mode (profile=%d exit_response=%d mode=0x%02x)\n",
+                      s->synthetic_profile, s->exit_response_delivered,
+                      s->mode_register);
+        return false;
+    }
+    if (s->touch_report_pending) {
+        qemu_log_mask(LOG_UNIMP,
+                      "clarion-tma460: pointer report deferred while prior report is unread\n");
+        return false;
+    }
+
+    memset(s->touch_report, 0, sizeof(s->touch_report));
+    s->touch_report[0] = x >> 8;
+    s->touch_report[1] = x;
+    s->touch_report[2] = y >> 8;
+    s->touch_report[3] = y;
+    s->touch_report[4] = 0; /* SYNTHETIC: reserved report byte. */
+    s->touch_report[5] = event_id << 4; /* TARGET: EVTID occupies bits 5:4. */
+    s->touch_report_pending = true;
+    qemu_log_mask(LOG_UNIMP,
+                  "clarion-tma460: pointer report evt=%u x=%d y=%d raw_x=%u raw_y=%u\n",
+                  event_id, pointer_x, pointer_y, x, y);
+    qemu_irq_raise(s->irq);
+    qemu_irq_lower(s->irq);
+    return true;
+}
+
+static void clarion_tma460_pointer_event(DeviceState *dev, QemuConsole *src,
+                                         QemuInputEvent *evt)
+{
+    ClarionTma460 *s = CLARION_TMA460(dev);
+
+    switch (evt->type) {
+    case INPUT_EVENT_KIND_ABS:
+        if (evt->abs.axis == INPUT_AXIS_X) {
+            s->pointer_x = qemu_input_scale_axis(evt->abs.value,
+                                                 INPUT_EVENT_ABS_MIN,
+                                                 INPUT_EVENT_ABS_MAX,
+                                                 0, 799);
+            s->pointer_valid = true;
+            s->pointer_dirty = true;
+        } else if (evt->abs.axis == INPUT_AXIS_Y) {
+            s->pointer_y = qemu_input_scale_axis(evt->abs.value,
+                                                 INPUT_EVENT_ABS_MIN,
+                                                 INPUT_EVENT_ABS_MAX,
+                                                 0, 479);
+            s->pointer_valid = true;
+            s->pointer_dirty = true;
+        }
+        break;
+    case INPUT_EVENT_KIND_BTN:
+        if (evt->btn.button == INPUT_BUTTON_LEFT &&
+            s->pointer_button_down != evt->btn.down) {
+            s->pointer_button_down = evt->btn.down;
+            s->pointer_dirty = true;
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static void clarion_tma460_pointer_sync_state(ClarionTma460 *s)
+{
+    uint8_t event_id;
+
+    if (!clarion_tma460_pointer_mode_ready(s)) {
+        s->pointer_dirty = false;
+        s->reported_button_down = false;
+        s->reported_pointer_valid = false;
+        s->ignore_pointer_until_release = s->pointer_button_down;
+        return;
+    }
+    if (s->ignore_pointer_until_release) {
+        s->pointer_dirty = false;
+        s->reported_button_down = false;
+        s->reported_pointer_valid = false;
+        if (!s->pointer_button_down) {
+            s->ignore_pointer_until_release = false;
+        }
+        return;
+    }
+    if (!s->pointer_dirty || !s->pointer_valid || s->touch_report_pending) {
+        return;
+    }
+
+    if (s->pointer_button_down && !s->reported_button_down) {
+        event_id = 1;
+    } else if (!s->pointer_button_down && s->reported_button_down) {
+        event_id = 3;
+    } else if (s->pointer_button_down && s->reported_button_down &&
+               s->reported_pointer_valid &&
+               (s->reported_pointer_x !=
+                    s->pointer_x + TMA460_TOUCH_X_OFFSET ||
+                s->reported_pointer_y !=
+                    s->pointer_y + TMA460_TOUCH_Y_OFFSET)) {
+        event_id = 2;
+    } else {
+        event_id = 0;
+    }
+    if (!event_id) {
+        s->pointer_dirty = false;
+        return;
+    }
+    if (clarion_tma460_emit_touch(s, event_id, s->pointer_x,
+                                   s->pointer_y)) {
+        s->pointer_dirty = false;
+        s->reported_button_down = s->pointer_button_down;
+        s->reported_pointer_x = s->pointer_x + TMA460_TOUCH_X_OFFSET;
+        s->reported_pointer_y = s->pointer_y + TMA460_TOUCH_Y_OFFSET;
+        s->reported_pointer_valid = true;
+    }
+}
+
+static void clarion_tma460_pointer_sync(DeviceState *dev)
+{
+    clarion_tma460_pointer_sync_state(CLARION_TMA460(dev));
+}
+
+static const QemuInputHandler clarion_tma460_pointer_handler = {
+    .name = "Clarion TMA460 absolute pointer",
+    .mask = INPUT_EVENT_MASK_ABS | INPUT_EVENT_MASK_BTN,
+    .event = clarion_tma460_pointer_event,
+    .sync = clarion_tma460_pointer_sync,
+};
+
+void clarion_tma460_bind_pointer_input(DeviceState *dev,
+                                       const char *display_id,
+                                       Error **errp)
+{
+    ERRP_GUARD();
+    ClarionTma460 *s = CLARION_TMA460(dev);
+
+    if (!s->synthetic_profile || s->pointer_input) {
+        return;
+    }
+    s->pointer_input = qemu_input_handler_register(dev,
+                                      &clarion_tma460_pointer_handler);
+    qemu_input_handler_bind(s->pointer_input, display_id, 0, errp);
+    if (*errp) {
+        qemu_input_handler_unregister(s->pointer_input);
+        s->pointer_input = NULL;
+    }
 }
 
 static void clarion_tma460_instance_init(Object *obj)
@@ -521,6 +787,19 @@ void clarion_tma460_set_reset(DeviceState *dev, bool gpio_level)
 
     if (!release) {
         s->ready_pulsed = false;
+        s->exit_response_delivered = false;
+        s->pointer_valid = false;
+        s->pointer_x = 0;
+        s->pointer_y = 0;
+        s->pointer_dirty = false;
+        s->pointer_button_down = false;
+        s->reported_button_down = false;
+        s->reported_pointer_valid = false;
+        s->ignore_pointer_until_release = false;
+        s->reported_pointer_x = 0;
+        s->reported_pointer_y = 0;
+        s->touch_report_pending = false;
+        memset(s->touch_report, 0, sizeof(s->touch_report));
         s->mode_register = 0; /* SYNTHETIC: chosen initial register-0 status. */
         return;
     }
