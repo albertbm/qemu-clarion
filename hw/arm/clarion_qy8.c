@@ -302,6 +302,7 @@ typedef struct Qy8Scif {
     bool dr;                    /* прийом завершився паузою */
     QEMUTimer *idle;
     int index;
+    bool txi;                   /* зводити TXI при TIE (лише SCIF3) */
 } Qy8Scif;
 
 /* SCSCR — дозволи переривань (мапа sh-sci.h) */
@@ -328,10 +329,19 @@ static void qy8_scif_update_irq(Qy8Scif *s)
      * тлумачити біт 2 SCSCR як TOIE з sh-sci.h), драйвер SCIF4 входить в
      * обробник, читає SCFSR/SCSCR/SCLSR, нічого не бере з SCFRDR і не гасить
      * причину — виходить нескінченний шторм (219 тис. входів за 16 с). Тобто
-     * такого джерела на цьому SCIF драйвер не знає. Передавач у нас завжди
-     * порожній, тож TIE не зводимо — інакше лінія висіла б вічно.
+     * такого джерела на цьому SCIF драйвер не знає.
+     *
+     * Передавач у нас завжди порожній (TDFE стоїть постійно), тож TXI — це
+     * просто TIE. serial_scif.dll передає по перериваннях: кладе байт,
+     * вмикає TIE і чекає TXI; коли черга спорожніла, сам знімає TIE. Без TXI
+     * кожен запис у SCI3: висить до наступного вхідного байта, а модулі, що
+     * пишуть у debug shell, блокуються й бут не доходить до AUI (перевірено
+     * дослідом, nissan-can-explore docs/32). Вмикаємо лише на SCIF3: на
+     * решті портів поведінку драйвера з TIE не перевірено.
      */
-    qemu_set_irq(s->irq, (qy8_scif_rdf(s) || s->dr) && (s->scscr & SCSCR_RIE));
+    qemu_set_irq(s->irq,
+                 ((qy8_scif_rdf(s) || s->dr) && (s->scscr & SCSCR_RIE)) ||
+                 (s->txi && (s->scscr & SCSCR_TIE)));
 }
 
 /*
@@ -2216,6 +2226,9 @@ static void qy8_init(MachineState *machine)
         char *name = g_strdup_printf("qy8.scif%d", i);
 
         sc->index = i;
+        /* QY8_SCIF3_TXI=0 повертає стару поведінку (A/B) */
+        sc->txi = i == QY8_SCIF_DEBUG &&
+                  g_strcmp0(getenv("QY8_SCIF3_TXI"), "0") != 0;
         sc->base = QY8_SCIF_BASE + i * QY8_SCIF_STRIDE;
         sc->idle = timer_new_ns(QEMU_CLOCK_VIRTUAL, qy8_scif_idle_expire, sc);
         sc->dmac = s->dmac;
