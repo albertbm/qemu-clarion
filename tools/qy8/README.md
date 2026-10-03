@@ -18,6 +18,7 @@ firmware version needs a new table:
 ```
 python3 exports.py G218ENNI.flash.img libGLESv2.dll libEGL.dll  > syms
 python3 exports.py NK1.bin coredll.dll | grep -E 'CreateDIBSection|CreateBitmap' >> syms
+python3 exports.py NK1.bin gdisub.dll | grep DDWaitForBltDone >> syms
 ```
 
 `NK1.bin` is the NAND dump from offset `0x1c0000` on. The `eglCreateImageKHR` and `REL` extension addresses come from the name-to-function table in

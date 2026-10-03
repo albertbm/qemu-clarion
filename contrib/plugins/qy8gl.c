@@ -909,6 +909,15 @@ static bool skip_in_guest(uint32_t ttbr, const char *n, uint32_t *ret)
 {
     Proc *p = g_hash_table_lookup(procs, GUINT_TO_POINTER(ttbr));
 
+    /*
+     * Each call waits a second for an SGX blit that never completes. Navi's
+     * map engine makes ten of them per surface DC it fails to get, so a map
+     * draw takes ~40 s and the map screen shows up only after minutes.
+     */
+    if (!native_gpu && !strcmp(n, "DDWaitForBltDone")) {
+        *ret = 0;
+        return true;
+    }
     if (native_gpu || !getenv("QY8_GL_FRAME") || !p ||
         !g_hash_table_size(p->prog_frag)) {
         return false;
