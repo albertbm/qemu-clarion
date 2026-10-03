@@ -21,7 +21,8 @@ No firmware ships with it. You need a NAND dump and a map card image from your o
 | Camera video, audio, CAN vehicle data | no | no |
 
 The map stays blank: `Navi.exe` draws it through `XGLDLL.dll` on the GPU, and that path isn't
-emulated.
+emulated. The map screen still comes up, with its buttons around a cyan area where the map would
+be.
 
 ## What you need
 
@@ -82,6 +83,9 @@ Debug shell commands take `<app id> <command>`. Useful ones: `00 ti` (unit info)
 - `contrib/plugins/qy8gl.c`: hooks the UI's OpenGL ES calls at their fixed ROM addresses
   (`qy8gl.syms` for nav image G218ENNI, `qy8gl-g214.syms` for G214ELNI), draws its textured quads
   in software and hands frames to the display model. It also prints the OS debug messages.
+- The GL plugin answers `DDWaitForBltDone` at once. Navi's map engine waited a second per call for
+  blits that never finish, which kept the screen on "Please wait..." for about ten minutes after
+  the consent screen.
 - `tcg/aarch64`: wrong FEAT_CSSC min/max opcodes crashed QEMU on Apple M4/M5 hosts.
 
 `tools/qy8/` has the helpers: export-table reader, QMP and debug-shell scripts, scripted taps.

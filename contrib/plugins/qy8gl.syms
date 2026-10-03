@@ -186,3 +186,5 @@
 906 0x4002c824 CreateBitmap
 # SYS_INF.dll config store (NK1), for the cnf= override
 2004 0x40296094 SYS_CNF_read
+# gdisub.dll blit wait (NK1), answered at once
+3061 0x402b2680 DDWaitForBltDone
