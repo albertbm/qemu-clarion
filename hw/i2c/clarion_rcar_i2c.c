@@ -31,6 +31,7 @@
 #define ICMSR_MNR  BIT(6)
 #define ICMSR_MDE  BIT(3)
 #define ICMSR_MDT  BIT(2)
+#define ICMSR_MDR  BIT(1)
 #define ICMSR_MAT  BIT(0)
 
 typedef enum ClarionRcarI2C4Phase {
@@ -57,6 +58,15 @@ struct ClarionRcarI2C4State {
 
 struct ClarionI2C4Recorder {
     I2CSlave parent_obj;
+};
+
+struct ClarionTma460 {
+    I2CSlave parent_obj;
+    qemu_irq irq;
+    uint8_t selector;
+    bool selector_valid;
+    bool reset_released;
+    bool ready_pulsed;
 };
 
 static int clarion_i2c4_recorder_event(I2CSlave *slave, enum i2c_event event)
@@ -115,6 +125,126 @@ static const TypeInfo clarion_i2c4_recorder_type_info = {
     .instance_size = sizeof(ClarionI2C4Recorder),
     .class_init = clarion_i2c4_recorder_class_init,
 };
+
+static int clarion_tma460_event(I2CSlave *slave, enum i2c_event event)
+{
+    ClarionTma460 *s = CLARION_TMA460(slave);
+
+    switch (event) {
+    case I2C_START_SEND:
+        s->selector_valid = false;
+        qemu_log_mask(LOG_UNIMP,
+                      "clarion-tma460: start(0x24, write)\n");
+        break;
+    case I2C_START_RECV:
+        qemu_log_mask(LOG_UNIMP,
+                      "clarion-tma460: start(0x24, read) selector=0x%02x\n",
+                      s->selector);
+        break;
+    case I2C_FINISH:
+        qemu_log_mask(LOG_UNIMP, "clarion-tma460: finish\n");
+        break;
+    case I2C_NACK:
+        qemu_log_mask(LOG_UNIMP, "clarion-tma460: nack\n");
+        break;
+    default:
+        qemu_log_mask(LOG_UNIMP,
+                      "clarion-tma460: unimplemented I2C event %d\n",
+                      event);
+        break;
+    }
+    return 0;
+}
+
+static int clarion_tma460_send(I2CSlave *slave, uint8_t data)
+{
+    ClarionTma460 *s = CLARION_TMA460(slave);
+
+    if (!s->reset_released || (data != 0x00 && data != 0x01)) {
+        qemu_log_mask(LOG_UNIMP,
+                      "clarion-tma460: NACK unsupported selector=0x%02x reset_released=%d\n",
+                      data, s->reset_released);
+        return 1;
+    }
+
+    s->selector = data;
+    s->selector_valid = true;
+    qemu_log_mask(LOG_UNIMP,
+                  "clarion-tma460: selector 0x%02x ACK\n", data);
+    return 0;
+}
+
+static uint8_t clarion_tma460_recv(I2CSlave *slave)
+{
+    ClarionTma460 *s = CLARION_TMA460(slave);
+
+    if (!s->reset_released || !s->selector_valid ||
+        (s->selector != 0x00 && s->selector != 0x01)) {
+        qemu_log_mask(LOG_UNIMP,
+                      "clarion-tma460: ERROR read without supported selector\n");
+        return 0xff;
+    }
+
+    /* T143 §6: both initial-state selector reads return the minimum 0x00. */
+    qemu_log_mask(LOG_UNIMP,
+                  "clarion-tma460: read selector=0x%02x -> 0x00\n",
+                  s->selector);
+    return 0x00;
+}
+
+static void clarion_tma460_instance_init(Object *obj)
+{
+    ClarionTma460 *s = CLARION_TMA460(obj);
+
+    s->reset_released = false;
+    s->ready_pulsed = false;
+    qdev_init_gpio_out(DEVICE(s), &s->irq, 1);
+}
+
+static void clarion_tma460_class_init(ObjectClass *klass, const void *data)
+{
+    I2CSlaveClass *sc = I2C_SLAVE_CLASS(klass);
+
+    sc->event = clarion_tma460_event;
+    sc->send = clarion_tma460_send;
+    sc->recv = clarion_tma460_recv;
+}
+
+static const TypeInfo clarion_tma460_type_info = {
+    .name = TYPE_CLARION_TMA460,
+    .parent = TYPE_I2C_SLAVE,
+    .instance_size = sizeof(ClarionTma460),
+    .instance_init = clarion_tma460_instance_init,
+    .class_init = clarion_tma460_class_init,
+};
+
+void clarion_tma460_set_reset(DeviceState *dev, bool gpio_level)
+{
+    ClarionTma460 *s = CLARION_TMA460(dev);
+    bool release = gpio_level;
+
+    if (s->reset_released == release) {
+        return;
+    }
+    s->reset_released = release;
+    s->selector_valid = false;
+    qemu_log_mask(LOG_UNIMP,
+                  "clarion-tma460: reset %s (GPIO4.OUTDT bit10=%d)\n",
+                  release ? "release" : "assert", gpio_level);
+
+    if (!release) {
+        s->ready_pulsed = false;
+        return;
+    }
+
+    if (!s->ready_pulsed) {
+        s->ready_pulsed = true;
+        qemu_log_mask(LOG_UNIMP,
+                      "clarion-tma460: ready IRQ pulse after reset release\n");
+        qemu_irq_raise(s->irq);
+        qemu_irq_lower(s->irq);
+    }
+}
 
 static void clarion_rcar_i2c4_update_irq(ClarionRcarI2C4State *s)
 {
@@ -232,9 +362,21 @@ static void clarion_rcar_i2c4_write(void *opaque, hwaddr offset,
                 }
             } else if (s->phase == RCAR_I2C4_READ_ADDRESS && mat_cleared) {
                 s->phase = RCAR_I2C4_READ_DATA_WAIT;
+                s->icrxtx = i2c_recv(s->bus);
+                s->icmsr |= ICMSR_MDR;
                 qemu_log_mask(LOG_UNIMP,
-                              "clarion-i2c4: read byte requested; ICMCR=0x%08x; withholding MDR/data\n",
-                              s->icmcr);
+                              "clarion-i2c4: read byte supplied=0x%02x; set MDR\n",
+                              s->icrxtx);
+            }
+
+            if (s->phase == RCAR_I2C4_READ_DATA_WAIT &&
+                (s->icmcr & BIT(1)) && !(s->icmsr & ICMSR_MDR)) {
+                i2c_end_transfer(s->bus);
+                s->bus_active = false;
+                s->phase = RCAR_I2C4_IDLE;
+                s->icmsr |= BIT(4); /* MST: FSB completion for this transfer. */
+                qemu_log_mask(LOG_UNIMP,
+                              "clarion-i2c4: FSB completed; set MST\n");
             }
         }
         clarion_rcar_i2c4_update_irq(s);
@@ -296,6 +438,7 @@ static void clarion_rcar_i2c4_register_types(void)
 {
     type_register_static(&clarion_rcar_i2c4_type_info);
     type_register_static(&clarion_i2c4_recorder_type_info);
+    type_register_static(&clarion_tma460_type_info);
 }
 
 type_init(clarion_rcar_i2c4_register_types)

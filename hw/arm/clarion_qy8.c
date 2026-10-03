@@ -158,6 +158,7 @@
  */
 #define QY8_DU_SPI          31          /* підтверджено таблицями OAL */
 #define QY8_I2C4_SPI        77          /* GIC ID 109 = SPI 77 */
+#define QY8_GPIO4_SPI       103         /* GIC ID 135 = SPI 103 */
 
 #define QY8_SCIF_BASE       0xFFE40000      /* scif0..scif5, крок 0x1000 */
 #define QY8_SCIF_STRIDE     0x1000
@@ -1313,10 +1314,67 @@ static const MemoryRegionOps qy8_usbphy_ops = {
 typedef struct Qy8Gpio {
     MemoryRegion mr;
     uint32_t iointsel, inoutsel, outdt;
-    uint32_t intmsk, posneg, edglevel, filonoff;
+    uint32_t intdt, intmsk, posneg, edglevel, filonoff;
     uint32_t in_level;          /* рівні на вхідних лініях */
+    qemu_irq parent_irq;
+    DeviceState *tma460_reset_target;
+    bool tma460_irq_enabled;
     int bank;
 } Qy8Gpio;
+
+#define GPIO4_TMA_RESET_BIT BIT(10)
+#define GPIO4_TMA_IRQ_BIT   BIT(11)
+
+static void qy8_gpio4_update_parent_irq(Qy8Gpio *g)
+{
+    if (g->bank == 4 && g->tma460_irq_enabled) {
+        bool pending = (g->intdt & GPIO4_TMA_IRQ_BIT) &&
+                       !(g->intmsk & GPIO4_TMA_IRQ_BIT);
+        qemu_set_irq(g->parent_irq, pending);
+    }
+}
+
+static bool qy8_gpio_reset_level(Qy8Gpio *g)
+{
+    return !!(g->outdt & g->inoutsel & GPIO4_TMA_RESET_BIT);
+}
+
+static void qy8_gpio4_tma_input(void *opaque, int n, int level)
+{
+    Qy8Gpio *g = opaque;
+    bool old_level = !!(g->in_level & GPIO4_TMA_IRQ_BIT);
+    bool new_level = !!level;
+
+    if (new_level) {
+        g->in_level |= GPIO4_TMA_IRQ_BIT;
+    } else {
+        g->in_level &= ~GPIO4_TMA_IRQ_BIT;
+    }
+
+    if (old_level == new_level) {
+        return;
+    }
+
+    if (new_level && g->tma460_irq_enabled) {
+        bool configured = (g->iointsel & GPIO4_TMA_IRQ_BIT) &&
+                          (g->edglevel & GPIO4_TMA_IRQ_BIT) &&
+                          !(g->posneg & GPIO4_TMA_IRQ_BIT) &&
+                          !(g->inoutsel & GPIO4_TMA_IRQ_BIT);
+
+        if (!configured) {
+            qemu_log_mask(LOG_UNIMP,
+                          "qy8.gpio4: TMA line rising with unsupported config IOINTSEL=%08x INOUTSEL=%08x POSNEG=%08x EDGLEVEL=%08x\n",
+                          g->iointsel, g->inoutsel, g->posneg,
+                          g->edglevel);
+            return;
+        }
+
+        g->intdt |= GPIO4_TMA_IRQ_BIT;
+        qemu_log_mask(LOG_UNIMP,
+                      "qy8.gpio4: TMA rising edge latched INTDT[11]\n");
+        qy8_gpio4_update_parent_irq(g);
+    }
+}
 
 static uint64_t qy8_gpio_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -1334,6 +1392,8 @@ static uint64_t qy8_gpio_read(void *opaque, hwaddr addr, unsigned size)
         return (g->outdt & g->inoutsel) | (g->in_level & ~g->inoutsel);
     case GPIO_INTMSK:
         return g->intmsk;
+    case GPIO_INTDT:
+        return g->bank == 4 && g->tma460_irq_enabled ? g->intdt : 0;
     case GPIO_POSNEG:
         return g->posneg;
     case GPIO_EDGLEVEL:
@@ -1349,6 +1409,7 @@ static void qy8_gpio_write(void *opaque, hwaddr addr, uint64_t val,
                            unsigned size)
 {
     Qy8Gpio *g = opaque;
+    bool old_reset_level = qy8_gpio_reset_level(g);
 
     switch (addr) {
     case GPIO_IOINTSEL:
@@ -1362,9 +1423,20 @@ static void qy8_gpio_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case GPIO_INTMSK:
         g->intmsk = val;
+        qy8_gpio4_update_parent_irq(g);
+        break;
+    case GPIO_INTCLR:
+        if (g->bank == 4 && g->tma460_irq_enabled) {
+            g->intdt &= ~(uint32_t)val;
+            qemu_log_mask(LOG_UNIMP,
+                          "qy8.gpio4: INTCLR write=0x%08x INTDT=0x%08x\n",
+                          (uint32_t)val, g->intdt);
+            qy8_gpio4_update_parent_irq(g);
+        }
         break;
     case GPIO_MSKCLR:
         g->intmsk &= ~val;
+        qy8_gpio4_update_parent_irq(g);
         break;
     case GPIO_POSNEG:
         g->posneg = val;
@@ -1377,6 +1449,19 @@ static void qy8_gpio_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     default:
         break;
+    }
+
+    if (g->bank == 4 && g->tma460_reset_target &&
+        (addr == GPIO_OUTDT || addr == GPIO_INOUTSEL)) {
+        bool new_reset_level = qy8_gpio_reset_level(g);
+
+        if (old_reset_level != new_reset_level) {
+            qemu_log_mask(LOG_UNIMP,
+                          "qy8.gpio4: reset OUTDT[10] %d -> %d\n",
+                          old_reset_level, new_reset_level);
+            clarion_tma460_set_reset(g->tma460_reset_target,
+                                     new_reset_level);
+        }
     }
 }
 
@@ -1807,6 +1892,7 @@ struct Qy8MachineState {
     DeviceState *sdhi[QY8_NUM_SDHI];
     DeviceState *can;
     DeviceState *i2c4;
+    DeviceState *tma460;
     DeviceState *sgx;         /* PowerVR SGX @0xFCE00000 */
     Qy8Tmu tmu;
     Qy8Gpio gpio[QY8_GPIO_BANKS];
@@ -1825,6 +1911,8 @@ struct Qy8MachineState {
     bool micom_on;              /* вбудований супутній МК на SCIF4 */
     bool dispmicom_on;          /* вбудований МК панелі на SCIF1 */
     bool i2c4_on;               /* opt-in bounded R-Car I2C4 model */
+    bool i2c4_recorder_on;      /* opt-in I2C4 transaction recorder */
+    bool tma460_on;             /* opt-in bounded TMA460 model */
 
     MemoryRegion flash;          /* лише коли флеш подано як ROM */
     DriveInfo *flash_drive;      /* -drive if=pflash: записувана копія */
@@ -1873,6 +1961,15 @@ static void qy8_init(MachineState *machine)
     char *fname;
     ssize_t sz;
     int i;
+
+    if (s->tma460_on && !s->i2c4_on) {
+        error_report("clarion-qy8: tma460=on requires i2c4=on");
+        exit(1);
+    }
+    if (s->tma460_on && s->i2c4_recorder_on) {
+        error_report("clarion-qy8: tma460 and i2c4-recorder are mutually exclusive at 0x24");
+        exit(1);
+    }
 
     s->cpu = ARM_CPU(object_new(machine->cpu_type));
     object_property_set_bool(OBJECT(s->cpu), "has_el3", false, &error_fatal);
@@ -2020,7 +2117,7 @@ static void qy8_init(MachineState *machine)
     sysbus_connect_irq(gicbusdev, 1,
                        qdev_get_gpio_in(DEVICE(s->cpu), ARM_CPU_FIQ));
 
-    /* --- I2C4: bounded T142 model; I2C0..I2C2 remain on qy8.periph --- */
+    /* --- I2C4: bounded T142/T143 models; other controllers stay unmodeled --- */
     if (s->i2c4_on) {
         I2CBus *bus;
 
@@ -2031,7 +2128,14 @@ static void qy8_init(MachineState *machine)
         sysbus_connect_irq(SYS_BUS_DEVICE(s->i2c4), 0,
                            qdev_get_gpio_in(s->gic, QY8_I2C4_SPI));
         bus = I2C_BUS(qdev_get_child_bus(s->i2c4, "i2c"));
-        i2c_slave_create_simple(bus, TYPE_CLARION_I2C4_RECORDER, 0x24);
+        if (s->i2c4_recorder_on) {
+            i2c_slave_create_simple(bus, TYPE_CLARION_I2C4_RECORDER, 0x24);
+        }
+        if (s->tma460_on) {
+            s->tma460 = DEVICE(i2c_slave_create_simple(bus,
+                                                       TYPE_CLARION_TMA460,
+                                                       0x24));
+        }
     }
 
     /*
@@ -2163,6 +2267,17 @@ static void qy8_init(MachineState *machine)
                                     QY8_GPIO_BASE + i * QY8_GPIO_STRIDE,
                                     &g->mr);
         g_free(name);
+    }
+
+    if (s->tma460_on) {
+        Qy8Gpio *g = &s->gpio[4];
+
+        g->tma460_irq_enabled = true;
+        g->parent_irq = qdev_get_gpio_in(s->gic, QY8_GPIO4_SPI);
+        g->tma460_reset_target = s->tma460;
+        qdev_connect_gpio_out(s->tma460, 0,
+                              qemu_allocate_irq(qy8_gpio4_tma_input,
+                                                g, 11));
     }
 
     /* --- контролер плати: DIPSW і дозвіл виходу зі standby --- */
@@ -2416,6 +2531,26 @@ static void qy8_i2c4_set(Object *obj, bool value, Error **errp)
     QY8_MACHINE(obj)->i2c4_on = value;
 }
 
+static bool qy8_i2c4_recorder_get(Object *obj, Error **errp)
+{
+    return QY8_MACHINE(obj)->i2c4_recorder_on;
+}
+
+static void qy8_i2c4_recorder_set(Object *obj, bool value, Error **errp)
+{
+    QY8_MACHINE(obj)->i2c4_recorder_on = value;
+}
+
+static bool qy8_tma460_get(Object *obj, Error **errp)
+{
+    return QY8_MACHINE(obj)->tma460_on;
+}
+
+static void qy8_tma460_set(Object *obj, bool value, Error **errp)
+{
+    QY8_MACHINE(obj)->tma460_on = value;
+}
+
 static void qy8_machine_instance_init(Object *obj)
 {
     Qy8MachineState *s = QY8_MACHINE(obj);
@@ -2474,6 +2609,18 @@ static void qy8_machine_instance_init(Object *obj)
     object_property_add_bool(obj, "i2c4", qy8_i2c4_get, qy8_i2c4_set);
     object_property_set_description(obj, "i2c4",
         "opt-in обмежена модель I2C4 @0xffc73000 (типово вимкнена)");
+
+    s->i2c4_recorder_on = false;
+    object_property_add_bool(obj, "i2c4-recorder", qy8_i2c4_recorder_get,
+                             qy8_i2c4_recorder_set);
+    object_property_set_description(obj, "i2c4-recorder",
+        "opt-in transaction recorder на I2C4 address 0x24");
+
+    s->tma460_on = false;
+    object_property_add_bool(obj, "tma460", qy8_tma460_get,
+                             qy8_tma460_set);
+    object_property_set_description(obj, "tma460",
+        "opt-in bounded TMA460 bootloader model на I2C4 address 0x24");
 }
 
 static void qy8_machine_class_init(ObjectClass *oc, const void *data)
