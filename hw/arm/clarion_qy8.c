@@ -1958,6 +1958,7 @@ struct Qy8MachineState {
     bool tma460_on;             /* opt-in bounded TMA460 model */
     bool tma460_synthetic_profile_on; /* opt-in synthetic profile */
     bool i2c_empty_on;          /* opt-in: I2C0..I2C2 з порожньою шиною */
+    char *board;                /* "ze1" (QY8602NB) or "ze0" (QY8202NA) */
     bool reverse;               /* RV input, machine property */
 
     MemoryRegion flash;          /* лише коли флеш подано як ROM */
@@ -2642,6 +2643,29 @@ static void qy8_init(MachineState *machine)
                                         &s->periph.mr, -1000);
 }
 
+/* the 2014-2017 ZE0 unit, QY8202NA: same SoC, different board peripherals */
+static G_GNUC_UNUSED bool qy8_is_ze0(Qy8MachineState *s)
+{
+    return !g_strcmp0(s->board, "ze0");
+}
+
+static char *qy8_board_get(Object *obj, Error **errp)
+{
+    return g_strdup(QY8_MACHINE(obj)->board);
+}
+
+static void qy8_board_set(Object *obj, const char *value, Error **errp)
+{
+    Qy8MachineState *s = QY8_MACHINE(obj);
+
+    if (g_strcmp0(value, "ze1") && g_strcmp0(value, "ze0")) {
+        error_setg(errp, "board must be ze1 or ze0");
+        return;
+    }
+    g_free(s->board);
+    s->board = g_strdup(value);
+}
+
 static bool qy8_micom_get(Object *obj, Error **errp)
 {
     return QY8_MACHINE(obj)->micom_on;
@@ -2743,6 +2767,11 @@ static void qy8_machine_instance_init(Object *obj)
                              qy8_reverse_set);
     object_property_set_description(obj, "reverse",
         "reverse gear input (RV), off by default");
+
+    s->board = g_strdup("ze1");
+    object_property_add_str(obj, "board", qy8_board_get, qy8_board_set);
+    object_property_set_description(obj, "board",
+        "ze1 = QY8602NB (default), ze0 = QY8202NA board peripherals");
 
     s->dipsw = QY8_DIPSW_NORM_RES;
     object_property_add_uint8_ptr(obj, "dipsw", &s->dipsw,
