@@ -29,11 +29,14 @@ truncate -s 16G "$work/card.img"
 display=cocoa
 [ -n "$HEADLESS" ] && display=none
 
-# software-render the AUI's GL calls; NOGL=1 leaves the screen to the SGX model
+# software-render the AUI's GL calls; NOGL=1 leaves the screen to the SGX model.
+# The immobiliser check reads as disabled (config 0x0f = 0, as leafsdtools
+# sets it); IMMO=1 keeps the stored value.
 gl=()
 if [ -z "$NOGL" ]; then
     export QY8_GL_FRAME="$work/glframe.bin"
     gl=(-plugin "$here/build/contrib/plugins/libqy8gl.dylib,syms=$glsyms,log=$work/gl.log")
+    [ -z "${IMMO:-}" ] && gl[1]="${gl[1]},cnf=0x0f:0"
 fi
 
 echo "work dir: $work   (Ctrl-A X quits)"
