@@ -15,5 +15,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(ClarionTma460, CLARION_TMA460)
 
 /* GPIO4.OUTDT bit 10 is the active-low reset signal observed by this device. */
 void clarion_tma460_set_reset(DeviceState *dev, bool gpio_level);
+void clarion_tma460_set_synthetic_profile(DeviceState *dev, bool enabled);
 
 #endif

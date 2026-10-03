@@ -1923,6 +1923,7 @@ struct Qy8MachineState {
     bool i2c4_on;               /* opt-in bounded R-Car I2C4 model */
     bool i2c4_recorder_on;      /* opt-in I2C4 transaction recorder */
     bool tma460_on;             /* opt-in bounded TMA460 model */
+    bool tma460_synthetic_profile_on; /* opt-in T147 profile */
     bool i2c_empty_on;          /* opt-in: I2C0..I2C2 з порожньою шиною */
 
     MemoryRegion flash;          /* лише коли флеш подано як ROM */
@@ -2169,6 +2170,8 @@ static void qy8_init(MachineState *machine)
             s->tma460 = DEVICE(i2c_slave_create_simple(bus,
                                                        TYPE_CLARION_TMA460,
                                                        0x24));
+            clarion_tma460_set_synthetic_profile(
+                s->tma460, s->tma460_synthetic_profile_on);
         }
     }
 
@@ -2598,6 +2601,16 @@ static void qy8_tma460_set(Object *obj, bool value, Error **errp)
     QY8_MACHINE(obj)->tma460_on = value;
 }
 
+static bool qy8_tma460_profile_get(Object *obj, Error **errp)
+{
+    return QY8_MACHINE(obj)->tma460_synthetic_profile_on;
+}
+
+static void qy8_tma460_profile_set(Object *obj, bool value, Error **errp)
+{
+    QY8_MACHINE(obj)->tma460_synthetic_profile_on = value;
+}
+
 static void qy8_machine_instance_init(Object *obj)
 {
     Qy8MachineState *s = QY8_MACHINE(obj);
@@ -2675,6 +2688,13 @@ static void qy8_machine_instance_init(Object *obj)
                              qy8_tma460_set);
     object_property_set_description(obj, "tma460",
         "opt-in bounded TMA460 bootloader model на I2C4 address 0x24");
+
+    s->tma460_synthetic_profile_on = false;
+    object_property_add_bool(obj, "tma460-profile",
+                             qy8_tma460_profile_get,
+                             qy8_tma460_profile_set);
+    object_property_set_description(obj, "tma460-profile",
+        "opt-in T147 мінімальний synthetic System Mode profile");
 }
 
 static void qy8_machine_class_init(ObjectClass *oc, const void *data)
