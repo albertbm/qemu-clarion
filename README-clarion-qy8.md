@@ -118,7 +118,8 @@ With `tma460-profile=on`, pointer events are reported only after the
 controller exits bootloader and enters working mode. Button transitions are
 preserved until the previous report is read; intermediate movement can be
 coalesced. Raw report coordinates use the target profile offsets `X + 14`
-and `Y + 9`.
+and `Y + 9`. Y is reported bottom to top (`479 - Y`), because `kepdrv.dll`
+mirrors it before it posts the touch to the window.
 
 | Pointer event | TMA460 event ID | Queue state |
 |---|---:|---|
