@@ -1913,6 +1913,7 @@ struct Qy8MachineState {
     bool i2c4_on;               /* opt-in bounded R-Car I2C4 model */
     bool i2c4_recorder_on;      /* opt-in I2C4 transaction recorder */
     bool tma460_on;             /* opt-in bounded TMA460 model */
+    bool i2c_empty_on;          /* opt-in: I2C0..I2C2 з порожньою шиною */
 
     MemoryRegion flash;          /* лише коли флеш подано як ROM */
     DriveInfo *flash_drive;      /* -drive if=pflash: записувана копія */
@@ -2116,6 +2117,29 @@ static void qy8_init(MachineState *machine)
                        qdev_get_gpio_in(DEVICE(s->cpu), ARM_CPU_IRQ));
     sysbus_connect_irq(gicbusdev, 1,
                        qdev_get_gpio_in(DEVICE(s->cpu), ARM_CPU_FIQ));
+
+    /*
+     * --- I2C0..I2C2: та сама обмежена модель контролера, шина ПОРОЖНЯ ---
+     *
+     * Діагностичний режим (docs/31): без моделі клієнти цих контролерів
+     * (бібліотека тюнера, Usb.exe) на кожній транзакції чекають переривання
+     * 3000 мс. Порожня шина дає чесний для неї результат — NACK адреси
+     * (MNR) — одразу. На справжній платі пристрої там є, тож це не
+     * поведінка заліза, а швидка помилка замість повільної; типово вимкнено.
+     * GIC ID за таблицею OEMInterruptHandler: 99, 110, 108 (SPI = ID - 32).
+     */
+    if (s->i2c_empty_on) {
+        static const struct { hwaddr base; int spi; } ctl[] = {
+            { 0xffc70000, 67 }, { 0xffc71000, 78 }, { 0xffc72000, 76 },
+        };
+        for (int i = 0; i < ARRAY_SIZE(ctl); i++) {
+            DeviceState *d = qdev_new(TYPE_CLARION_RCAR_I2C4);
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(d), &error_fatal);
+            sysbus_mmio_map(SYS_BUS_DEVICE(d), 0, ctl[i].base);
+            sysbus_connect_irq(SYS_BUS_DEVICE(d), 0,
+                               qdev_get_gpio_in(s->gic, ctl[i].spi));
+        }
+    }
 
     /* --- I2C4: bounded T142/T143 models; other controllers stay unmodeled --- */
     if (s->i2c4_on) {
@@ -2541,6 +2565,16 @@ static void qy8_i2c4_recorder_set(Object *obj, bool value, Error **errp)
     QY8_MACHINE(obj)->i2c4_recorder_on = value;
 }
 
+static bool qy8_i2c_empty_get(Object *obj, Error **errp)
+{
+    return QY8_MACHINE(obj)->i2c_empty_on;
+}
+
+static void qy8_i2c_empty_set(Object *obj, bool value, Error **errp)
+{
+    QY8_MACHINE(obj)->i2c_empty_on = value;
+}
+
 static bool qy8_tma460_get(Object *obj, Error **errp)
 {
     return QY8_MACHINE(obj)->tma460_on;
@@ -2615,6 +2649,13 @@ static void qy8_machine_instance_init(Object *obj)
                              qy8_i2c4_recorder_set);
     object_property_set_description(obj, "i2c4-recorder",
         "opt-in transaction recorder на I2C4 address 0x24");
+
+    s->i2c_empty_on = false;
+    object_property_add_bool(obj, "i2c-empty", qy8_i2c_empty_get,
+                             qy8_i2c_empty_set);
+    object_property_set_description(obj, "i2c-empty",
+        "opt-in діагностика: I2C0..I2C2 з порожньою шиною (NACK замість "
+        "3-секундного таймауту)");
 
     s->tma460_on = false;
     object_property_add_bool(obj, "tma460", qy8_tma460_get,

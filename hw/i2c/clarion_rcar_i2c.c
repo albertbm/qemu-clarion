@@ -69,16 +69,22 @@ struct ClarionTma460 {
     uint8_t command[9];
     uint8_t command_len;
     uint8_t response_index;
+    uint8_t response_len;
     bool selector_valid;
     bool command_valid;
     bool command_pending;
     bool response_active;
+    bool exit_response_delivered;
     bool reset_released;
     bool ready_pulsed;
 };
 
 static const uint8_t clarion_tma460_enter_active[9] = {
     0x00, 0xff, 0x01, 0x38, 0x00, 0x00, 0xa0, 0x09, 0x17,
+};
+
+static const uint8_t clarion_tma460_exit_bootloader[9] = {
+    0x00, 0xff, 0x01, 0x3b, 0x00, 0x00, 0x4f, 0x6d, 0x17,
 };
 
 static int clarion_i2c4_recorder_event(I2CSlave *slave, enum i2c_event event)
@@ -156,6 +162,12 @@ static int clarion_tma460_event(I2CSlave *slave, enum i2c_event event)
         s->response_index = 0;
         s->response_active = s->command_pending && s->selector_valid &&
                              s->selector == 0x00 && s->command_len == 1;
+        if (s->exit_response_delivered && s->selector_valid &&
+            s->selector == 0x00 && s->command_len == 1) {
+            qemu_log_mask(LOG_UNIMP,
+                          "clarion-tma460: NACK unsupported read request selector=0x00 read_len=16 (length from target callsite; not present on I2C wire) after ExitBootloader response\n");
+            return 1;
+        }
         if (!s->reset_released || !s->selector_valid || s->command_len != 1 ||
             (s->command_pending && !s->response_active)) {
             qemu_log_mask(LOG_UNIMP,
@@ -167,12 +179,17 @@ static int clarion_tma460_event(I2CSlave *slave, enum i2c_event event)
                       "clarion-tma460: start(0x24, read) selector=0x%02x write_len=%u command=%s\n",
                       s->selector, s->command_len,
                       s->response_active ? "EnterActiveState" : "selector-read");
+        s->response_len = s->response_active ?
+            (s->command[3] == 0x3b ? 7 : 15) : 1;
         break;
     case I2C_FINISH:
         if (s->command_valid && s->command_len == sizeof(s->command)) {
             s->command_pending = true;
         }
         if (s->response_active) {
+            if (s->command[3] == 0x3b) {
+                s->exit_response_delivered = true;
+            }
             s->command_pending = false;
             s->response_active = false;
         }
@@ -217,8 +234,13 @@ static int clarion_tma460_send(I2CSlave *slave, uint8_t data)
         return 0;
     }
 
+    const uint8_t *expected = s->command_len < sizeof(s->command) &&
+                              s->command_len > 3 && s->command[3] == 0x3b ?
+                              clarion_tma460_exit_bootloader :
+                              clarion_tma460_enter_active;
     if (s->selector != 0x00 || s->command_len >= sizeof(s->command) ||
-        data != clarion_tma460_enter_active[s->command_len]) {
+        (s->command_len == 3 ? (data != 0x38 && data != 0x3b) :
+                               data != expected[s->command_len])) {
         qemu_log_mask(LOG_UNIMP,
                       "clarion-tma460: NACK command byte[%u]=0x%02x\n",
                       s->command_len, data);
@@ -249,7 +271,7 @@ static uint8_t clarion_tma460_recv(I2CSlave *slave)
         return 0xff;
     }
 
-    if (s->response_active && s->response_index >= 15) {
+    if (s->response_active && s->response_index >= s->response_len) {
         qemu_log_mask(LOG_UNIMP,
                       "clarion-tma460: ERROR response overread index=%u\n",
                       s->response_index);
