@@ -33,3 +33,7 @@ config VHOST_USER_INPUT
 
 config LASIPS2
     select PS2
+
+config CYPRESS_TTSP
+    bool
+    depends on I2C
