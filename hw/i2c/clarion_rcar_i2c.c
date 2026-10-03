@@ -54,6 +54,8 @@ struct ClarionRcarI2C4State {
     uint32_t icrxtx;
     ClarionRcarI2C4Phase phase;
     bool bus_active;
+    bool icrxtx_written;
+    bool read_last_pending;
 };
 
 struct ClarionI2C4Recorder {
@@ -64,9 +66,19 @@ struct ClarionTma460 {
     I2CSlave parent_obj;
     qemu_irq irq;
     uint8_t selector;
+    uint8_t command[9];
+    uint8_t command_len;
+    uint8_t response_index;
     bool selector_valid;
+    bool command_valid;
+    bool command_pending;
+    bool response_active;
     bool reset_released;
     bool ready_pulsed;
+};
+
+static const uint8_t clarion_tma460_enter_active[9] = {
+    0x00, 0xff, 0x01, 0x38, 0x00, 0x00, 0xa0, 0x09, 0x17,
 };
 
 static int clarion_i2c4_recorder_event(I2CSlave *slave, enum i2c_event event)
@@ -133,15 +145,37 @@ static int clarion_tma460_event(I2CSlave *slave, enum i2c_event event)
     switch (event) {
     case I2C_START_SEND:
         s->selector_valid = false;
+        s->command_valid = false;
+        s->command_len = 0;
+        s->response_index = 0;
+        s->response_active = false;
         qemu_log_mask(LOG_UNIMP,
                       "clarion-tma460: start(0x24, write)\n");
         break;
     case I2C_START_RECV:
+        s->response_index = 0;
+        s->response_active = s->command_pending && s->selector_valid &&
+                             s->selector == 0x00 && s->command_len == 1;
+        if (!s->reset_released || !s->selector_valid || s->command_len != 1 ||
+            (s->command_pending && !s->response_active)) {
+            qemu_log_mask(LOG_UNIMP,
+                          "clarion-tma460: NACK read start selector=0x%02x write_len=%u\n",
+                          s->selector, s->command_len);
+            return 1;
+        }
         qemu_log_mask(LOG_UNIMP,
-                      "clarion-tma460: start(0x24, read) selector=0x%02x\n",
-                      s->selector);
+                      "clarion-tma460: start(0x24, read) selector=0x%02x write_len=%u command=%s\n",
+                      s->selector, s->command_len,
+                      s->response_active ? "EnterActiveState" : "selector-read");
         break;
     case I2C_FINISH:
+        if (s->command_valid && s->command_len == sizeof(s->command)) {
+            s->command_pending = true;
+        }
+        if (s->response_active) {
+            s->command_pending = false;
+            s->response_active = false;
+        }
         qemu_log_mask(LOG_UNIMP, "clarion-tma460: finish\n");
         break;
     case I2C_NACK:
@@ -160,17 +194,47 @@ static int clarion_tma460_send(I2CSlave *slave, uint8_t data)
 {
     ClarionTma460 *s = CLARION_TMA460(slave);
 
-    if (!s->reset_released || (data != 0x00 && data != 0x01)) {
+    if (!s->reset_released) {
         qemu_log_mask(LOG_UNIMP,
-                      "clarion-tma460: NACK unsupported selector=0x%02x reset_released=%d\n",
-                      data, s->reset_released);
+                      "clarion-tma460: NACK write byte=0x%02x reset_released=0\n",
+                      data);
         return 1;
     }
 
-    s->selector = data;
-    s->selector_valid = true;
+    if (!s->command_len) {
+        if (data != 0x00 && data != 0x01) {
+            qemu_log_mask(LOG_UNIMP,
+                          "clarion-tma460: NACK unsupported selector=0x%02x\n",
+                          data);
+            return 1;
+        }
+        s->selector = data;
+        s->selector_valid = true;
+        s->command[0] = data;
+        s->command_len = 1;
+        qemu_log_mask(LOG_UNIMP,
+                      "clarion-tma460: selector 0x%02x ACK\n", data);
+        return 0;
+    }
+
+    if (s->selector != 0x00 || s->command_len >= sizeof(s->command) ||
+        data != clarion_tma460_enter_active[s->command_len]) {
+        qemu_log_mask(LOG_UNIMP,
+                      "clarion-tma460: NACK command byte[%u]=0x%02x\n",
+                      s->command_len, data);
+        s->command_valid = false;
+        return 1;
+    }
+
+    s->command[s->command_len++] = data;
+    s->command_valid = s->command_len == sizeof(s->command);
     qemu_log_mask(LOG_UNIMP,
-                  "clarion-tma460: selector 0x%02x ACK\n", data);
+                  "clarion-tma460: command byte[%u]=0x%02x ACK\n",
+                  s->command_len - 1, data);
+    if (s->command_valid) {
+        qemu_log_mask(LOG_UNIMP,
+                      "clarion-tma460: Enter Active State command accepted\n");
+    }
     return 0;
 }
 
@@ -179,16 +243,31 @@ static uint8_t clarion_tma460_recv(I2CSlave *slave)
     ClarionTma460 *s = CLARION_TMA460(slave);
 
     if (!s->reset_released || !s->selector_valid ||
-        (s->selector != 0x00 && s->selector != 0x01)) {
+        (s->command_len != 1 && !s->command_valid)) {
         qemu_log_mask(LOG_UNIMP,
                       "clarion-tma460: ERROR read without supported selector\n");
         return 0xff;
     }
 
-    /* T143 §6: both initial-state selector reads return the minimum 0x00. */
+    if (s->response_active && s->response_index >= 15) {
+        qemu_log_mask(LOG_UNIMP,
+                      "clarion-tma460: ERROR response overread index=%u\n",
+                      s->response_index);
+        return 0xff;
+    }
+
+    if (!s->response_active && s->response_index >= 1) {
+        qemu_log_mask(LOG_UNIMP,
+                      "clarion-tma460: ERROR selector response overread index=%u\n",
+                      s->response_index);
+        return 0xff;
+    }
+
+    /* T143 selector reads and the T144 checked fields are zero. */
     qemu_log_mask(LOG_UNIMP,
-                  "clarion-tma460: read selector=0x%02x -> 0x00\n",
-                  s->selector);
+                  "clarion-tma460: read selector=0x%02x response[%u]=0x00\n",
+                  s->selector, s->response_index);
+    s->response_index++;
     return 0x00;
 }
 
@@ -342,12 +421,19 @@ static void clarion_rcar_i2c4_write(void *opaque, hwaddr offset,
         {
             bool mat_cleared = (s->icmsr & ICMSR_MAT) &&
                                !(v & ICMSR_MAT);
+            bool send_ready_cleared =
+                (s->icmsr & (ICMSR_MDE | ICMSR_MDT)) ==
+                    (ICMSR_MDE | ICMSR_MDT) &&
+                !(v & ICMSR_MDE) && !(v & ICMSR_MDT);
+            bool receive_ready_cleared = (s->icmsr & ICMSR_MDR) &&
+                                         !(v & ICMSR_MDR);
 
             /* Apply the target's W0C before modeling the hardware transition. */
             s->icmsr &= v | ~ICMSR_MASK;
 
             if (s->phase == RCAR_I2C4_WRITE_DATA && mat_cleared) {
                 int ret = i2c_send(s->bus, s->icrxtx);
+                s->icrxtx_written = false;
 
                 if (ret) {
                     s->icmsr |= ICMSR_MNR;
@@ -357,26 +443,62 @@ static void clarion_rcar_i2c4_write(void *opaque, hwaddr offset,
                 } else {
                     s->icmsr |= ICMSR_MDE | ICMSR_MDT;
                     qemu_log_mask(LOG_UNIMP,
-                                  "clarion-i2c4: W0C MAT -> send ICRXTX=0x%02x; set MDE|MDT\n",
-                                  s->icrxtx);
+                              "clarion-i2c4: W0C MAT -> send ICRXTX=0x%02x; set MDE|MDT\n",
+                              s->icrxtx);
                 }
+            } else if (s->phase == RCAR_I2C4_WRITE_DATA &&
+                       send_ready_cleared && s->icrxtx_written) {
+                int ret = i2c_send(s->bus, s->icrxtx);
+                s->icrxtx_written = false;
+
+                if (ret) {
+                    s->icmsr |= ICMSR_MNR;
+                    qemu_log_mask(LOG_UNIMP,
+                                  "clarion-i2c4: MDE|MDT send NACK byte=0x%02x\n",
+                                  s->icrxtx);
+                } else {
+                    s->icmsr |= ICMSR_MDE | ICMSR_MDT;
+                    qemu_log_mask(LOG_UNIMP,
+                              "clarion-i2c4: W0C MDE|MDT -> send ICRXTX=0x%02x; set MDE|MDT\n",
+                              s->icrxtx);
+                }
+            } else if (s->phase == RCAR_I2C4_WRITE_DATA &&
+                       send_ready_cleared && !s->icrxtx_written &&
+                       (s->icmcr & BIT(1))) {
+                i2c_end_transfer(s->bus);
+                s->bus_active = false;
+                s->phase = RCAR_I2C4_IDLE;
+                s->icmsr |= BIT(4); /* MST: write STOP completion. */
+                qemu_log_mask(LOG_UNIMP,
+                              "clarion-i2c4: write FSB completed; set MST\n");
             } else if (s->phase == RCAR_I2C4_READ_ADDRESS && mat_cleared) {
                 s->phase = RCAR_I2C4_READ_DATA_WAIT;
                 s->icrxtx = i2c_recv(s->bus);
                 s->icmsr |= ICMSR_MDR;
+                s->read_last_pending = !!(s->icmcr & BIT(1));
                 qemu_log_mask(LOG_UNIMP,
                               "clarion-i2c4: read byte supplied=0x%02x; set MDR\n",
                               s->icrxtx);
             }
 
             if (s->phase == RCAR_I2C4_READ_DATA_WAIT &&
-                (s->icmcr & BIT(1)) && !(s->icmsr & ICMSR_MDR)) {
-                i2c_end_transfer(s->bus);
-                s->bus_active = false;
-                s->phase = RCAR_I2C4_IDLE;
-                s->icmsr |= BIT(4); /* MST: FSB completion for this transfer. */
-                qemu_log_mask(LOG_UNIMP,
-                              "clarion-i2c4: FSB completed; set MST\n");
+                receive_ready_cleared) {
+                if (s->read_last_pending) {
+                    i2c_end_transfer(s->bus);
+                    s->bus_active = false;
+                    s->phase = RCAR_I2C4_IDLE;
+                    s->read_last_pending = false;
+                    s->icmsr |= BIT(4); /* MST: FSB completion. */
+                    qemu_log_mask(LOG_UNIMP,
+                                  "clarion-i2c4: FSB completed; set MST\n");
+                } else {
+                    s->icrxtx = i2c_recv(s->bus);
+                    s->icmsr |= ICMSR_MDR;
+                    s->read_last_pending = !!(s->icmcr & BIT(1));
+                    qemu_log_mask(LOG_UNIMP,
+                                  "clarion-i2c4: MDR clear without FSB -> read byte 0x%02x; set MDR\n",
+                                  s->icrxtx);
+                }
             }
         }
         clarion_rcar_i2c4_update_irq(s);
@@ -390,6 +512,7 @@ static void clarion_rcar_i2c4_write(void *opaque, hwaddr offset,
         break;
     case ICRXTX:
         s->icrxtx = v & 0xff;
+        s->icrxtx_written = true;
         break;
     default:
         qemu_log_mask(LOG_UNIMP,
