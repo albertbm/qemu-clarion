@@ -923,6 +923,15 @@ static bool skip_in_guest(uint32_t ttbr, const char *n, uint32_t *ret)
            !strcmp(n, "glFinish");
 }
 
+/*
+ * cnf=CODE:VALUE answers SYS_CNF_read(CODE, buf, 1) with VALUE without
+ * reading the store. leafsdtools disables the immobiliser check by writing
+ * code 0x0f = 0 with SYS_CNF_write; flash programming isn't modelled well
+ * enough for that write to land, so the read is answered instead.
+ */
+static int cnf_code = -1;
+static uint8_t cnf_value;
+
 static void on_call(unsigned int vcpu, void *udata)
 {
     Sym *s = udata;
@@ -945,6 +954,20 @@ static void on_call(unsigned int vcpu, void *udata)
         detail(s, a, sp);
     }
     gl_call(ttbr, s->name, a, sp);
+
+    if (cnf_code >= 0 && a[0] == (uint32_t)cnf_code && a[2] == 1 && !(lr & 1) &&
+        !strcmp(s->name, "SYS_CNF_read")) {
+        g_autoptr(GByteArray) v = g_byte_array_new();
+        g_autoptr(GByteArray) r = g_byte_array_new();
+        uint32_t ok = 0;
+
+        g_byte_array_append(v, &cnf_value, 1);
+        g_byte_array_append(r, (const guint8 *)&ok, 4);
+        g_mutex_unlock(&lock);
+        qemu_plugin_write_memory_vaddr(a[1], v);
+        qemu_plugin_write_register(reg_r[0], r);
+        qemu_plugin_set_pc(lr);
+    }
 
     uint32_t ret;
     if (!(lr & 1) && skip_in_guest(ttbr, s->name, &ret)) {
@@ -1093,6 +1116,12 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
             sympath = g_strdup(kv[1]);
         } else if (!g_strcmp0(kv[0], "log")) {
             logpath = g_strdup(kv[1]);
+        } else if (!g_strcmp0(kv[0], "cnf")) {
+            char *v = strchr(kv[1], ':');
+            if (v) {
+                cnf_code = g_ascii_strtoull(kv[1], NULL, 0);
+                cnf_value = g_ascii_strtoull(v + 1, NULL, 0);
+            }
         } else if (!g_strcmp0(kv[0], "native")) {
             native_gpu = g_ascii_strtoull(kv[1], NULL, 0) != 0;
         } else if (!g_strcmp0(kv[0], "out")) {
