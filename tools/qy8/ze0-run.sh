@@ -38,6 +38,7 @@ fi
     -plugin "$here/build/contrib/plugins/libqy8gl.$([ "$(uname)" = Darwin ] && echo dylib || echo so),syms=$out/syms,log=$out/dbg.log" \
     -d guest_errors,unimp -D "$out/guest.log" "$@" > "$out/qemu.log" 2>&1 &
 pid=$!
+echo "booting ${BOARD:-ze0} headless for ${secs}s, logs in $out ..."
 sleep "$secs"
 python3 "$here/tools/qy8/qmp.py" "$out/q.sock" "info registers" > "$out/regs.txt" 2>/dev/null
 python3 "$here/tools/qy8/qmp.py" "$out/q.sock" "screendump $out/screen.png -f png" quit >/dev/null 2>&1
