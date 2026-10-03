@@ -129,6 +129,114 @@ static void dump_attribs(const char *tag, uint32_t lst, int max)
     fprintf(tracef, "\n");
 }
 
+static void rwstr(uint32_t va, char *out, size_t max)
+{
+    size_t i;
+
+    for (i = 0; i + 1 < max; i++) {
+        uint16_t c = 0;
+        if (!rmem(va + i * 2, &c, 2) || !c) {
+            break;
+        }
+        out[i] = c < 0x80 ? c : '?';
+    }
+    out[i] = 0;
+}
+
+/* format a CE debug message: wide format, args from @next() */
+static void wprintf_guest(uint32_t fmtva, uint32_t (*next)(void *), void *ctx,
+                          GString *out)
+{
+    char fmt[512];
+
+    rwstr(fmtva, fmt, sizeof(fmt));
+    for (const char *f = fmt; *f; f++) {
+        char spec[16], buf[256];
+        int n = 0;
+
+        if (*f != '%') {
+            g_string_append_c(out, *f);
+            continue;
+        }
+        spec[n++] = *f++;
+        while (*f && strchr("-+ #0123456789.lhwI", *f) && n < 12) {
+            if (*f != 'l' && *f != 'h' && *f != 'w' && *f != 'I') {
+                spec[n++] = *f;
+            }
+            f++;
+        }
+        if (!*f) {
+            break;
+        }
+        switch (*f) {
+        case '%':
+            g_string_append_c(out, '%');
+            break;
+        case 's':
+            rwstr(next(ctx), buf, sizeof(buf));
+            g_string_append(out, buf);
+            break;
+        case 'S':
+            rstr(next(ctx), buf, sizeof(buf));
+            g_string_append(out, buf);
+            break;
+        case 'c': case 'C':
+            g_string_append_c(out, (char)next(ctx));
+            break;
+        case 'd': case 'i': case 'u': case 'x': case 'X': case 'o': case 'p':
+            spec[n++] = *f == 'p' ? 'x' : *f;
+            spec[n] = 0;
+            snprintf(buf, sizeof(buf), spec, next(ctx));
+            g_string_append(out, buf);
+            break;
+        default:
+            g_string_append_c(out, *f);
+        }
+    }
+}
+
+typedef struct {
+    const uint32_t *reg;
+    int nreg, idx;
+    uint32_t mem;
+} ArgIt;
+
+static uint32_t arg_next(void *p)
+{
+    ArgIt *it = p;
+    uint32_t v;
+
+    if (it->idx < it->nreg) {
+        return it->reg[it->idx++];
+    }
+    v = rd32(it->mem);
+    it->mem += 4;
+    return v;
+}
+
+static void debug_msg(const char *n, const uint32_t *a, uint32_t sp, uint32_t lr)
+{
+    g_autoptr(GString) out = g_string_new(NULL);
+    char buf[512];
+
+    if (!strcmp(n, "OutputDebugStringW")) {
+        rwstr(a[0], buf, sizeof(buf));
+        g_string_append(out, buf);
+    } else if (!strcmp(n, "NKDbgPrintfW")) {
+        ArgIt it = { a + 1, 3, 0, sp };
+        wprintf_guest(a[0], arg_next, &it, out);
+    } else if (!strcmp(n, "NKvDbgPrintfW")) {
+        ArgIt it = { NULL, 0, 0, a[1] };
+        wprintf_guest(a[0], arg_next, &it, out);
+    } else {
+        return;
+    }
+    while (out->len && (out->str[out->len - 1] == '\n' || out->str[out->len - 1] == '\r')) {
+        g_string_truncate(out, out->len - 1);
+    }
+    fprintf(tracef, "DBG %08x %s\n", lr, out->str);
+}
+
 /* extra detail for the calls whose arguments point at data */
 static void detail(Sym *s, const uint32_t *a, uint32_t sp)
 {
@@ -799,7 +907,11 @@ static void on_call(unsigned int vcpu, void *udata)
 
     g_mutex_lock(&lock);
     s->calls++;
-    if (tracef && logged < log_limit) {
+    if (strstr(s->name, "DebugString") || strstr(s->name, "DbgPrintf")) {
+        if (tracef) {
+            debug_msg(s->name, a, sp, lr);
+        }
+    } else if (tracef && logged < log_limit) {
         logged++;
         fprintf(tracef, "[%08x] %s(%08x, %08x, %08x, %08x | %08x %08x) lr=%08x\n",
                 ttbr, s->name, a[0], a[1], a[2], a[3], rd32(sp), rd32(sp + 4), lr);
