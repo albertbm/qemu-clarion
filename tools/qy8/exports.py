@@ -25,7 +25,8 @@ for want in sys.argv[2:]:
             if not er or rva(er) + 40 > len(img):
                 continue
             nm = cstr(img, rva(u32(img, rva(er) + 12)))
-            if nm and nm.lower() == n.lower():
+            # the directory may name the module without its extension
+            if nm and nm.lower().split('.dll')[0] == n.lower().split('.dll')[0]:
                 break
         else:
             print(n, 'no export dir'); continue
