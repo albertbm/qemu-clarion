@@ -14,12 +14,14 @@
 #include "hw/i2c/i2c.h"
 #include "hw/i2c/clarion_rcar_i2c.h"
 #include "qemu/module.h"
+#include "qemu/timer.h"
 #include "ui/input.h"
 
 #define RCAR_I2C4_MMIO_SIZE 0x1000
 #define TMA460_PROFILE_POINT_SIZE 10
 #define TMA460_TOUCH_X_OFFSET 14
 #define TMA460_TOUCH_Y_OFFSET 9
+#define TMA460_TOUCH_REPORT_STALE_MS 500
 
 #define ICMCR  0x04
 #define ICMSR  0x0c
@@ -98,6 +100,7 @@ struct ClarionTma460 {
     uint16_t reported_pointer_x;
     uint16_t reported_pointer_y;
     bool touch_report_pending;
+    int64_t touch_report_time;
     uint8_t touch_report[TMA460_PROFILE_POINT_SIZE];
     uint8_t mode_register;
     uint8_t mode_write_value;
@@ -619,6 +622,7 @@ static bool clarion_tma460_emit_touch(ClarionTma460 *s, uint8_t event_id,
     s->touch_report[4] = 0; /* SYNTHETIC: reserved report byte. */
     s->touch_report[5] = event_id << 4; /* TARGET: EVTID occupies bits 5:4. */
     s->touch_report_pending = true;
+    s->touch_report_time = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
     qemu_log_mask(LOG_UNIMP,
                   "clarion-tma460: pointer report evt=%u x=%d y=%d raw_x=%u raw_y=%u\n",
                   event_id, pointer_x, pointer_y, x, y);
@@ -673,6 +677,19 @@ static void clarion_tma460_pointer_sync_state(ClarionTma460 *s)
         s->reported_pointer_valid = false;
         s->ignore_pointer_until_release = s->pointer_button_down;
         return;
+    }
+    /*
+     * Early in boot the driver acks the IRQ without reading the report;
+     * drop it rather than hold back every later one.
+     */
+    if (s->touch_report_pending &&
+        qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) - s->touch_report_time >
+            TMA460_TOUCH_REPORT_STALE_MS) {
+        qemu_log_mask(LOG_UNIMP,
+                      "clarion-tma460: dropping unread touch report\n");
+        s->touch_report_pending = false;
+        s->reported_button_down = false;
+        s->reported_pointer_valid = false;
     }
     if (s->ignore_pointer_until_release) {
         s->pointer_dirty = false;
