@@ -347,11 +347,14 @@ typedef struct {
 static GHashTable *procs;           /* ttbr -> Proc* */
 static char *outdir;
 
-/* fragment shader binaries inside auirtdll.dll, told apart by address */
-#define FS_TEXCOLOR   0x412a3a18u   /* u_TextureEnabled ? tex : u_Color */
-#define FS_KEYED_A    0x412a3f40u   /* tex with optional colour key */
-#define FS_KEYED_B    0x412a4648u
-#define FS_TINT       0x412a4ce0u   /* u_Color tinted by tex alpha */
+/*
+ * Fragment shader binaries inside auirtdll.dll, told apart by address. The
+ * defaults are G218ENNI's; a syms file can override them with "@fs_*" lines.
+ */
+static uint32_t FS_TEXCOLOR = 0x412a3a18u;  /* u_TextureEnabled ? tex : u_Color */
+static uint32_t FS_KEYED_A  = 0x412a3f40u;  /* tex with optional colour key */
+static uint32_t FS_KEYED_B  = 0x412a4648u;
+static uint32_t FS_TINT     = 0x412a4ce0u;  /* u_Color tinted by tex alpha */
 
 static Proc *proc_get(uint32_t ttbr)
 {
@@ -596,14 +599,11 @@ static void draw_quad(Proc *p, int count)
                         s[k] = t8[k] / 255.0f;
                     }
                 }
-                switch (frag) {
-                case FS_TEXCOLOR:
+                if (frag == FS_TEXCOLOR) {
                     if (!(ten && ten[0] != 0) && col) {
                         memcpy(s, col, sizeof(s));
                     }
-                    break;
-                case FS_KEYED_A:
-                case FS_KEYED_B:
+                } else if (frag == FS_KEYED_A || frag == FS_KEYED_B) {
                     /* opaque except the key colour; texture alpha is ignored */
                     if (key && key[0] != 0 && col &&
                         fabsf(s[0] - col[0]) < 0.02f &&
@@ -612,14 +612,10 @@ static void draw_quad(Proc *p, int count)
                         continue;
                     }
                     s[3] = 1;
-                    break;
-                case FS_TINT:
-                    if (col) {
-                        for (int k = 0; k < 4; k++) {
-                            s[k] *= col[k];
-                        }
+                } else if (frag == FS_TINT && col) {
+                    for (int k = 0; k < 4; k++) {
+                        s[k] *= col[k];
                     }
-                    break;
                 }
                 if (tr) {
                     s[3] *= tr[0];
@@ -1021,7 +1017,18 @@ static bool load_syms(const char *path)
         unsigned ord, addr;
         char name[128];
 
-        if (sscanf(lines[i], "%u %x %127s", &ord, &addr, name) == 3) {
+        if (sscanf(lines[i], "%u %x %127s", &ord, &addr, name) != 3) {
+            continue;
+        }
+        if (!strcmp(name, "@fs_texcolor")) {
+            FS_TEXCOLOR = addr;
+        } else if (!strcmp(name, "@fs_keyed_a")) {
+            FS_KEYED_A = addr;
+        } else if (!strcmp(name, "@fs_keyed_b")) {
+            FS_KEYED_B = addr;
+        } else if (!strcmp(name, "@fs_tint")) {
+            FS_TINT = addr;
+        } else {
             add_sym(addr, name);
         }
     }
