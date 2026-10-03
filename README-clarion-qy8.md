@@ -128,11 +128,13 @@ mirrors it before it posts the touch to the window.
 | Left button up | 3 | Released |
 
 The same input path can be scripted over QMP (`-qmp
-unix:path,server=on,wait=off`), with coordinates on the `0..0x7fff` scale:
+unix:path,server=on,wait=off`), with coordinates on the `0..0x7fff` scale.
+The handler is bound to the display, so the events need `"device": "qy8-du"`;
+without it QEMU answers "Input handler not found":
 
 ```json
 {"execute": "qmp_capabilities"}
-{"execute": "input-send-event", "arguments": {"events": [
+{"execute": "input-send-event", "arguments": {"device": "qy8-du", "events": [
   {"type": "abs", "data": {"axis": "x", "value": 16383}},
   {"type": "abs", "data": {"axis": "y", "value": 16383}},
   {"type": "btn", "data": {"button": "left", "down": true}}]}}
