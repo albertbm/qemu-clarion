@@ -974,9 +974,15 @@ static uint64_t ehci_port_read(void *ptr, hwaddr addr,
                                unsigned size)
 {
     EHCIState *s = ptr;
+    USBDevice *dev = s->ports[addr >> 2].dev;
     uint32_t val;
 
     val = s->portsc[addr >> 2];
+    /* idle line state of a non-high-speed device: K for low, J for full */
+    if (dev && dev->attached && !(val & (PORTSC_PED | PORTSC_POWNER)) &&
+        !(dev->speedmask & USB_SPEED_MASK_HIGH)) {
+        val |= (dev->speed == USB_SPEED_LOW ? 1 : 2) << PORTSC_LINESTAT_SH;
+    }
     trace_usb_ehci_portsc_read(addr + s->portscbase, addr >> 2, val);
     return val;
 }
@@ -1639,7 +1645,8 @@ static int ehci_state_fetchentry(EHCIState *ehci, int async)
     int again = 0;
     uint64_t entry = ehci_get_fetch_addr(ehci, async);
 
-    if (NLPTR_TBIT(entry)) {
+    /* section 3.6.1: T is ignored in the async schedule; some guests set it */
+    if (!async && NLPTR_TBIT(entry)) {
         ehci_set_state(ehci, async, EST_ACTIVE);
         goto out;
     }
