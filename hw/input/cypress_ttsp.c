@@ -94,6 +94,7 @@ struct CypressTTSPState {
     bool gen4;
     uint8_t bl_addr;            /* TMA616: separate bootloader address */
     uint16_t width, height;     /* panel resolution reported to the host */
+    bool invert_y;              /* panel Y runs bottom to top */
 
     uint32_t mode;
     uint32_t act;
@@ -510,6 +511,9 @@ static void ttsp_input_event(DeviceState *dev, QemuConsole *src,
             s->y = qemu_input_scale_axis(move->value, INPUT_EVENT_ABS_MIN,
                                          INPUT_EVENT_ABS_MAX, 0,
                                          s->height - 1);
+            if (s->invert_y) {
+                s->y = s->height - 1 - s->y;
+            }
         }
         break;
     case INPUT_EVENT_KIND_BTN:
@@ -584,6 +588,7 @@ static void ttsp_init(Object *obj)
 static const Property ttsp_props[] = {
     DEFINE_PROP_UINT16("width", CypressTTSPState, width, 800),
     DEFINE_PROP_UINT16("height", CypressTTSPState, height, 480),
+    DEFINE_PROP_BOOL("invert-y", CypressTTSPState, invert_y, false),
 };
 
 static const VMStateDescription vmstate_ttsp = {

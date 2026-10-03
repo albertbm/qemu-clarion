@@ -2011,10 +2011,13 @@ static void qy8_init_i2c(Qy8MachineState *s)
 
     bus = I2C_BUS(qdev_get_child_bus(s->i2c[QY8_I2C_TOUCH], "i2c"));
     if (qy8_is_ze0(s)) {
-        ts = i2c_slave_create_simple(bus, TYPE_CY_TMA616, 0x67);
+        ts = i2c_slave_new(TYPE_CY_TMA616, 0x67);
     } else {
-        ts = i2c_slave_create_simple(bus, TYPE_CY_TMA460, 0x24);
+        ts = i2c_slave_new(TYPE_CY_TMA460, 0x24);
+        /* kepdrv flips the driver's Y before posting WM_LBUTTON* */
+        qdev_prop_set_bit(DEVICE(ts), "invert-y", true);
     }
+    i2c_slave_realize_and_unref(ts, bus, &error_fatal);
     s->touch = DEVICE(ts);
     s->gpio[4].out[10] = qdev_get_gpio_in_named(s->touch,
                                                 CYPRESS_TTSP_RESET, 0);
