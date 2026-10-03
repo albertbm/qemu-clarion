@@ -1498,8 +1498,14 @@ static void qy8_gpio_write(void *opaque, hwaddr addr, uint64_t val,
             qemu_log_mask(LOG_UNIMP,
                           "qy8.gpio4: reset OUTDT[10] %d -> %d\n",
                           old_reset_level, new_reset_level);
-            clarion_tma460_set_reset(g->tma460_reset_target,
-                                     new_reset_level);
+            if (object_dynamic_cast(OBJECT(g->tma460_reset_target),
+                                    TYPE_CLARION_TMA616)) {
+                clarion_tma616_set_reset(g->tma460_reset_target,
+                                         new_reset_level);
+            } else {
+                clarion_tma460_set_reset(g->tma460_reset_target,
+                                         new_reset_level);
+            }
         }
     }
 }
@@ -2008,6 +2014,12 @@ static void qy8_usb_irq(void *opaque, int n, int level)
                  s->int2_usb.pending != 0);
 }
 
+/* the 2014-2017 ZE0 unit, QY8202NA: same SoC, different board peripherals */
+static bool qy8_is_ze0(Qy8MachineState *s)
+{
+    return !g_strcmp0(s->board, "ze0");
+}
+
 /* Parking brake on, lights off; reverse as the property says */
 static void qy8_bctl_set_inputs(Qy8MachineState *s)
 {
@@ -2241,7 +2253,15 @@ static void qy8_init(MachineState *machine)
         if (s->i2c4_recorder_on) {
             i2c_slave_create_simple(bus, TYPE_CLARION_I2C4_RECORDER, 0x24);
         }
-        if (s->tma460_on) {
+        if (s->tma460_on && qy8_is_ze0(s)) {
+            /*
+             * The ZE0 board has a TMA616 in the same place: application
+             * on 0x67, bootloader on 0x69, same reset and interrupt pins.
+             */
+            s->tma460 = DEVICE(i2c_slave_create_simple(bus,
+                                                       TYPE_CLARION_TMA616,
+                                                       0x67));
+        } else if (s->tma460_on) {
             s->tma460 = DEVICE(i2c_slave_create_simple(bus,
                                                        TYPE_CLARION_TMA460,
                                                        0x24));
@@ -2441,7 +2461,9 @@ static void qy8_init(MachineState *machine)
     qdev_set_id(s->du, g_strdup("qy8-du"), &error_fatal);
     qdev_prop_set_uint32(s->du, "dotclk", s->du_dotclk);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(s->du), &error_fatal);
-    if (s->tma460 && s->tma460_synthetic_profile_on) {
+    if (s->tma460 && qy8_is_ze0(s)) {
+        clarion_tma616_bind_pointer_input(s->tma460, "qy8-du", &error_fatal);
+    } else if (s->tma460 && s->tma460_synthetic_profile_on) {
         clarion_tma460_bind_pointer_input(s->tma460, "qy8-du", &error_fatal);
     }
     sysbus_mmio_map(SYS_BUS_DEVICE(s->du), 0, QY8_DU_BASE);
@@ -2643,12 +2665,6 @@ static void qy8_init(MachineState *machine)
                                         &s->periph.mr, -1000);
 }
 
-/* the 2014-2017 ZE0 unit, QY8202NA: same SoC, different board peripherals */
-static G_GNUC_UNUSED bool qy8_is_ze0(Qy8MachineState *s)
-{
-    return !g_strcmp0(s->board, "ze0");
-}
-
 static char *qy8_board_get(Object *obj, Error **errp)
 {
     return g_strdup(QY8_MACHINE(obj)->board);
@@ -2822,7 +2838,8 @@ static void qy8_machine_instance_init(Object *obj)
     object_property_add_bool(obj, "tma460", qy8_tma460_get,
                              qy8_tma460_set);
     object_property_set_description(obj, "tma460",
-        "Bounded TMA460 bootloader model at I2C4 address 0x24 (on by default; requires i2c4=on)");
+        "Bounded TMA460 bootloader model at I2C4 address 0x24 (on by default; requires i2c4=on); "
+        "TMA616 at 0x67 with board=ze0");
 
     s->tma460_synthetic_profile_on = true;
     object_property_add_bool(obj, "tma460-profile",
