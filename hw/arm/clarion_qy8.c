@@ -46,6 +46,8 @@
 #include "hw/i2c/clarion_rcar_i2c.h"
 #include "hw/sd/renesas_sdhi.h"
 #include "hw/misc/unimp.h"
+#include "hw/usb/hcd-ehci.h"
+#include "hw/usb/hcd-ohci.h"
 #include "hw/block/flash.h"
 #include "system/block-backend.h"
 #include "system/blockdev.h"
@@ -1303,6 +1305,22 @@ static const MemoryRegionOps qy8_usbphy_ops = {
     .valid.max_access_size = 4,
 };
 
+/* --- USB host: EHCI @0xFFE70000, OHCI @0xFFE70400 --------------------- */
+
+/*
+ * Bases are the ones MQUSBH prints and the OAL's base->IRQ table uses
+ * (nk.exe ZE0 @0x8801275c, ZE1 @0x88013028): EHCI -> IRQ 165, OHCI -> 164.
+ * Both share GIC ID 76 (SPI 44); the OAL demux reads INTC2 word 0xFE782058,
+ * bit 1 for EHCI and bit 0 for OHCI (ZE0 @0x88011734, ZE1 @0x88011e14).
+ * Vendor registers inside the EHCI window (EIIBC1/2 at +0x94/+0x9c, written
+ * by the OAL) fall through to qy8.periph.
+ */
+#define QY8_EHCI_BASE       0xFFE70000
+#define QY8_OHCI_BASE       0xFFE70400
+#define QY8_USB_SPI         44
+#define QY8_INT2_USB_OHCI   (1u << 0)
+#define QY8_INT2_USB_EHCI   (1u << 1)
+
 /* --- GPIO (R-Car, 6 банків по 0x1000) --------------------------------- */
 
 
@@ -1837,20 +1855,21 @@ static const MemoryRegionOps qy8_mstp_ops = {
 #define QY8_INT2_STATUS_DU      0xFE782048
 #define QY8_INT2_STATUS_SDHI0   0xFE7820F4
 #define QY8_INT2_STATUS_SDHI1   0xFE7820F8
+#define QY8_INT2_STATUS_USB     0xFE782058
 #define QY8_INT2_BIT            (1u << 0)   /* біт у слові — не доведений */
 
 typedef struct Qy8Int2Line {
     MemoryRegion mr;
     const char *name;
     hwaddr pa;
-    bool pending;               /* пристрій тримає свою лінію GIC */
+    uint32_t pending;           /* біти джерел, що тримають лінію GIC */
 } Qy8Int2Line;
 
 static uint64_t qy8_int2_read(void *opaque, hwaddr addr, unsigned size)
 {
     Qy8Int2Line *l = opaque;
 
-    return l->pending ? QY8_INT2_BIT : 0;
+    return l->pending;
 }
 
 static void qy8_int2_write(void *opaque, hwaddr addr, uint64_t val,
@@ -1878,7 +1897,7 @@ static void qy8_int2_line_init(MemoryRegion *sysmem, Qy8Int2Line *l,
 {
     l->name = name;
     l->pa = pa;
-    l->pending = false;
+    l->pending = 0;
     memory_region_init_io(&l->mr, NULL, &qy8_int2_ops, l, name, 4);
     memory_region_add_subregion_overlap(sysmem, pa, &l->mr, 1);
 }
@@ -1904,6 +1923,8 @@ struct Qy8MachineState {
     DeviceState *can;
     DeviceState *i2c4;
     DeviceState *tma460;
+    DeviceState *ehci;
+    DeviceState *ohci;
     DeviceState *sgx;         /* PowerVR SGX @0xFCE00000 */
     Qy8Tmu tmu;
     Qy8Gpio gpio[QY8_GPIO_BANKS];
@@ -1912,6 +1933,7 @@ struct Qy8MachineState {
     Qy8Dbsc3 dbsc3;
     Qy8Int2Line int2_du;
     Qy8Int2Line int2_sdhi[QY8_NUM_SDHI];
+    Qy8Int2Line int2_usb;
     Qy8Mstp mstp[QY8_NUM_MSTP];
     Qy8Periph periph;
     MemoryRegion voidmr;
@@ -1943,7 +1965,7 @@ static void qy8_du_irq(void *opaque, int n, int level)
 {
     Qy8MachineState *s = opaque;
 
-    s->int2_du.pending = !!level;
+    s->int2_du.pending = level ? QY8_INT2_BIT : 0;
     qemu_set_irq(qdev_get_gpio_in(s->gic, s->du_spi), level);
 }
 
@@ -1955,8 +1977,23 @@ static void qy8_sdhi_irq(void *opaque, int n, int level)
 {
     Qy8MachineState *s = opaque;
 
-    s->int2_sdhi[n].pending = !!level;
+    s->int2_sdhi[n].pending = level ? QY8_INT2_BIT : 0;
     qemu_set_irq(qdev_get_gpio_in(s->gic, QY8_SDHI_SPI0 + n), level);
+}
+
+/* n = 0 OHCI, 1 EHCI: one GIC line, the demux tells them apart by bit */
+static void qy8_usb_irq(void *opaque, int n, int level)
+{
+    Qy8MachineState *s = opaque;
+    uint32_t bit = n ? QY8_INT2_USB_EHCI : QY8_INT2_USB_OHCI;
+
+    if (level) {
+        s->int2_usb.pending |= bit;
+    } else {
+        s->int2_usb.pending &= ~bit;
+    }
+    qemu_set_irq(qdev_get_gpio_in(s->gic, QY8_USB_SPI),
+                 s->int2_usb.pending != 0);
 }
 
 static void qy8_add_ram(MemoryRegion *sysmem, MemoryRegion *mr,
@@ -2334,7 +2371,27 @@ static void qy8_init(MachineState *machine)
     memory_region_init_io(&s->usbphy.mr, NULL, &qy8_usbphy_ops, &s->usbphy,
                           "qy8.usbphy", QY8_USBPHY_SIZE);
     memory_region_add_subregion_overlap(sysmem, QY8_USBPHY_BASE,
-                                        &s->usbphy.mr, 1);
+                                        &s->usbphy.mr, 2);
+
+    /*
+     * The EHCI window is 4 KiB and would cover OHCI and the PHY, so those
+     * two sit one priority higher. OHCI is the companion for full/low speed.
+     */
+    s->ehci = qdev_new(TYPE_PLATFORM_EHCI);
+    qdev_prop_set_bit(s->ehci, "companion-enable", true);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(s->ehci), &error_fatal);
+    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(s->ehci), 0, QY8_EHCI_BASE, 1);
+    sysbus_connect_irq(SYS_BUS_DEVICE(s->ehci), 0,
+                       qemu_allocate_irq(qy8_usb_irq, s, 1));
+
+    s->ohci = qdev_new(TYPE_SYSBUS_OHCI);
+    qdev_prop_set_string(s->ohci, "masterbus",
+                         SYS_BUS_EHCI(s->ehci)->ehci.bus.qbus.name);
+    qdev_prop_set_uint32(s->ohci, "num-ports", EHCI_PORTS);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(s->ohci), &error_fatal);
+    sysbus_mmio_map_overlap(SYS_BUS_DEVICE(s->ohci), 0, QY8_OHCI_BASE, 2);
+    sysbus_connect_irq(SYS_BUS_DEVICE(s->ohci), 0,
+                       qemu_allocate_irq(qy8_usb_irq, s, 0));
 
     /* --- Display Unit: справжнє вікно QEMU --- */
     /*
@@ -2363,6 +2420,8 @@ static void qy8_init(MachineState *machine)
                        QY8_INT2_STATUS_SDHI0);
     qy8_int2_line_init(sysmem, &s->int2_sdhi[1], "qy8.int2.sdhi1",
                        QY8_INT2_STATUS_SDHI1);
+    qy8_int2_line_init(sysmem, &s->int2_usb, "qy8.int2.usb",
+                       QY8_INT2_STATUS_USB);
 
     /*
      * CPG MSTPCR: шість окремих чотирибайтових вікон із пріоритетом 1 над
