@@ -42,6 +42,7 @@
 #include "hw/dma/clarion_lbdma.h"
 #include "hw/sd/sd.h"
 #include "hw/net/renesas_can.h"
+#include "hw/i2c/clarion_rcar_i2c.h"
 #include "hw/sd/renesas_sdhi.h"
 #include "hw/misc/unimp.h"
 #include "hw/block/flash.h"
@@ -156,6 +157,7 @@
  * Номер лишається властивістю машини `du-spi` — зручно для дослідів.
  */
 #define QY8_DU_SPI          31          /* підтверджено таблицями OAL */
+#define QY8_I2C4_SPI        77          /* GIC ID 109 = SPI 77 */
 
 #define QY8_SCIF_BASE       0xFFE40000      /* scif0..scif5, крок 0x1000 */
 #define QY8_SCIF_STRIDE     0x1000
@@ -1804,6 +1806,7 @@ struct Qy8MachineState {
     DeviceState *dispmicom;
     DeviceState *sdhi[QY8_NUM_SDHI];
     DeviceState *can;
+    DeviceState *i2c4;
     DeviceState *sgx;         /* PowerVR SGX @0xFCE00000 */
     Qy8Tmu tmu;
     Qy8Gpio gpio[QY8_GPIO_BANKS];
@@ -1821,6 +1824,7 @@ struct Qy8MachineState {
     uint32_t du_dotclk;         /* точкова частота DU, Гц; 0 = без такту */
     bool micom_on;              /* вбудований супутній МК на SCIF4 */
     bool dispmicom_on;          /* вбудований МК панелі на SCIF1 */
+    bool i2c4_on;               /* opt-in bounded R-Car I2C4 model */
 
     MemoryRegion flash;          /* лише коли флеш подано як ROM */
     DriveInfo *flash_drive;      /* -drive if=pflash: записувана копія */
@@ -2015,6 +2019,20 @@ static void qy8_init(MachineState *machine)
                        qdev_get_gpio_in(DEVICE(s->cpu), ARM_CPU_IRQ));
     sysbus_connect_irq(gicbusdev, 1,
                        qdev_get_gpio_in(DEVICE(s->cpu), ARM_CPU_FIQ));
+
+    /* --- I2C4: bounded T142 model; I2C0..I2C2 remain on qy8.periph --- */
+    if (s->i2c4_on) {
+        I2CBus *bus;
+
+        s->i2c4 = qdev_new(TYPE_CLARION_RCAR_I2C4);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(s->i2c4), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(s->i2c4), 0, 0xffc73000);
+        /* GIC input indices are SPI numbers: ID 109 maps to SPI 77. */
+        sysbus_connect_irq(SYS_BUS_DEVICE(s->i2c4), 0,
+                           qdev_get_gpio_in(s->gic, QY8_I2C4_SPI));
+        bus = I2C_BUS(qdev_get_child_bus(s->i2c4, "i2c"));
+        i2c_slave_create_simple(bus, TYPE_CLARION_I2C4_RECORDER, 0x24);
+    }
 
     /*
      * --- HPB-DMAC ---
@@ -2388,6 +2406,16 @@ static void qy8_dispmicom_set(Object *obj, bool value, Error **errp)
     QY8_MACHINE(obj)->dispmicom_on = value;
 }
 
+static bool qy8_i2c4_get(Object *obj, Error **errp)
+{
+    return QY8_MACHINE(obj)->i2c4_on;
+}
+
+static void qy8_i2c4_set(Object *obj, bool value, Error **errp)
+{
+    QY8_MACHINE(obj)->i2c4_on = value;
+}
+
 static void qy8_machine_instance_init(Object *obj)
 {
     Qy8MachineState *s = QY8_MACHINE(obj);
@@ -2441,6 +2469,11 @@ static void qy8_machine_instance_init(Object *obj)
     object_property_set_description(obj, "dispmicom",
         "вбудований МК панелі дисплея на SCIF1 (off — щоб причепити свій "
         "відповідач через -serial)");
+
+    s->i2c4_on = false;
+    object_property_add_bool(obj, "i2c4", qy8_i2c4_get, qy8_i2c4_set);
+    object_property_set_description(obj, "i2c4",
+        "opt-in обмежена модель I2C4 @0xffc73000 (типово вимкнена)");
 }
 
 static void qy8_machine_class_init(ObjectClass *oc, const void *data)
