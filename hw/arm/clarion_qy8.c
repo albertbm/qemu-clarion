@@ -44,6 +44,8 @@
 #include "hw/net/renesas_can.h"
 #include "hw/sd/renesas_sdhi.h"
 #include "hw/misc/unimp.h"
+#include "hw/i2c/rcar_i2c.h"
+#include "hw/input/cypress_ttsp.h"
 #include "hw/usb/hcd-ehci.h"
 #include "hw/usb/hcd-ohci.h"
 #include "hw/block/flash.h"
@@ -1316,6 +1318,13 @@ static const MemoryRegionOps qy8_usbphy_ops = {
 #define QY8_GPIO_BASE       0xFFC40000
 #define QY8_GPIO_BANKS      6
 #define QY8_GPIO_STRIDE     0x1000
+/* all banks share INTID 135; the OAL demuxes GP1.0 and GP4.11 from it */
+#define QY8_GPIO_SPI        103
+
+#define QY8_I2C_BASE        0xFFC70000
+#define QY8_I2C_STRIDE      0x1000
+#define QY8_NUM_I2C         4
+#define QY8_I2C_TOUCH       3
 
 #define GPIO_IOINTSEL   0x00
 #define GPIO_INOUTSEL   0x04
@@ -1332,10 +1341,59 @@ static const MemoryRegionOps qy8_usbphy_ops = {
 typedef struct Qy8Gpio {
     MemoryRegion mr;
     uint32_t iointsel, inoutsel, outdt;
-    uint32_t intmsk, posneg, edglevel, filonoff;
+    uint32_t intdt, intmsk, posneg, edglevel, filonoff;
     uint32_t in_level;          /* рівні на вхідних лініях */
+    uint32_t driven;            /* inputs a device model drives */
+    qemu_irq *in;               /* those inputs, one per bit */
+    qemu_irq out[32];           /* OUTDT bits wired to devices */
+    qemu_irq irq;               /* this bank's share of GIC SPI 103 */
     int bank;
 } Qy8Gpio;
+
+static void qy8_gpio_update(Qy8Gpio *g)
+{
+    qemu_set_irq(g->irq, !!(g->intdt & g->intmsk));
+}
+
+/* Only driven lines raise level interrupts, so board straps stay quiet. */
+static void qy8_gpio_level_irqs(Qy8Gpio *g)
+{
+    uint32_t active = g->in_level ^ g->posneg;
+
+    g->intdt |= active & g->driven & g->iointsel & ~g->edglevel;
+}
+
+static void qy8_gpio_set_input(void *opaque, int n, int level)
+{
+    Qy8Gpio *g = opaque;
+    uint32_t bit = 1u << n;
+    bool old = g->in_level & bit;
+
+    if (level) {
+        g->in_level |= bit;
+    } else {
+        g->in_level &= ~bit;
+    }
+    /* POSNEG=0 catches rising edges, 1 falling */
+    if ((g->iointsel & g->edglevel & bit) && old != !!level &&
+        !!level != !!(g->posneg & bit)) {
+        g->intdt |= bit;
+    }
+    qy8_gpio_level_irqs(g);
+    qy8_gpio_update(g);
+}
+
+static void qy8_gpio_drive_outputs(Qy8Gpio *g, uint32_t old)
+{
+    uint32_t changed = old ^ g->outdt;
+    int i;
+
+    for (i = 0; i < 32; i++) {
+        if ((changed & (1u << i)) && g->out[i]) {
+            qemu_set_irq(g->out[i], (g->outdt >> i) & 1);
+        }
+    }
+}
 
 static uint64_t qy8_gpio_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -1351,6 +1409,8 @@ static uint64_t qy8_gpio_read(void *opaque, hwaddr addr, unsigned size)
     case GPIO_INDT:
         /* виходи читаються як те, що ми туди записали; входи — рівень лінії */
         return (g->outdt & g->inoutsel) | (g->in_level & ~g->inoutsel);
+    case GPIO_INTDT:
+        return g->intdt;
     case GPIO_INTMSK:
         return g->intmsk;
     case GPIO_POSNEG:
@@ -1368,6 +1428,7 @@ static void qy8_gpio_write(void *opaque, hwaddr addr, uint64_t val,
                            unsigned size)
 {
     Qy8Gpio *g = opaque;
+    uint32_t old = g->outdt;
 
     switch (addr) {
     case GPIO_IOINTSEL:
@@ -1378,12 +1439,20 @@ static void qy8_gpio_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case GPIO_OUTDT:
         g->outdt = val;
+        /* direction is the guest's business; OUTDT alone drives the wire */
+        qy8_gpio_drive_outputs(g, old);
+        break;
+    case GPIO_INTCLR:
+        g->intdt &= ~val;
+        qy8_gpio_level_irqs(g);
         break;
     case GPIO_INTMSK:
+        /* 1 = enabled; the OAL masks by clearing bits here ... */
         g->intmsk = val;
         break;
     case GPIO_MSKCLR:
-        g->intmsk &= ~val;
+        /* ... and unmasks by setting them here, as Linux gpio-rcar does */
+        g->intmsk |= val;
         break;
     case GPIO_POSNEG:
         g->posneg = val;
@@ -1397,6 +1466,7 @@ static void qy8_gpio_write(void *opaque, hwaddr addr, uint64_t val,
     default:
         break;
     }
+    qy8_gpio_update(g);
 }
 
 static const MemoryRegionOps qy8_gpio_ops = {
@@ -1831,6 +1901,9 @@ struct Qy8MachineState {
     DeviceState *sgx;         /* PowerVR SGX @0xFCE00000 */
     Qy8Tmu tmu;
     Qy8Gpio gpio[QY8_GPIO_BANKS];
+    uint32_t gpio_irq_banks;    /* banks with an unmasked pending input */
+    DeviceState *i2c[QY8_NUM_I2C];
+    DeviceState *touch;
     Qy8Bctl bctl;
     Qy8UsbPhy usbphy;
     Qy8Dbsc3 dbsc3;
@@ -1893,6 +1966,61 @@ static void qy8_usb_irq(void *opaque, int n, int level)
     }
     qemu_set_irq(qdev_get_gpio_in(s->gic, QY8_USB_SPI),
                  s->int2_usb.pending != 0);
+}
+
+/* the 2014-2017 ZE0 unit, QY8202NA: same SoC, different board peripherals */
+static bool qy8_is_ze0(Qy8MachineState *s)
+{
+    return !g_strcmp0(s->board, "ze0");
+}
+
+static void qy8_gpio_irq(void *opaque, int bank, int level)
+{
+    Qy8MachineState *s = opaque;
+
+    if (level) {
+        s->gpio_irq_banks |= 1u << bank;
+    } else {
+        s->gpio_irq_banks &= ~(1u << bank);
+    }
+    qemu_set_irq(qdev_get_gpio_in(s->gic, QY8_GPIO_SPI), !!s->gpio_irq_banks);
+}
+
+/*
+ * I2C masters at the r8a7778 addresses. The IRQs are the OAL's own answer
+ * to IOCTL_HAL_REQUEST_IRQ (INTID 99, 110, 108, 109), same as Linux.
+ *
+ * Touch sits on the fourth one (the guest's "I2C4:"): reset on GP4.10,
+ * interrupt on GP4.11 (OAL pin 0xBA -> IRQ 186), on both boards.
+ */
+static void qy8_init_i2c(Qy8MachineState *s)
+{
+    static const int spi[QY8_NUM_I2C] = { 67, 78, 76, 77 };
+    I2CBus *bus;
+    I2CSlave *ts;
+    int i;
+
+    for (i = 0; i < QY8_NUM_I2C; i++) {
+        s->i2c[i] = qdev_new(TYPE_RCAR_I2C);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(s->i2c[i]), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(s->i2c[i]), 0,
+                        QY8_I2C_BASE + i * QY8_I2C_STRIDE);
+        sysbus_connect_irq(SYS_BUS_DEVICE(s->i2c[i]), 0,
+                           qdev_get_gpio_in(s->gic, spi[i]));
+    }
+
+    bus = I2C_BUS(qdev_get_child_bus(s->i2c[QY8_I2C_TOUCH], "i2c"));
+    if (qy8_is_ze0(s)) {
+        ts = i2c_slave_create_simple(bus, TYPE_CY_TMA616, 0x67);
+    } else {
+        ts = i2c_slave_create_simple(bus, TYPE_CY_TMA460, 0x24);
+    }
+    s->touch = DEVICE(ts);
+    s->gpio[4].out[10] = qdev_get_gpio_in_named(s->touch,
+                                                CYPRESS_TTSP_RESET, 0);
+    s->gpio[4].driven |= 1u << 11;
+    qdev_connect_gpio_out_named(s->touch, CYPRESS_TTSP_INT, 0,
+                                s->gpio[4].in[11]);
 }
 
 static void qy8_add_ram(MemoryRegion *sysmem, MemoryRegion *mr,
@@ -2181,12 +2309,16 @@ static void qy8_init(MachineState *machine)
 
         g->bank = i;
         g->in_level = qy8_gpio_in_level[i];
+        g->in = qemu_allocate_irqs(qy8_gpio_set_input, g, 32);
+        g->irq = qemu_allocate_irq(qy8_gpio_irq, s, i);
         memory_region_init_io(&g->mr, NULL, &qy8_gpio_ops, g, name, 0x1000);
         memory_region_add_subregion(sysmem,
                                     QY8_GPIO_BASE + i * QY8_GPIO_STRIDE,
                                     &g->mr);
         g_free(name);
     }
+
+    qy8_init_i2c(s);
 
     /* --- контролер плати: DIPSW і дозвіл виходу зі standby --- */
     s->bctl.reg[BCTL_STATUS >> 1] = BCTL_ST_PWR | BCTL_ST_BOOT;
@@ -2429,12 +2561,6 @@ static void qy8_init(MachineState *machine)
                           "qy8.periph", 0x10000000);
     memory_region_add_subregion_overlap(sysmem, 0xF0000000,
                                         &s->periph.mr, -1000);
-}
-
-/* the 2014-2017 ZE0 unit, QY8202NA: same SoC, different board peripherals */
-static G_GNUC_UNUSED bool qy8_is_ze0(Qy8MachineState *s)
-{
-    return !g_strcmp0(s->board, "ze0");
 }
 
 static char *qy8_board_get(Object *obj, Error **errp)
