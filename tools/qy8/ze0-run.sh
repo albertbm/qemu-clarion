@@ -7,8 +7,8 @@ set -u
 secs=$1; out=$2; shift 2
 here=$(cd "$(dirname "$0")/../.." && pwd)
 qemu=${QEMU:-$here/build/qemu-system-arm}
-nand=${ZE0_NAND:?set ZE0_NAND to the unit's NAND dump}
-card=${ZE0_CARD:?set ZE0_CARD to the unit's map card image}
+nand=${ZE0_NAND:?set ZE0_NAND to the NAND dump}
+card=${ZE0_CARD:?set ZE0_CARD to the map card image}
 mkdir -p "$out"
 rm -f "$out"/q.sock "$out"/*.log "$out"/screen.png
 

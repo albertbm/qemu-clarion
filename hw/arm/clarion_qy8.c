@@ -1920,6 +1920,7 @@ struct Qy8MachineState {
     bool micom_on;              /* вбудований супутній МК на SCIF4 */
     bool dispmicom_on;          /* вбудований МК панелі на SCIF1 */
     char *board;                /* "ze1" (QY8602NB) or "ze0" (QY8202NA) */
+    char *gpio_in;              /* "BANK:MASK,..." input pins held high */
 
     MemoryRegion flash;          /* лише коли флеш подано як ROM */
     DriveInfo *flash_drive;      /* -drive if=pflash: записувана копія */
@@ -1966,6 +1967,35 @@ static void qy8_usb_irq(void *opaque, int n, int level)
     }
     qemu_set_irq(qdev_get_gpio_in(s->gic, QY8_USB_SPI),
                  s->int2_usb.pending != 0);
+}
+
+/* gpio-in=BANK:MASK,... holds those input pins high, e.g. harness signals */
+static uint32_t qy8_gpio_in_override(Qy8MachineState *s, int bank)
+{
+    g_auto(GStrv) items = s->gpio_in ? g_strsplit(s->gpio_in, ",", -1) : NULL;
+    uint32_t mask = 0;
+
+    for (int i = 0; items && items[i]; i++) {
+        char *colon = strchr(items[i], ':');
+
+        if (colon && g_ascii_strtoull(items[i], NULL, 0) == (guint64)bank) {
+            mask |= g_ascii_strtoull(colon + 1, NULL, 0);
+        }
+    }
+    return mask;
+}
+
+static char *qy8_gpio_in_get(Object *obj, Error **errp)
+{
+    return g_strdup(QY8_MACHINE(obj)->gpio_in);
+}
+
+static void qy8_gpio_in_set(Object *obj, const char *value, Error **errp)
+{
+    Qy8MachineState *s = QY8_MACHINE(obj);
+
+    g_free(s->gpio_in);
+    s->gpio_in = g_strdup(value);
 }
 
 /* the 2014-2017 ZE0 unit, QY8202NA: same SoC, different board peripherals */
@@ -2311,7 +2341,7 @@ static void qy8_init(MachineState *machine)
         char *name = g_strdup_printf("qy8.gpio%d", i);
 
         g->bank = i;
-        g->in_level = qy8_gpio_in_level[i];
+        g->in_level = qy8_gpio_in_level[i] | qy8_gpio_in_override(s, i);
         g->in = qemu_allocate_irqs(qy8_gpio_set_input, g, 32);
         g->irq = qemu_allocate_irq(qy8_gpio_irq, s, i);
         memory_region_init_io(&g->mr, NULL, &qy8_gpio_ops, g, name, 0x1000);
@@ -2629,6 +2659,10 @@ static void qy8_machine_instance_init(Object *obj)
                                    OBJ_PROP_FLAG_READWRITE);
     object_property_set_description(obj, "du-dotclk",
         "точкова частота DU в Гц (0 = кадровий такт вимкнено)");
+
+    object_property_add_str(obj, "gpio-in", qy8_gpio_in_get, qy8_gpio_in_set);
+    object_property_set_description(obj, "gpio-in",
+        "BANK:MASK,... GPIO input pins held high");
 
     s->board = g_strdup("ze1");
     object_property_add_str(obj, "board", qy8_board_get, qy8_board_set);
