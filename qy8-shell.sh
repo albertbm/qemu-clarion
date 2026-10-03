@@ -19,6 +19,9 @@ if [ -z "$nand" ] || [ -z "$card" ]; then
     sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
     exit 1
 fi
+for f in "$nand" "$card"; do
+    [ -f "$f" ] || { echo "no such file: $f" >&2; exit 1; }
+done
 case $board in
     ze0) glsyms=$here/contrib/plugins/qy8gl-g214.syms ;;
     ze1) glsyms=$here/contrib/plugins/qy8gl.syms ;;
@@ -38,7 +41,8 @@ cp "$nand" "$work/nand.bin"
 if [ -z "$KEEP_VEUP" ]; then
     printf '\x00\x00' | dd of="$work/nand.bin" bs=1 seek=$((0x100010)) conv=notrunc 2>/dev/null
 fi
-cp -c "$card" "$work/card.img" 2>/dev/null || cp --reflink=auto "$card" "$work/card.img"
+# clone instead of copying 16 GB where the filesystem allows it
+if [ "$(uname)" = Darwin ]; then cp -c "$card" "$work/card.img"; else cp --reflink=auto "$card" "$work/card.img"; fi
 truncate -s 16G "$work/card.img"
 
 # software-render the AUI's GL calls; the immobiliser check reads as

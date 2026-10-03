@@ -9,13 +9,20 @@ here=$(cd "$(dirname "$0")/../.." && pwd)
 qemu=${QEMU:-$here/build/qemu-system-arm}
 nand=${ZE0_NAND:?set ZE0_NAND to the NAND dump}
 card=${ZE0_CARD:?set ZE0_CARD to the map card image}
+for f in "$nand" "$card"; do
+    [ -f "$f" ] || { echo "no such file: $f" >&2; exit 1; }
+done
 mkdir -p "$out"
 rm -f "$out"/q.sock "$out"/*.log "$out"/screen.png
 
 # copies only: the guest writes flash and card. Clear VEUP's update request.
 cp "$nand" "$out/nand.bin"
 printf '\x00\x00' | dd of="$out/nand.bin" bs=1 seek=$((0x100010)) conv=notrunc 2>/dev/null
-[ -f "$out/card.img" ] || { cp -c "$card" "$out/card.img" 2>/dev/null || cp --reflink=auto "$card" "$out/card.img"; truncate -s 16G "$out/card.img"; }
+if [ ! -f "$out/card.img" ]; then
+    # clone instead of copying 16 GB where the filesystem allows it
+    if [ "$(uname)" = Darwin ]; then cp -c "$card" "$out/card.img"; else cp --reflink=auto "$card" "$out/card.img"; fi
+    truncate -s 16G "$out/card.img"
+fi
 
 cat "$here/contrib/plugins/qy8dbg.syms" > "$out/syms"
 if [ -n "${GL:-}" ]; then
