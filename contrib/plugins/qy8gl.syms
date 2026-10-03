@@ -184,3 +184,5 @@
 904 0x40e46ce4 eglSurfaceAttribREL
 905 0x40044388 CreateDIBSection
 906 0x4002c824 CreateBitmap
+# SYS_INF.dll config store (NK1), for the cnf= override
+2004 0x40296094 SYS_CNF_read

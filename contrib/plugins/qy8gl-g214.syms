@@ -187,3 +187,5 @@
 0 0x411b3f40 @fs_keyed_a
 0 0x411b4648 @fs_keyed_b
 0 0x411b4ce0 @fs_tint
+# SYS_INF.dll config store (NK1), for the cnf= override
+2004 0x4029604c SYS_CNF_read
