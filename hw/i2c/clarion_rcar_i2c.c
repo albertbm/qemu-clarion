@@ -642,10 +642,11 @@ static void clarion_tma460_pointer_event(DeviceState *dev, QemuConsole *src,
             s->pointer_valid = true;
             s->pointer_dirty = true;
         } else if (evt->abs.axis == INPUT_AXIS_Y) {
-            s->pointer_y = qemu_input_scale_axis(evt->abs.value,
-                                                 INPUT_EVENT_ABS_MIN,
-                                                 INPUT_EVENT_ABS_MAX,
-                                                 0, 479);
+            /* kepdrv.dll mirrors Y before it posts WM_LBUTTON* */
+            s->pointer_y = 479 - qemu_input_scale_axis(evt->abs.value,
+                                                       INPUT_EVENT_ABS_MIN,
+                                                       INPUT_EVENT_ABS_MAX,
+                                                       0, 479);
             s->pointer_valid = true;
             s->pointer_dirty = true;
         }
