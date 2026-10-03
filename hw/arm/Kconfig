@@ -745,3 +745,5 @@ config CLARION_QY8
     select CLARION_DISPMICOM
     select RENESAS_SDHI
     select RENESAS_CAN
+    select USB_EHCI_SYSBUS
+    select USB_OHCI_SYSBUS
