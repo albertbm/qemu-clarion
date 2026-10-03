@@ -21,7 +21,7 @@ No firmware ships with it. You need a NAND dump and a map card image from your o
 | Camera video, audio, CAN vehicle data | no | no |
 
 The map stays blank: `Navi.exe` draws it through `XGLDLL.dll` on the GPU, and that path isn't
-emulated. The ZE0 sometimes starts in the rear camera view.
+emulated.
 
 ## What you need
 
@@ -75,6 +75,9 @@ Debug shell commands take `<app id> <command>`. Useful ones: `00 ti` (unit info)
 - SD host: CSD/CID responses were shifted by a byte, DMA reads of the data port came back as zeros,
   and multi-block reads never sent CMD12.
 - SCIF transmit interrupt, without which the debug shell stalled.
+- Board controller inputs: reverse, parking brake and illumination read as out of reverse, brake on,
+  lights off. Left at zero they read as in reverse and the ZE0 started in the rear camera view. Type
+  `qom-set /machine reverse on` in the monitor (Ctrl-A C) to shift into reverse.
 - SGX heartbeat: the host driver's lockup watchdog reset the GPU hundreds of times per boot.
 - `contrib/plugins/qy8gl.c`: hooks the UI's OpenGL ES calls at their fixed ROM addresses
   (`qy8gl.syms` for nav image G218ENNI, `qy8gl-g214.syms` for G214ELNI), draws its textured quads

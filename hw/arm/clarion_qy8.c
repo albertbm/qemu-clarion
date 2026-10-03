@@ -234,6 +234,16 @@ static int qy8_scif_chr_index(int scif)
 #define BCTL_ST_BOOT        0x0400
 
 /*
+ * Vehicle inputs in the same word, from GPIO.dll's register reader (ZE0
+ * @0xEF6F31E0, ZE1 @0xEF6C3204): IOCTL_GPIO_ACCESS_* -> ldrh [base] >> bit.
+ * GPIO.dll polls them and signals EVT_GPIO_* on a change. All active low.
+ * ST_PWR is IGN (bit 7) and ST_BOOT is NAVI_ON (bit 10) in the same table.
+ */
+#define BCTL_ST_PKB         0x0020      /* bit 5: 0 = parking brake on */
+#define BCTL_ST_ILL         0x0200      /* bit 9: ILL_MR, 0 = lights on */
+#define BCTL_ST_RV          0x1000      /* bit 12: 0 = in reverse */
+
+/*
  * Card-detect обох слотів SD живе в тому самому 16-бітному слові, що й DIPSW.
  * Знято з бітових аксесорів `GPIO.dll` (читання vtbl+0x1C0 @VA 0xEF6C3204,
  * запис vtbl+0x1C4 @0xEF6C3850; base = змаплений PA 0x18800000):
@@ -1921,6 +1931,7 @@ struct Qy8MachineState {
     bool dispmicom_on;          /* вбудований МК панелі на SCIF1 */
     char *board;                /* "ze1" (QY8602NB) or "ze0" (QY8202NA) */
     char *gpio_in;              /* "BANK:MASK,..." input pins held high */
+    bool reverse;               /* RV input, machine property */
 
     MemoryRegion flash;          /* лише коли флеш подано як ROM */
     DriveInfo *flash_drive;      /* -drive if=pflash: записувана копія */
@@ -2002,6 +2013,31 @@ static void qy8_gpio_in_set(Object *obj, const char *value, Error **errp)
 static bool qy8_is_ze0(Qy8MachineState *s)
 {
     return !g_strcmp0(s->board, "ze0");
+}
+
+/* Parking brake on, lights off; reverse as the property says */
+static void qy8_bctl_set_inputs(Qy8MachineState *s)
+{
+    uint16_t *st = &s->bctl.reg[BCTL_STATUS >> 1];
+
+    *st = (*st & ~(BCTL_ST_PKB | BCTL_ST_RV)) | BCTL_ST_ILL;
+    if (!s->reverse) {
+        *st |= BCTL_ST_RV;
+    }
+}
+
+static bool qy8_reverse_get(Object *obj, Error **errp)
+{
+    return QY8_MACHINE(obj)->reverse;
+}
+
+/* GPIO.dll polls the word, so qom-set at run time shifts into reverse */
+static void qy8_reverse_set(Object *obj, bool value, Error **errp)
+{
+    Qy8MachineState *s = QY8_MACHINE(obj);
+
+    s->reverse = value;
+    qy8_bctl_set_inputs(s);
 }
 
 static void qy8_gpio_irq(void *opaque, int bank, int level)
@@ -2355,6 +2391,7 @@ static void qy8_init(MachineState *machine)
 
     /* --- контролер плати: DIPSW і дозвіл виходу зі standby --- */
     s->bctl.reg[BCTL_STATUS >> 1] = BCTL_ST_PWR | BCTL_ST_BOOT;
+    qy8_bctl_set_inputs(s);
     s->bctl.reg[BCTL_DIPSW >> 1] = s->dipsw & 7;
     memory_region_init_io(&s->bctl.mr, NULL, &qy8_bctl_ops, &s->bctl,
                           "qy8.bctl", QY8_BCTL_SIZE);
@@ -2663,6 +2700,11 @@ static void qy8_machine_instance_init(Object *obj)
     object_property_add_str(obj, "gpio-in", qy8_gpio_in_get, qy8_gpio_in_set);
     object_property_set_description(obj, "gpio-in",
         "BANK:MASK,... GPIO input pins held high");
+
+    object_property_add_bool(obj, "reverse", qy8_reverse_get,
+                             qy8_reverse_set);
+    object_property_set_description(obj, "reverse",
+        "reverse gear input (RV), off by default");
 
     s->board = g_strdup("ze1");
     object_property_add_str(obj, "board", qy8_board_get, qy8_board_set);
