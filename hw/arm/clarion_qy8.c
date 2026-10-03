@@ -1923,7 +1923,7 @@ struct Qy8MachineState {
     bool i2c4_on;               /* opt-in bounded R-Car I2C4 model */
     bool i2c4_recorder_on;      /* opt-in I2C4 transaction recorder */
     bool tma460_on;             /* opt-in bounded TMA460 model */
-    bool tma460_synthetic_profile_on; /* opt-in T147 profile */
+    bool tma460_synthetic_profile_on; /* opt-in synthetic profile */
     bool i2c_empty_on;          /* opt-in: I2C0..I2C2 з порожньою шиною */
 
     MemoryRegion flash;          /* лише коли флеш подано як ROM */
@@ -2694,7 +2694,7 @@ static void qy8_machine_instance_init(Object *obj)
                              qy8_tma460_profile_get,
                              qy8_tma460_profile_set);
     object_property_set_description(obj, "tma460-profile",
-        "opt-in T147 мінімальний synthetic System Mode profile");
+        "opt-in мінімальний synthetic System Mode profile");
 }
 
 static void qy8_machine_class_init(ObjectClass *oc, const void *data)

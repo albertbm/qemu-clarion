@@ -78,55 +78,79 @@ struct ClarionTma460 {
     bool reset_released;
     bool ready_pulsed;
     bool synthetic_profile;
-    bool sysinfo_pending;
-    bool sysinfo_delivered;
+    bool system_header_active;
     bool profile_read_active;
     bool mode_write_pending;
     uint8_t mode_register;
     uint8_t mode_write_value;
 };
 
-/* T147 chosen selectors/lengths; TARGET-constrained values are annotated. */
-static const uint8_t clarion_tma460_t147_sysinfo[16] = {
-    [0] = 0x10, /* TARGET: hdr[0] bit 0x10 accepts System Mode. */
-    [1] = 0x00, /* SYNTHETIC: unconsumed header byte. */
-    [2] = 0x00, /* SYNTHETIC: high byte of required nonzero read-8 length. */
-    [3] = 0x01, /* TARGET: read-8 length must be nonzero. */
-    [4] = 0x00, /* SYNTHETIC: high byte of selector A1=0x20. */
-    [5] = 0x20, /* SYNTHETIC: A1 selector, below 0x100. */
-    [6] = 0x00, /* SYNTHETIC: high byte of A2=0x4a. */
-    [7] = 0x4a, /* SYNTHETIC: A2-A1=0x2a (TARGET constraint). */
-    [8] = 0x00, /* SYNTHETIC: high byte of A3=0x50. */
-    [9] = 0x50, /* SYNTHETIC: A3 selector, below 0x100. */
-    [10] = 0x00, /* SYNTHETIC: high byte of A4=0x60. */
-    [11] = 0x60, /* SYNTHETIC: A4 selector, below 0x100. */
-    [12] = 0x00, /* SYNTHETIC: high byte of A5=0x70. */
-    [13] = 0x70, /* SYNTHETIC: A5 selector, below 0x100. */
-    [14] = 0x00, /* SYNTHETIC: high byte of A6=0x71. */
-    [15] = 0x71, /* SYNTHETIC: A6-A5=1 (TARGET constraint). */
+/* Profile values accepted by the target-side System Mode parser. */
+static const uint8_t clarion_tma460_profile_sysinfo[16] = {
+    0x10, 0x00, 0x00, 0x01, 0x00, 0x20, 0x00, 0x4a,
+    0x00, 0x50, 0x00, 0x60, 0x00, 0x70, 0x00, 0x71,
 };
 
-/* The sole nonzero config payload is cfg[8], constrained to stride 10. */
-static uint8_t clarion_tma460_t147_config_byte(uint8_t selector)
-{
-    switch (selector) {
-    case 0x60: return 0x70; /* SYNTHETIC: cfg[0], report selector. */
-    case 0x61: return 0x71; /* SYNTHETIC: cfg[1], one-byte report span. */
-    case 0x64: return 0x00; /* TARGET: cfg[4]=0 avoids unmodeled extra reads. */
-    case 0x66: return 0x00; /* TARGET: cfg[6]&1=0 avoids gesture path. */
-    case 0x68: return 0x0a; /* TARGET: cfg[8]=10 point-record stride. */
-    default: return 0x00;   /* SYNTHETIC: all unconstrained profile bytes zero. */
-    }
-}
+#define TMA460_PROFILE_A1 0x20
+#define TMA460_PROFILE_L  0x10
+#define TMA460_PROFILE_A2 0x4a
+#define TMA460_PROFILE_A4 0x60
+#define TMA460_PROFILE_A5 0x70
+#define TMA460_PROFILE_A6 0x71
 
-static uint8_t clarion_tma460_t147_register_byte(uint8_t selector)
+static const uint8_t clarion_tma460_profile_registers[256] = {
+    [TMA460_PROFILE_A1 + 0x12] = TMA460_PROFILE_L,
+    [TMA460_PROFILE_A4] = TMA460_PROFILE_A5,
+    [TMA460_PROFILE_A4 + 1] = TMA460_PROFILE_A6,
+    [TMA460_PROFILE_A4 + 8] = 0x0a,
+};
+
+typedef struct ClarionTma460ProfileMap {
+    uint8_t selector;
+    uint8_t length;
+    const uint8_t *data;
+    bool mode_register;
+    const uint8_t *system_header;
+    uint8_t system_header_length;
+} ClarionTma460ProfileMap;
+
+/* The sole selector/length/data table for the synthetic profile. */
+static const ClarionTma460ProfileMap clarion_tma460_profile_map[] = {
+    { 0x00, 2, NULL, true, clarion_tma460_profile_sysinfo,
+      sizeof(clarion_tma460_profile_sysinfo) },
+    { TMA460_PROFILE_A1, 0x2a,
+      clarion_tma460_profile_registers + TMA460_PROFILE_A1, false },
+    { TMA460_PROFILE_A1 + 0x13, 0x10,
+      clarion_tma460_profile_registers + TMA460_PROFILE_A1 + 0x13, false },
+    { TMA460_PROFILE_A1 + TMA460_PROFILE_L + 0x15, 5,
+      clarion_tma460_profile_registers + TMA460_PROFILE_A1 +
+          TMA460_PROFILE_L + 0x15, false },
+    { TMA460_PROFILE_A2, 2,
+      clarion_tma460_profile_registers + TMA460_PROFILE_A2, false },
+    { TMA460_PROFILE_A4 - 0x10, 0x0d,
+      clarion_tma460_profile_registers + TMA460_PROFILE_A4 - 0x10, false },
+    { TMA460_PROFILE_A4, 0x22,
+      clarion_tma460_profile_registers + TMA460_PROFILE_A4, false },
+    { TMA460_PROFILE_A5, 1,
+      clarion_tma460_profile_registers + TMA460_PROFILE_A5, false },
+    { TMA460_PROFILE_A6, 2,
+      clarion_tma460_profile_registers + TMA460_PROFILE_A6, false },
+    { 0x01, 1, clarion_tma460_profile_registers + 0x01, false },
+    { 0x02, 10, clarion_tma460_profile_registers + 0x02, false },
+    { 0x03, 0x80, clarion_tma460_profile_registers + 0x03, false },
+};
+
+static const ClarionTma460ProfileMap *
+clarion_tma460_profile_map_find(uint8_t selector)
 {
-    switch (selector) {
-    case 0x32:
-        return 0x10; /* TARGET: blk1[0x12] == L == 0x10. */
-    default:
-        return clarion_tma460_t147_config_byte(selector);
+    size_t i;
+
+    for (i = 0; i < ARRAY_SIZE(clarion_tma460_profile_map); i++) {
+        if (clarion_tma460_profile_map[i].selector == selector) {
+            return &clarion_tma460_profile_map[i];
+        }
     }
+    return NULL;
 }
 
 static const uint8_t clarion_tma460_enter_active[9] = {
@@ -137,12 +161,9 @@ static const uint8_t clarion_tma460_exit_bootloader[9] = {
     0x00, 0xff, 0x01, 0x3b, 0x00, 0x00, 0x4f, 0x6d, 0x17,
 };
 
-static const uint8_t clarion_tma460_t147_handshake_write[5] = {
-    0x00, /* TARGET: selector 0x03 payload byte 0. */
-    0x00, /* TARGET: selector 0x03 payload byte 1. */
-    0x00, /* TARGET: selector 0x03 payload byte 2. */
-    0x80, /* TARGET: selector 0x03 payload byte 3. */
-    0x00, /* TARGET: selector 0x03 payload byte 4. */
+/* Target-constrained selector 0x03 handshake payload. */
+static const uint8_t clarion_tma460_profile_handshake_write[5] = {
+    0x00, 0x00, 0x00, 0x80, 0x00,
 };
 
 static int clarion_i2c4_recorder_event(I2CSlave *slave, enum i2c_event event)
@@ -214,6 +235,7 @@ static int clarion_tma460_event(I2CSlave *slave, enum i2c_event event)
         s->response_index = 0;
         s->response_active = false;
         s->profile_read_active = false;
+        s->system_header_active = false;
         s->mode_write_pending = false;
         qemu_log_mask(LOG_UNIMP,
                       "clarion-tma460: start(0x24, write)\n");
@@ -221,6 +243,7 @@ static int clarion_tma460_event(I2CSlave *slave, enum i2c_event event)
     case I2C_START_RECV:
         s->response_index = 0;
         s->profile_read_active = false;
+        s->system_header_active = false;
         s->response_active = s->command_pending && s->selector_valid &&
                              s->selector == 0x00 && s->command_len == 1;
         if (s->exit_response_delivered && s->selector_valid &&
@@ -232,8 +255,8 @@ static int clarion_tma460_event(I2CSlave *slave, enum i2c_event event)
                     return 1;
                 }
             } else {
-                s->sysinfo_pending = s->selector == 0x00 &&
-                                     !s->sysinfo_delivered;
+                s->system_header_active = s->selector == 0x00 &&
+                                     s->mode_register == 0x10;
                 s->profile_read_active = true;
             }
         }
@@ -250,32 +273,18 @@ static int clarion_tma460_event(I2CSlave *slave, enum i2c_event event)
                       s->response_active ? "EnterActiveState" : "selector-read");
         if (s->response_active) {
             s->response_len = s->command[3] == 0x3b ? 7 : 15;
-        } else if (s->profile_read_active && s->sysinfo_pending) {
-            s->response_len = sizeof(clarion_tma460_t147_sysinfo);
-        } else if (s->profile_read_active && s->selector == 0x20) {
-            s->response_len = 0x2a;
-        } else if (s->profile_read_active && s->selector == 0x33) {
-            s->response_len = 0x10;
-        } else if (s->profile_read_active && s->selector == 0x45) {
-            s->response_len = 5;
-        } else if (s->profile_read_active && s->selector == 0x4a) {
-            s->response_len = 2;
-        } else if (s->profile_read_active && s->selector == 0x50) {
-            s->response_len = 0x0d;
-        } else if (s->profile_read_active && s->selector == 0x60) {
-            s->response_len = 0x22;
-        } else if (s->profile_read_active && s->selector == 0x70) {
-            s->response_len = 1;
-        } else if (s->profile_read_active && s->selector == 0x71) {
-            s->response_len = 2;
-        } else if (s->profile_read_active && s->selector == 0x00) {
-            s->response_len = 2;
-        } else if (s->profile_read_active && s->selector == 0x01) {
-            s->response_len = 1;
-        } else if (s->profile_read_active && s->selector == 0x02) {
-            s->response_len = 10;
-        } else if (s->profile_read_active && s->selector == 0x03) {
-            s->response_len = 0x80;
+        } else if (s->profile_read_active) {
+            const ClarionTma460ProfileMap *entry =
+                clarion_tma460_profile_map_find(s->selector);
+
+            if (!entry) {
+                qemu_log_mask(LOG_UNIMP,
+                              "clarion-tma460: NACK unsupported profile selector=0x%02x\n",
+                              s->selector);
+                return 1;
+            }
+            s->response_len = s->system_header_active ?
+                entry->system_header_length : entry->length;
         } else {
             s->response_len = 1;
         }
@@ -287,16 +296,12 @@ static int clarion_tma460_event(I2CSlave *slave, enum i2c_event event)
         if (s->response_active) {
             if (s->command[3] == 0x3b) {
                 s->exit_response_delivered = true;
+                if (s->synthetic_profile) {
+                    s->mode_register = 0x10;
+                }
             }
             s->command_pending = false;
             s->response_active = false;
-        }
-        if (s->profile_read_active && s->sysinfo_pending &&
-            s->response_index == sizeof(clarion_tma460_t147_sysinfo)) {
-            s->sysinfo_pending = false;
-            s->sysinfo_delivered = true;
-            qemu_log_mask(LOG_UNIMP,
-                          "clarion-tma460: T147 System Mode profile delivered (16 bytes)\n");
         }
         if (s->mode_write_pending) {
             uint8_t mode = s->mode_write_value & 0x78;
@@ -306,13 +311,13 @@ static int clarion_tma460_event(I2CSlave *slave, enum i2c_event event)
                 /* TARGET: §2 register-0 command constants and readback modes. */
                 s->mode_register = mode & 0x70;
                 qemu_log_mask(LOG_UNIMP,
-                              "clarion-tma460: T147 register 0 mode write=0x%02x readback=0x%02x\n",
+                              "clarion-tma460: profile register 0 mode write=0x%02x readback=0x%02x\n",
                               s->mode_write_value, s->mode_register);
                 /* TARGET: §2 mode transition wakes event [+0x1ac]. */
                 qemu_irq_raise(s->irq);
                 qemu_irq_lower(s->irq);
                 qemu_log_mask(LOG_UNIMP,
-                              "clarion-tma460: T147 mode-change IRQ pulse\n");
+                              "clarion-tma460: profile mode-change IRQ pulse\n");
             }
             s->mode_write_pending = false;
         }
@@ -343,10 +348,8 @@ static int clarion_tma460_send(I2CSlave *slave, uint8_t data)
 
     if (!s->command_len) {
         if (data != 0x00 && data != 0x01 &&
-            !(s->synthetic_profile && (data == 0x02 || data == 0x03 ||
-              data == 0x20 || data == 0x33 || data == 0x45 ||
-              data == 0x4a || data == 0x50 || data == 0x60 ||
-              data == 0x70 || data == 0x71))) {
+            !(s->synthetic_profile &&
+              clarion_tma460_profile_map_find(data))) {
             qemu_log_mask(LOG_UNIMP,
                           "clarion-tma460: NACK unsupported selector=0x%02x\n",
                           data);
@@ -370,18 +373,18 @@ static int clarion_tma460_send(I2CSlave *slave, uint8_t data)
         s->command[1] = data;
         s->command_len = 2;
         qemu_log_mask(LOG_UNIMP,
-                      "clarion-tma460: T147 register 0 write byte=0x%02x ACK\n",
+                      "clarion-tma460: profile register 0 write byte=0x%02x ACK\n",
                       data);
         return 0;
     }
 
     if (s->synthetic_profile && s->selector == 0x03 &&
         s->command_len >= 1 && s->command_len <= 5 &&
-        data == clarion_tma460_t147_handshake_write[s->command_len - 1]) {
+        data == clarion_tma460_profile_handshake_write[s->command_len - 1]) {
         /* TARGET: §2 handshake-enable transaction writes exactly 5 bytes. */
         s->command[s->command_len++] = data;
         qemu_log_mask(LOG_UNIMP,
-                      "clarion-tma460: T147 handshake selector 0x03 payload[%u]=0x%02x ACK\n",
+                      "clarion-tma460: profile handshake selector 0x03 payload[%u]=0x%02x ACK\n",
                       s->command_len - 2, data);
         return 0;
     }
@@ -392,7 +395,7 @@ static int clarion_tma460_send(I2CSlave *slave, uint8_t data)
         s->command[1] = data;
         s->command_len = 2;
         qemu_log_mask(LOG_UNIMP,
-                      "clarion-tma460: T147 handshake selector 0x02 payload=0x03 ACK\n");
+                      "clarion-tma460: profile handshake selector 0x02 payload=0x03 ACK\n");
         return 0;
     }
 
@@ -450,19 +453,19 @@ static uint8_t clarion_tma460_recv(I2CSlave *slave)
     }
 
     if (s->synthetic_profile && s->profile_read_active) {
-        uint8_t value = 0; /* SYNTHETIC: default bytes are zero. */
+        const ClarionTma460ProfileMap *entry =
+            clarion_tma460_profile_map_find(s->selector);
+        uint8_t value = 0;
 
-        if (s->sysinfo_pending) {
-            value = clarion_tma460_t147_sysinfo[s->response_index];
-        } else if (s->selector == 0x00) {
-            /* TARGET: §2 register readback tests; minimal branch values. */
+        if (s->system_header_active && entry && entry->system_header) {
+            value = entry->system_header[s->response_index];
+        } else if (entry && entry->mode_register) {
             value = s->response_index == 0 ? s->mode_register : 0;
-        } else {
-            value = clarion_tma460_t147_register_byte(
-                s->selector + s->response_index);
+        } else if (entry && entry->data) {
+            value = entry->data[s->response_index];
         }
         qemu_log_mask(LOG_UNIMP,
-                      "clarion-tma460: T147 read selector=0x%02x response[%u]=0x%02x\n",
+                      "clarion-tma460: profile read selector=0x%02x response[%u]=0x%02x\n",
                       s->selector, s->response_index, value);
         s->response_index++;
         return value;
@@ -518,8 +521,6 @@ void clarion_tma460_set_reset(DeviceState *dev, bool gpio_level)
 
     if (!release) {
         s->ready_pulsed = false;
-        s->sysinfo_pending = false;
-        s->sysinfo_delivered = false;
         s->mode_register = 0; /* SYNTHETIC: chosen initial register-0 status. */
         return;
     }
@@ -538,9 +539,10 @@ void clarion_tma460_set_synthetic_profile(DeviceState *dev, bool enabled)
     ClarionTma460 *s = CLARION_TMA460(dev);
 
     s->synthetic_profile = enabled;
-    qemu_log_mask(LOG_UNIMP,
-                  "clarion-tma460: T147 synthetic profile %s\n",
-                  enabled ? "enabled" : "disabled");
+    if (enabled) {
+        qemu_log_mask(LOG_UNIMP,
+                      "clarion-tma460: profile enabled\n");
+    }
 }
 
 static void clarion_rcar_i2c4_update_irq(ClarionRcarI2C4State *s)
