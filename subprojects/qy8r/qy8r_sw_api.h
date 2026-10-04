@@ -1,0 +1,39 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+#ifndef QY8R_SW_API_H
+#define QY8R_SW_API_H
+
+#define qy8r_open qy8r_sw_open
+#define qy8r_close qy8r_sw_close
+#define qy8r_get_info qy8r_sw_get_info
+#define qy8r_get_caps qy8r_sw_get_caps
+#define qy8r_program_create qy8r_sw_program_create
+#define qy8r_program_destroy qy8r_sw_program_destroy
+#define qy8r_target_create qy8r_sw_target_create
+#define qy8r_target_destroy qy8r_sw_target_destroy
+#define qy8r_target_bind qy8r_sw_target_bind
+#define qy8r_viewport qy8r_sw_viewport
+#define qy8r_clear qy8r_sw_clear
+#define qy8r_use_program qy8r_sw_use_program
+#define qy8r_uniform_f32 qy8r_sw_uniform_f32
+#define qy8r_uniform_i32 qy8r_sw_uniform_i32
+#define qy8r_texture_rgba32f qy8r_sw_texture_rgba32f
+#define qy8r_begin_draw qy8r_sw_begin_draw
+#define qy8r_attribute_f32 qy8r_sw_attribute_f32
+#define qy8r_draw_arrays qy8r_sw_draw_arrays
+#define qy8r_blend_state qy8r_sw_blend_state
+#define qy8r_draw_points qy8r_sw_draw_points
+#define qy8r_draw_transform_feedback qy8r_sw_draw_transform_feedback
+#define qy8r_read_rgba8 qy8r_sw_read_rgba8
+#define qy8r_read_rgba8_rect qy8r_sw_read_rgba8_rect
+#define qy8r_read_rgba32f qy8r_sw_read_rgba32f
+#define qy8r_texture_upload_rgba8 qy8r_sw_texture_upload_rgba8
+#define qy8r_texture_parameter qy8r_sw_texture_parameter
+#define qy8r_texture_bind qy8r_sw_texture_bind
+#define qy8r_target_copy_texture qy8r_sw_target_copy_texture
+#define qy8r_bind_target_texture qy8r_sw_bind_target_texture
+#define qy8r_texture_set_sampler qy8r_sw_texture_set_sampler
+#define qy8r_last_error qy8r_sw_last_error
+
+#include "qy8r_backend.h"
+
+#endif
