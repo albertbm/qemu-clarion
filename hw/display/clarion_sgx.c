@@ -4034,10 +4034,10 @@ static void sgx_parse_find(ClarionSgxState *s, const char *spec)
 }
 
 /*
- * The real microkernel bumps a timer counter in HOST_CTL (+0x40) from its
- * own timer task. SGXOSTimer in the host driver treats a zero or frozen
- * counter as a lockup and resets the GPU every few ticks, which leaves the
- * AUI's GL calls failing. Bump it here so the driver sees a live core.
+ * The real microkernel appears to bump a timer counter in HOST_CTL (+0x40)
+ * from its own timer task. The relationship between this field and the
+ * microkernel timer is unproven on target (the DDK field resembles
+ * ui32OpenCLDelayCount), so this synthetic heartbeat is opt-in only.
  */
 #define SGX_HOSTCTL_UKERNEL_CLOCK   0x40
 #define SGX_HEARTBEAT_MS            10
@@ -4124,7 +4124,7 @@ static void clarion_sgx_realize(DeviceState *dev, Error **errp)
     }
 
     e = getenv("QY8_SGX_HEARTBEAT");
-    if (!e || (strcmp(e, "off") && strcmp(e, "0"))) {
+    if (e && (!strcmp(e, "on") || !strcmp(e, "1"))) {
         s->heartbeat = timer_new_ms(QEMU_CLOCK_VIRTUAL, sgx_heartbeat, s);
         timer_mod(s->heartbeat,
                   qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + SGX_HEARTBEAT_MS);
