@@ -8,6 +8,7 @@ Local tooling for the Clarion QY8 (Nissan Leaf ZE1) emulator. Boot it with `../.
 | `qmp.py SOCK 'hmp cmd'...` | runs monitor commands over a QMP socket, e.g. `screendump out.png -f png` |
 | `shell.py SOCK SECS cmd...` | waits for boot output, then types debug-shell commands and prints the replies |
 | `tap.py SOCK X Y` | taps screen pixel X,Y (800x480) through QMP input events; the touch panel model turns it into a touch |
+| `ublox.py LAT LON [SPEED_KN] [COURSE]` | stands in for the GNSS receiver so the unit gets a fix; see below |
 | `rgba2png.py FILE W H OUT` | turns a frame the GL plugin dumped (`out=DIR`) into a PNG |
 
 ## Rebuilding the GL symbol table
@@ -25,3 +26,53 @@ python3 exports.py NK1.bin gdisub.dll | grep DDWaitForBltDone >> syms
 `libIMGEGL.dll`; `glEGLImageTargetTexture2DOES` is caught at runtime from `eglGetProcAddress`.
 The four fragment-shader addresses at the top of the renderer in `qy8gl.c` are the
 `glShaderBinary` sources inside `auirtdll.dll`.
+## GPS
+
+The unit's GNSS receiver is a u-blox on `SCI2:`. In the emulator SCIF2 is the fourth `-serial`,
+index 3, because the launcher's own `-serial mon:stdio` takes index 0, so two nulls fill 1 and 2:
+
+```
+QY8_ARGS='-serial null -serial null -serial unix:/tmp/gps.sock,server=on,wait=off' \
+    ./qy8-shell.sh NAND CARD
+python3 tools/qy8/ublox.py 52.5200 13.4050
+```
+
+`QY8_GPS_SOCK` moves the socket if `/tmp/gps.sock` does not suit.
+
+Info > GPS Position then shows 11 satellites and the coordinates, and the map moves there. A
+speed in knots and a course make the position walk, so the icon tracks.
+
+Feeding NMEA at the port is not enough, and neither is answering the UBX. `navdrv.dll` only
+frames what arrives: `SetGpsData` reads SCI2 into a 128-byte buffer, `CheckOnePacket` cuts one
+packet out of it and `SetGpsDataBuff` drops it into a 128-slot ring, while `NAV_Read` and
+`NAV_Write` both return -1. Everything goes through `NAV_IOControl`.
+
+`Navi.exe` is the client. It opens `NAV1:` and pumps the device at `0x358314`, up to ten packets
+an event, using `0x8011200c` to read, `0x80112010` to write and `0x80112014` for status. Its log
+tag is `=SNSW=`. The UBX configuration the receiver sees comes from there: `CFG-NAV5` with
+dynModel 4 and fixMode 2, `CFG-GNSS`, four `CFG-MSG`s that enable NAV-POSECEF, NAV-POSLLH and
+NAV-VELNED at 1 Hz and disable NMEA-GNS, then `CFG-CFG` and a `MON-VER` poll.
+
+The NMEA handler at `0x357bd0` parses nothing. It appends each sentence to a 1280-byte block and
+hands the block to the locator only when one arrives whose id ends in `GLL`, which is the only
+NMEA sentence id in `Navi.exe`. A feed without `$GPGLL` grows the block until it overflows and is
+discarded, so the locator never sees a sentence. The unit reads that as a sick receiver and
+reissues `CFG-RST` on a timer, which looks like a cold-start loop and is only the symptom.
+
+Three limits are worth knowing. A packet over 128 bytes is dropped at three separate checks.
+`NavDrv >> GPS:SetGpsDataBuff NAV_BUFFER_FULL` in `gl.log` means the consumer is behind; it
+appears once while `Navi.exe` starts and clears by itself. `SckDrv.cpp SckGpsCheck changed OK`
+means the port is receiving at all.
+
+`Navi.exe` also bounds the fix by mesh primary from a table at va `0xe6558`, Europe being lon
+-20..68, so a position west of 20 W is dropped before the locator sees it and the parser logs
+`GPS without Shipment Area!!`. Test inside the area first.
+
+To trace the driver, `QY8_SYMS` takes an extra symbol file and the launcher concatenates it:
+
+```
+2000 0xef6b5214 NAV_IOControl
+2001 0xef6b7298 SendGpsData
+2002 0xef6b6900 SetGpsDataBuff
+2003 0xef6b64c8 GetGpsData
+```
