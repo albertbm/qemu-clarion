@@ -69,6 +69,7 @@
 #include "qemu/log.h"
 #include "qemu/error-report.h"
 #include "qemu/cutils.h"
+#include "qemu/timer.h"
 #include "hw/core/sysbus.h"
 #include "hw/display/clarion_sgx.h"
 #include "system/address-spaces.h"
@@ -139,6 +140,7 @@ struct ClarionSgxState {
     bool nullrender;            /* QY8_SGX_NULLRENDER: synthetic scene completion */
     bool nullrender_all;        /* =all: правило dst-sync для кожної READY TA-команди */
     bool b2_disabled;           /* image guard failed; disabled for this run */
+    QEMUTimer *heartbeat;       /* stands in for the microkernel's timer task */
     ClarionSgxSyntheticWord b2_synthetic[SGX_B2_SYNTH_MAX];
     unsigned nb2_synthetic;
     ClarionSgxGuestStore b2_stores[SGX_B2_STORE_HISTORY];
@@ -4031,6 +4033,33 @@ static void sgx_parse_find(ClarionSgxState *s, const char *spec)
     }
 }
 
+/*
+ * The real microkernel bumps a timer counter in HOST_CTL (+0x40) from its
+ * own timer task. SGXOSTimer in the host driver treats a zero or frozen
+ * counter as a lockup and resets the GPU every few ticks, which leaves the
+ * AUI's GL calls failing. Bump it here so the driver sees a live core.
+ */
+#define SGX_HOSTCTL_UKERNEL_CLOCK   0x40
+#define SGX_HEARTBEAT_MS            10
+
+static void sgx_heartbeat(void *opaque)
+{
+    ClarionSgxState *s = opaque;
+    uint32_t pd = sgx_reg(s, SGX_CR_BIF_DIR_LIST_BASE0) &
+                  SGX_BIF_DIR_LIST_BASE_ADDR_MASK;
+    uint32_t pa;
+
+    if (s->sa_known[SGX_SA_HOSTCTL] && pd &&
+        sgx_translate(pd, s->sa[SGX_SA_HOSTCTL] + SGX_HOSTCTL_UKERNEL_CLOCK,
+                      &pa)) {
+        uint32_t v = sgx_phys_ld32(pa) + 1;
+
+        sgx_phys_st32(pa, v ? v : 1);
+    }
+    timer_mod(s->heartbeat,
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + SGX_HEARTBEAT_MS);
+}
+
 static void clarion_sgx_realize(DeviceState *dev, Error **errp)
 {
     ClarionSgxState *s = CLARION_SGX(dev);
@@ -4092,6 +4121,13 @@ static void clarion_sgx_realize(DeviceState *dev, Error **errp)
     if (s->readback) {
         fprintf(stderr, "[sgx] ⚠ QY8_SGX_READBACK: читання віддають записане — "
                 "видима гостем поведінка ЗМІНЕНА\n");
+    }
+
+    e = getenv("QY8_SGX_HEARTBEAT");
+    if (!e || (strcmp(e, "off") && strcmp(e, "0"))) {
+        s->heartbeat = timer_new_ms(QEMU_CLOCK_VIRTUAL, sgx_heartbeat, s);
+        timer_mod(s->heartbeat,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + SGX_HEARTBEAT_MS);
     }
 
     memory_region_init_io(&s->mr, OBJECT(dev), &sgx_ops, s,
