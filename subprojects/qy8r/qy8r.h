@@ -16,6 +16,9 @@ int qy8r_get_caps(void *ctx, int *color_buffer_float, int *tf_essl100);
 void *qy8r_program_create(void *ctx, const uint8_t *vs, size_t vs_size,
                           const uint8_t *fs, size_t fs_size, char *log,
                           size_t log_size);
+/* Test wrappers use GLSL; guest rendering uses blob-backed program_create. */
+void *qy8r_program_create_glsl(void *ctx, const char *vs, const char *fs,
+                               char *log, size_t log_size);
 void *qy8r_program_create_tf(void *ctx, const char *vs, const char *fs,
                              const char *const *varyings, int varying_count,
                              char *log, size_t log_size);

@@ -4,6 +4,7 @@
 #define qy8r_get_info qy8r_gl_get_info
 #define qy8r_get_caps qy8r_gl_get_caps
 #define qy8r_program_create qy8r_gl_program_create
+#define qy8r_program_create_glsl qy8r_gl_program_create_glsl
 #define qy8r_program_create_tf qy8r_gl_program_create_tf
 #define qy8r_program_destroy qy8r_gl_program_destroy
 #define qy8r_target_create qy8r_gl_target_create
@@ -454,6 +455,11 @@ void *qy8r_program_create_tf(void *p, const char *vs, const char *fs,
     }
     return program_create(p, vs, fs, varyings, count, log, n);
 }
+void *qy8r_program_create_glsl(void *p, const char *vs, const char *fs,
+                               char *log, size_t n)
+{
+    return program_create(p, vs, fs, NULL, 0, log, n);
+}
 void qy8r_program_destroy(void *p, void *q)
 {
     (void)p;
@@ -807,6 +813,7 @@ const qy8r_backend_ops qy8r_gl_backend = {
     .get_info = qy8r_gl_get_info,
     .get_caps = qy8r_gl_get_caps,
     .program_create = qy8r_gl_program_create,
+    .program_create_glsl = qy8r_gl_program_create_glsl,
     .program_create_tf = qy8r_gl_program_create_tf,
     .program_destroy = qy8r_gl_program_destroy,
     .target_create = qy8r_gl_target_create,

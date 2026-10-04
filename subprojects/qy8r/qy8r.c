@@ -121,6 +121,22 @@ void *qy8r_program_create(void *opaque, const uint8_t *vs, size_t vs_size,
                : NULL;
 }
 
+void *qy8r_program_create_glsl(void *opaque, const char *vs, const char *fs,
+                               char *log, size_t log_size)
+{
+    qy8r_context *context = opaque;
+
+    if (!context || !context->backend->program_create_glsl) {
+        if (log && log_size) {
+            snprintf(log, log_size,
+                     "GLSL program creation is unavailable in this backend");
+        }
+        return NULL;
+    }
+    return context->backend->program_create_glsl(context->state, vs, fs, log,
+                                                 log_size);
+}
+
 void *qy8r_program_create_tf(void *opaque, const char *vs, const char *fs,
                              const char *const *varyings, int count, char *log,
                              size_t log_size)

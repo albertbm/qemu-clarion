@@ -13,6 +13,8 @@ typedef struct qy8r_backend_ops {
     void *(*program_create)(void *context, const uint8_t *vs, size_t vs_size,
                             const uint8_t *fs, size_t fs_size, char *log,
                             size_t log_size);
+    void *(*program_create_glsl)(void *context, const char *vs, const char *fs,
+                                 char *log, size_t log_size);
     void *(*program_create_tf)(void *context, const char *vs, const char *fs,
                                const char *const *varyings, int count,
                                char *log, size_t log_size);

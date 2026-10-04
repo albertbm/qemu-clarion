@@ -1028,6 +1028,7 @@ const qy8r_backend_ops qy8r_sw_backend = {
     .get_info = qy8r_sw_get_info,
     .get_caps = qy8r_sw_get_caps,
     .program_create = qy8r_sw_program_create,
+    .program_create_glsl = NULL,
     .program_create_tf = NULL,
     .program_destroy = qy8r_sw_program_destroy,
     .target_create = qy8r_sw_target_create,
