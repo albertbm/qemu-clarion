@@ -71,6 +71,7 @@
 #include "qemu/cutils.h"
 #include "qemu/timer.h"
 #include "hw/core/sysbus.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/display/clarion_sgx.h"
 #include "system/address-spaces.h"
 #include "qom/object.h"
@@ -91,6 +92,18 @@
 #define SGX_B2_WALK_MAX     8       /* команд TA-CCB за один kick у режимі all */
 #define SGX_B2_CMDTA_SIZE   0x280   /* розмір TA-команди, виміряний live (docs/sgx/89) */
 #define SGX_B2_STORE_HISTORY 512
+#define SGX_CR_EVENT_TIMER 0x0ACC
+#define SGX_CR_EVENT_TIMER_ENABLE (1U << 24)
+#define SGX_CR_EVENT_TIMER_VALUE_MASK 0x00FFFFFFU
+#define SGX_CR_USE0_SERV_EVENT 0x0B10
+#define SGX_CR_USE1_SERV_EVENT 0x0B1C
+/*
+ * Conditional conversion scale: target core clock is not statically known.
+ * At the recorded reload of 200,000 this produces a 1.8 ms virtual tick.
+ * Any tick below the watchdog's roughly 90 ms sample interval is equivalent
+ * for acceptance; this is not a measured target clock.
+ */
+#define SGX_CORE_CLOCK_HZ 111000000ULL
 
 typedef struct ClarionSgxSyntheticWord {
     uint32_t dva;
@@ -141,6 +154,9 @@ struct ClarionSgxState {
     bool nullrender_all;        /* =all: правило dst-sync для кожної READY TA-команди */
     bool b2_disabled;           /* image guard failed; disabled for this run */
     QEMUTimer *heartbeat;       /* stands in for the microkernel's timer task */
+    bool edm_task_register_model;
+    uint64_t edm_timer_start_ns;
+    uint64_t edm_timer_period_ns;
     ClarionSgxSyntheticWord b2_synthetic[SGX_B2_SYNTH_MAX];
     unsigned nb2_synthetic;
     ClarionSgxGuestStore b2_stores[SGX_B2_STORE_HISTORY];
@@ -230,6 +246,19 @@ static uint32_t sgx_reg(ClarionSgxState *s, hwaddr off)
     return s->regs[off / 4];
 }
 
+static uint32_t sgx_edm_task_count(ClarionSgxState *s)
+{
+    uint64_t elapsed;
+
+    if (!s->edm_task_register_model || !s->edm_timer_period_ns ||
+        !(sgx_reg(s, SGX_CR_EVENT_TIMER) & SGX_CR_EVENT_TIMER_ENABLE)) {
+        return 0;
+    }
+
+    elapsed = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->edm_timer_start_ns;
+    return (uint32_t)(elapsed / s->edm_timer_period_ns);
+}
+
 static void sgx_set_reg(ClarionSgxState *s, hwaddr off, uint32_t val)
 {
     if (s->regs_known_mask[off / 4] != UINT32_MAX ||
@@ -239,6 +268,15 @@ static void sgx_set_reg(ClarionSgxState *s, hwaddr off, uint32_t val)
     }
     s->regs[off / 4] = val;
     s->regs_known_mask[off / 4] = UINT32_MAX;
+}
+
+static void sgx_event_timer_write(ClarionSgxState *s, uint32_t val)
+{
+    uint32_t ticks = val & SGX_CR_EVENT_TIMER_VALUE_MASK;
+
+    s->edm_timer_start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->edm_timer_period_ns =
+        ((uint64_t)ticks * NANOSECONDS_PER_SECOND) / SGX_CORE_CLOCK_HZ;
 }
 
 /* Establish only justified bits; unrelated register bits retain their state. */
@@ -289,6 +327,10 @@ static bool sgx_write_event_status(ClarionSgxState *s, uint32_t val)
  */
 static void sgx_reg_side_effects(ClarionSgxState *s, hwaddr off, uint32_t val)
 {
+    if (off == SGX_CR_EVENT_TIMER) {
+        sgx_event_timer_write(s, val);
+    }
+
     switch (off) {
     case SGX_CR_CACHE_CTRL:
         if (val & SGX_CR_CACHE_CTRL_INVALIDATE) {
@@ -3816,7 +3858,10 @@ static uint64_t sgx_read(void *opaque, hwaddr addr, unsigned size)
     ClarionSgxState *s = opaque;
     uint64_t val = 0;
 
-    if (s->readback && size == 4 && addr + 4 <= CLARION_SGX_SIZE) {
+    if (size == 4 && (addr == SGX_CR_USE0_SERV_EVENT ||
+                      addr == SGX_CR_USE1_SERV_EVENT)) {
+        val = addr == SGX_CR_USE0_SERV_EVENT ? sgx_edm_task_count(s) : 0;
+    } else if (s->readback && size == 4 && addr + 4 <= CLARION_SGX_SIZE) {
         val = sgx_reg(s, addr);
     }
 
@@ -3943,6 +3988,8 @@ static void clarion_sgx_reset_hold(Object *obj, ResetType type)
     s->nb2_stores = 0;
     s->b2_store_overflow = false;
     s->b2_disabled = false;
+    s->edm_timer_start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->edm_timer_period_ns = 0;
 
     /*
      * Регістри ідентичності апарат тримає завжди — їх ніхто не «пише», вони
@@ -4034,10 +4081,17 @@ static void sgx_parse_find(ClarionSgxState *s, const char *spec)
 }
 
 /*
- * The real microkernel appears to bump a timer counter in HOST_CTL (+0x40)
- * from its own timer task. The relationship between this field and the
- * microkernel timer is unproven on target (the DDK field resembles
- * ui32OpenCLDelayCount), so this synthetic heartbeat is opt-in only.
+ * Target DDK 1.7 disassembly proves that SGXOSTimer reads HOST_CTL+0x40,
+ * remembers changes, and decrements an unchanged nonzero value to skip
+ * recovery. DDK 1.8 names this field ui32OpenCLDelayCount. This legacy
+ * opt-in therefore remains a diagnostic shim, not the modeled task counter.
+ *
+ * Target static disassembly shows the timer callback reading two configured
+ * USE service-event offsets, XORing their values, and checking after three
+ * unchanged samples. DDK 1.8 maps these offsets to USE0/USE1_SERV_EVENT and
+ * initializes the second offset to zero. The target's EVENT_TIMER write is
+ * observed in the existing trace; its use as the microkernel tick source is
+ * inferred from DDK 1.8, not proven by target disassembly.
  */
 #define SGX_HOSTCTL_UKERNEL_CLOCK   0x40
 #define SGX_HEARTBEAT_MS            10
@@ -4135,6 +4189,11 @@ static void clarion_sgx_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(sbd, &s->mr);
 }
 
+static const Property clarion_sgx_properties[] = {
+    DEFINE_PROP_BOOL("edm-task-register-model", ClarionSgxState,
+                     edm_task_register_model, true),
+};
+
 static void clarion_sgx_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -4142,6 +4201,7 @@ static void clarion_sgx_class_init(ObjectClass *klass, const void *data)
 
     dc->realize = clarion_sgx_realize;
     dc->desc = "Clarion QY8XXX PowerVR SGX (passive MMIO + BIF/MMU tracer)";
+    device_class_set_props(dc, clarion_sgx_properties);
     rc->phases.hold = clarion_sgx_reset_hold;
 }
 
