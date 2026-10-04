@@ -13,7 +13,9 @@ endif
 # Deliberately independent of EGL/GLES so IR consumers can link it in a
 # software-only process.
 static_library('qy8r_usp', 'qy8r_usp.c', install: true)
+static_library('qy8r_usp_cpu', 'qy8r_usp_cpu.c', install: true)
 static_library('qy8r_usp_glsl', 'qy8r_usp_glsl.c', install: true)
 install_headers('qy8r.h')
 install_headers('qy8r_usp.h')
+install_headers('qy8r_usp_cpu.h')
 install_headers('qy8r_usp_glsl.h')
