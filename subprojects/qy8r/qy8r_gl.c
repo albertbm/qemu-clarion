@@ -16,6 +16,12 @@
 #define qy8r_uniform_f32 qy8r_gl_uniform_f32
 #define qy8r_uniform_i32 qy8r_gl_uniform_i32
 #define qy8r_texture_rgba32f qy8r_gl_texture_rgba32f
+#define qy8r_texture_upload_rgba8 qy8r_gl_texture_upload_rgba8
+#define qy8r_texture_parameter qy8r_gl_texture_parameter
+#define qy8r_texture_bind qy8r_gl_texture_bind
+#define qy8r_target_copy_texture qy8r_gl_target_copy_texture
+#define qy8r_bind_target_texture qy8r_gl_bind_target_texture
+#define qy8r_texture_set_sampler qy8r_gl_texture_set_sampler
 #define qy8r_begin_draw qy8r_gl_begin_draw
 #define qy8r_attribute_f32 qy8r_gl_attribute_f32
 #define qy8r_draw_arrays qy8r_gl_draw_arrays
@@ -48,6 +54,12 @@ typedef struct {
     GLuint fbo, tex;
     int w, h, is_float;
 } qy8r_target;
+#define QY8R_GL_MAX_GUEST_TEXTURES 256
+typedef struct {
+    unsigned key;
+    GLuint tex;
+    int w, h, live;
+} qy8r_guest_texture;
 typedef struct {
     EGLDisplay dpy;
     EGLContext ctx;
@@ -55,6 +67,7 @@ typedef struct {
     GLuint vao;
     GLuint *textures;
     GLint max_texture_units;
+    qy8r_guest_texture guest_textures[QY8R_GL_MAX_GUEST_TEXTURES];
     GLuint buffers[16];
     int n_buffers;
     char error[512];
@@ -192,6 +205,11 @@ void qy8r_close(void *p)
                 if (c->textures[i]) {
                     glDeleteTextures(1, &c->textures[i]);
                 }
+            }
+        }
+        for (size_t i = 0; i < QY8R_GL_MAX_GUEST_TEXTURES; i++) {
+            if (c->guest_textures[i].live && c->guest_textures[i].tex) {
+                glDeleteTextures(1, &c->guest_textures[i].tex);
             }
         }
         for (int i = 0; i < c->n_buffers; i++) {
@@ -645,6 +663,123 @@ int qy8r_texture_rgba32f(void *p, void *q, const char *sampler,
     glUniform1i(l, unit);
     return glok(c, "upload float texture");
 }
+static qy8r_guest_texture *guest_texture(qy8r_context *c, unsigned key,
+                                         int create)
+{
+    qy8r_guest_texture *free_slot = NULL;
+    if (!c || !key) {
+        return NULL;
+    }
+    for (size_t i = 0; i < QY8R_GL_MAX_GUEST_TEXTURES; i++) {
+        qy8r_guest_texture *t = &c->guest_textures[i];
+        if (t->live && t->key == key) {
+            return t;
+        }
+        if (!t->live && !free_slot) {
+            free_slot = t;
+        }
+    }
+    if (!create || !free_slot) {
+        return NULL;
+    }
+    free_slot->key = key;
+    free_slot->live = 1;
+    glGenTextures(1, &free_slot->tex);
+    if (!glok(c, "create guest texture")) {
+        memset(free_slot, 0, sizeof(*free_slot));
+        return NULL;
+    }
+    return free_slot;
+}
+int qy8r_texture_upload_rgba8(void *p, unsigned key, int width, int height,
+                              const unsigned char *rgba, size_t byte_count)
+{
+    qy8r_context *c = p;
+    if (!c || !rgba || width < 1 || height < 1 ||
+        (size_t)width > SIZE_MAX / (size_t)height / 4 ||
+        byte_count < (size_t)width * (size_t)height * 4) {
+        return 0;
+    }
+    qy8r_guest_texture *t = guest_texture(c, key, 1);
+    if (!t) {
+        return 0;
+    }
+    glBindTexture(GL_TEXTURE_2D, t->tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, rgba);
+    t->w = width;
+    t->h = height;
+    return glok(c, "upload guest RGBA8 texture");
+}
+int qy8r_texture_parameter(void *p, unsigned key, int pname, int value)
+{
+    qy8r_context *c = p;
+    qy8r_guest_texture *t = guest_texture(c, key, 1);
+    if (!c || !t) {
+        return 0;
+    }
+    glBindTexture(GL_TEXTURE_2D, t->tex);
+    glTexParameteri(GL_TEXTURE_2D, (GLenum)pname, value);
+    return glok(c, "set guest texture parameter");
+}
+int qy8r_texture_bind(void *p, unsigned key, int unit)
+{
+    qy8r_context *c = p;
+    qy8r_guest_texture *t = guest_texture(c, key, 1);
+    if (!c || !t || unit < 0 || unit >= c->max_texture_units) {
+        return 0;
+    }
+    glActiveTexture(GL_TEXTURE0 + unit);
+    glBindTexture(GL_TEXTURE_2D, t->tex);
+    return glok(c, "bind guest texture");
+}
+int qy8r_target_copy_texture(void *p, void *q, unsigned key)
+{
+    qy8r_context *c = p;
+    qy8r_target *target = q;
+    qy8r_guest_texture *t = guest_texture(c, key, 1);
+    if (!c || !target || !t) {
+        return 0;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, target->fbo);
+    glBindTexture(GL_TEXTURE_2D, t->tex);
+    glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 0, 0, target->w, target->h, 0);
+    t->w = target->w;
+    t->h = target->h;
+    return glok(c, "copy target to guest texture");
+}
+int qy8r_bind_target_texture(void *p, void *q, int unit)
+{
+    qy8r_context *c = p;
+    qy8r_target *target = q;
+    if (!c || !target || unit < 0 || unit >= c->max_texture_units) {
+        return 0;
+    }
+    glActiveTexture(GL_TEXTURE0 + unit);
+    glBindTexture(GL_TEXTURE_2D, target->tex);
+    return glok(c, "bind render target texture");
+}
+int qy8r_texture_set_sampler(void *p, void *q, const char *sampler,
+                             unsigned key, int unit)
+{
+    qy8r_context *c = p;
+    qy8r_program *program = q;
+    qy8r_guest_texture *t = guest_texture(c, key, 1);
+    if (!c || !program || !sampler || !t || unit < 0 ||
+        unit >= c->max_texture_units) {
+        return 0;
+    }
+    GLint location = glGetUniformLocation(program->id, sampler);
+    if (location < 0) {
+        snprintf(c->error, sizeof c->error, "required sampler not active: %s",
+                 sampler);
+        return 0;
+    }
+    glActiveTexture(GL_TEXTURE0 + unit);
+    glBindTexture(GL_TEXTURE_2D, t->tex);
+    glUniform1i(location, unit);
+    return glok(c, "set sampler texture");
+}
 int qy8r_begin_draw(void *p, void *q)
 {
     qy8r_context *c = p;
@@ -834,11 +969,11 @@ const qy8r_backend_ops qy8r_gl_backend = {
     .read_rgba8 = qy8r_gl_read_rgba8,
     .read_rgba8_rect = qy8r_gl_read_rgba8_rect,
     .read_rgba32f = qy8r_gl_read_rgba32f,
-    .texture_upload_rgba8 = NULL,
-    .texture_parameter = NULL,
-    .texture_bind = NULL,
-    .target_copy_texture = NULL,
-    .bind_target_texture = NULL,
-    .texture_set_sampler = NULL,
+    .texture_upload_rgba8 = qy8r_gl_texture_upload_rgba8,
+    .texture_parameter = qy8r_gl_texture_parameter,
+    .texture_bind = qy8r_gl_texture_bind,
+    .target_copy_texture = qy8r_gl_target_copy_texture,
+    .bind_target_texture = qy8r_gl_bind_target_texture,
+    .texture_set_sampler = qy8r_gl_texture_set_sampler,
     .last_error = qy8r_gl_last_error,
 };
