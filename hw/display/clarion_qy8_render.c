@@ -295,12 +295,25 @@ static gboolean load_qy8r(void)
         q_target_copy = qy8r_target_copy_texture;
         q_set_sampler = qy8r_texture_set_sampler;
     } else {
-        if (!qy8r_path) {
-            return mirror_fail("render=angle requires render-lib=<path>");
+        const char *library = qy8r_path;
+        const char *default_library;
+
+        if (!library) {
+#ifdef G_OS_DARWIN
+            default_library = "libqy8r.dylib";
+#else
+            default_library = "libqy8r.so";
+#endif
+            library = default_library;
         }
-        mirror_lib = dlopen(qy8r_path, RTLD_NOW | RTLD_LOCAL);
+        mirror_lib = dlopen(library, RTLD_NOW | RTLD_LOCAL);
         if (!mirror_lib) {
-            return mirror_fail(dlerror());
+            char *message = g_strdup_printf("cannot load render-lib '%s': %s",
+                                            library, dlerror());
+            gboolean result = mirror_fail(message);
+
+            g_free(message);
+            return result;
         }
 #define SYM(v, n)                                                              \
     do {                                                                       \
