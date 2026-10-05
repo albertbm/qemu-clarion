@@ -40,9 +40,13 @@
  */
 QEMU_BUILD_BUG_ON(QEMU_PLUGIN_EV_MAX > 32);
 
+typedef int (*qemu_plugin_install_func_t)(qemu_plugin_id_t,
+                                         const qemu_info_t *, int, char **);
+
 struct qemu_plugin_desc {
     char *path;
     char **argv;
+    qemu_plugin_install_func_t builtin_install;
     QTAILQ_ENTRY(qemu_plugin_desc) entry;
     int argc;
 };
@@ -62,9 +66,9 @@ QemuOptsList qemu_plugin_opts = {
     },
 };
 
-typedef int (*qemu_plugin_install_func_t)(qemu_plugin_id_t, const qemu_info_t *, int, char **);
-
 extern struct qemu_plugin_state plugin;
+
+static void plugin_desc_free(struct qemu_plugin_desc *desc);
 
 void qemu_plugin_add_dyn_cb_arr(GArray *arr)
 {
@@ -187,40 +191,52 @@ static int plugin_load(struct qemu_plugin_desc *desc, const qemu_info_t *info, E
     memset(ctx, 0, sizeof(*ctx));
     ctx->desc = desc;
 
-    ctx->handle = g_module_open(desc->path, G_MODULE_BIND_LOCAL);
-    if (ctx->handle == NULL) {
-        error_setg(errp, "Could not load plugin %s: %s", desc->path, g_module_error());
-        goto err_dlopen;
-    }
-
-    if (!g_module_symbol(ctx->handle, "qemu_plugin_install", &sym)) {
-        error_setg(errp, "Could not load plugin %s: %s", desc->path, g_module_error());
-        goto err_symbol;
-    }
-    install = (qemu_plugin_install_func_t) sym;
-    /* symbol was found; it could be NULL though */
-    if (install == NULL) {
-        error_setg(errp, "Could not load plugin %s: qemu_plugin_install is NULL",
-                   desc->path);
-        goto err_symbol;
-    }
-
-    if (!g_module_symbol(ctx->handle, "qemu_plugin_version", &sym)) {
-        error_setg(errp, "Could not load plugin %s: plugin does not declare API version %s",
-                   desc->path, g_module_error());
-        goto err_symbol;
+    if (desc->builtin_install) {
+        install = desc->builtin_install;
     } else {
-        int version = *(int *)sym;
-        if (version < QEMU_PLUGIN_MIN_VERSION) {
-            error_setg(errp, "Could not load plugin %s: plugin requires API version %d, but "
-                       "this QEMU supports only a minimum version of %d",
-                       desc->path, version, QEMU_PLUGIN_MIN_VERSION);
+        ctx->handle = g_module_open(desc->path, G_MODULE_BIND_LOCAL);
+        if (ctx->handle == NULL) {
+            error_setg(errp, "Could not load plugin %s: %s", desc->path,
+                       g_module_error());
+            goto err_dlopen;
+        }
+
+        if (!g_module_symbol(ctx->handle, "qemu_plugin_install", &sym)) {
+            error_setg(errp, "Could not load plugin %s: %s", desc->path,
+                       g_module_error());
             goto err_symbol;
-        } else if (version > QEMU_PLUGIN_VERSION) {
-            error_setg(errp, "Could not load plugin %s: plugin requires API version %d, but "
-                       "this QEMU supports only up to version %d",
-                       desc->path, version, QEMU_PLUGIN_VERSION);
+        }
+        install = (qemu_plugin_install_func_t) sym;
+        if (install == NULL) {
+            error_setg(errp,
+                       "Could not load plugin %s: qemu_plugin_install is NULL",
+                       desc->path);
             goto err_symbol;
+        }
+
+        if (!g_module_symbol(ctx->handle, "qemu_plugin_version", &sym)) {
+            error_setg(errp,
+                       "Could not load plugin %s: plugin does not declare API "
+                       "version %s",
+                       desc->path, g_module_error());
+            goto err_symbol;
+        } else {
+            int version = *(int *)sym;
+            if (version < QEMU_PLUGIN_MIN_VERSION) {
+                error_setg(errp,
+                           "Could not load plugin %s: plugin requires API "
+                           "version %d, but "
+                           "this QEMU supports only a minimum version of %d",
+                           desc->path, version, QEMU_PLUGIN_MIN_VERSION);
+                goto err_symbol;
+            } else if (version > QEMU_PLUGIN_VERSION) {
+                error_setg(errp,
+                           "Could not load plugin %s: plugin requires API "
+                           "version %d, but "
+                           "this QEMU supports only up to version %d",
+                           desc->path, version, QEMU_PLUGIN_VERSION);
+                goto err_symbol;
+            }
         }
     }
 
@@ -248,6 +264,9 @@ static int plugin_load(struct qemu_plugin_desc *desc, const qemu_info_t *info, E
     if (rc) {
         error_setg(errp, "Could not load plugin %s: qemu_plugin_install returned error code %d",
                    desc->path, rc);
+        if (desc->builtin_install) {
+            ctx->desc = NULL;
+        }
         /*
          * we cannot rely on the plugin doing its own cleanup, so
          * call a full uninstall if the plugin did not yet call it.
@@ -261,10 +280,36 @@ static int plugin_load(struct qemu_plugin_desc *desc, const qemu_info_t *info, E
     return rc;
 
  err_symbol:
-    g_module_close(ctx->handle);
+    if (ctx->handle) {
+        g_module_close(ctx->handle);
+    }
  err_dlopen:
     qemu_vfree(ctx);
     return 1;
+}
+
+int qemu_plugin_load_builtin(
+    const char *name,
+    int (*install)(qemu_plugin_id_t, const qemu_info_t *, int, char **),
+    Error **errp)
+{
+    QemuPluginList list = QTAILQ_HEAD_INITIALIZER(list);
+    struct qemu_plugin_desc *desc = g_new0(struct qemu_plugin_desc, 1);
+
+    if (!name || !install) {
+        g_free(desc);
+        error_setg(errp, "Invalid built-in plugin registration");
+        return -1;
+    }
+    desc->path = g_strdup_printf("builtin:%s", name);
+    desc->builtin_install = install;
+    QTAILQ_INSERT_TAIL(&list, desc, entry);
+    if (qemu_plugin_load_list(&list, errp)) {
+        QTAILQ_REMOVE(&list, desc, entry);
+        plugin_desc_free(desc);
+        return -1;
+    }
+    return 0;
 }
 
 /* call after having removed @desc from the list */
@@ -360,10 +405,12 @@ static void plugin_reset_destroy__locked(struct qemu_plugin_reset_data *data)
     if (data->cb) {
         data->cb(data->userdata);
     }
-    if (!g_module_close(ctx->handle)) {
+    if (ctx->handle && !g_module_close(ctx->handle)) {
         warn_report("%s: %s", __func__, g_module_error());
     }
-    plugin_desc_free(ctx->desc);
+    if (ctx->desc) {
+        plugin_desc_free(ctx->desc);
+    }
     qemu_vfree(ctx);
     g_free(data);
 }

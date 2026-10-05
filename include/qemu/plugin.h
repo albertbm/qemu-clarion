@@ -53,6 +53,10 @@ static inline void qemu_plugin_add_opts(void)
 
 void qemu_plugin_opt_parse(const char *optstr, QemuPluginList *head);
 int qemu_plugin_load_list(QemuPluginList *head, Error **errp);
+int qemu_plugin_load_builtin(
+    const char *name,
+    int (*install)(qemu_plugin_id_t, const qemu_info_t *, int, char **),
+    Error **errp);
 
 union qemu_plugin_cb_sig {
     qemu_plugin_udata_cb_t               udata;
@@ -247,6 +251,16 @@ static inline void qemu_plugin_opt_parse(const char *optstr,
 static inline int qemu_plugin_load_list(QemuPluginList *head, Error **errp)
 {
     return 0;
+}
+
+static inline int qemu_plugin_load_builtin(
+    const char *name,
+    int (*install)(qemu_plugin_id_t, const qemu_info_t *, int, char **),
+    Error **errp)
+{
+    error_setg(errp, "Built-in plugin %s requires plugin support",
+               name ? name : "(unnamed)");
+    return -1;
 }
 
 static inline void qemu_plugin_vcpu_init_hook(CPUState *cpu)
