@@ -3453,6 +3453,16 @@ endif
 # Subprojects #
 ###############
 
+qy8r_sw_dep = not_found
+qy8r_needed = (
+  have_system and get_option('plugins') and
+  'CONFIG_CLARION_QY8' in config_all_devices
+)
+if qy8r_needed
+  qy8r_proj = subproject('qy8r')
+  qy8r_sw_dep = qy8r_proj.get_variable('qy8r_sw_dep')
+endif
+
 libvfio_user_dep = not_found
 if have_system and vfio_user_server_allowed
   libvfio_user_proj = subproject('libvfio-user', required: true)

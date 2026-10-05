@@ -35,6 +35,10 @@
 #include "hw/arm/boot.h"
 #include "hw/intc/arm_gic.h"
 #include "hw/display/clarion_du.h"
+#ifdef CONFIG_PLUGIN
+#include "qemu/plugin.h"
+#include "hw/display/clarion_qy8_render.h"
+#endif
 #include "monitor/qdev.h"
 #include "hw/display/clarion_sgx.h"
 #include "hw/misc/clarion_micom.h"
@@ -1959,6 +1963,10 @@ struct Qy8MachineState {
     bool tma460_synthetic_profile_on; /* opt-in synthetic profile */
     bool i2c_empty_on;          /* opt-in: I2C0..I2C2 з порожньою шиною */
     bool reverse;               /* RV input, machine property */
+    char *render;
+    char *render_lib;
+    char *render_log;
+    char *render_dump_dir;
 
     MemoryRegion flash;          /* лише коли флеш подано як ROM */
     DriveInfo *flash_drive;      /* -drive if=pflash: записувана копія */
@@ -2032,6 +2040,71 @@ static void qy8_reverse_set(Object *obj, bool value, Error **errp)
     qy8_bctl_set_inputs(s);
 }
 
+static char *qy8_render_get(Object *obj, Error **errp)
+{
+    (void)errp;
+    return g_strdup(QY8_MACHINE(obj)->render);
+}
+
+static void qy8_render_set(Object *obj, const char *value, Error **errp)
+{
+    Qy8MachineState *s = QY8_MACHINE(obj);
+
+    if (strcmp(value, "cpu") && strcmp(value, "angle") &&
+        strcmp(value, "off")) {
+        error_setg(errp, "render must be cpu, angle, or off");
+        return;
+    }
+    g_free(s->render);
+    s->render = g_strdup(value);
+}
+
+static char *qy8_render_lib_get(Object *obj, Error **errp)
+{
+    (void)errp;
+    return g_strdup(QY8_MACHINE(obj)->render_lib);
+}
+
+static void qy8_render_lib_set(Object *obj, const char *value, Error **errp)
+{
+    Qy8MachineState *s = QY8_MACHINE(obj);
+
+    (void)errp;
+    g_free(s->render_lib);
+    s->render_lib = g_strdup(value);
+}
+
+static char *qy8_render_log_get(Object *obj, Error **errp)
+{
+    (void)errp;
+    return g_strdup(QY8_MACHINE(obj)->render_log);
+}
+
+static void qy8_render_log_set(Object *obj, const char *value, Error **errp)
+{
+    Qy8MachineState *s = QY8_MACHINE(obj);
+
+    (void)errp;
+    g_free(s->render_log);
+    s->render_log = g_strdup(value);
+}
+
+static char *qy8_render_dump_dir_get(Object *obj, Error **errp)
+{
+    (void)errp;
+    return g_strdup(QY8_MACHINE(obj)->render_dump_dir);
+}
+
+static void qy8_render_dump_dir_set(Object *obj, const char *value,
+                                    Error **errp)
+{
+    Qy8MachineState *s = QY8_MACHINE(obj);
+
+    (void)errp;
+    g_free(s->render_dump_dir);
+    s->render_dump_dir = g_strdup(value);
+}
+
 static void qy8_add_ram(MemoryRegion *sysmem, MemoryRegion *mr,
                         const char *name, hwaddr base, uint64_t size)
 {
@@ -2056,6 +2129,15 @@ static void qy8_init(MachineState *machine)
         error_report("clarion-qy8: tma460 and i2c4-recorder are mutually exclusive at 0x24");
         exit(1);
     }
+
+#ifdef CONFIG_PLUGIN
+    if (strcmp(s->render, "off")) {
+        clarion_qy8_render_configure(s->render, s->render_lib, s->render_log,
+                                     s->render_dump_dir);
+        qemu_plugin_load_builtin("clarion-qy8-render",
+                                 clarion_qy8_render_install, &error_fatal);
+    }
+#endif
 
     s->cpu = ARM_CPU(object_new(machine->cpu_type));
     object_property_set_bool(OBJECT(s->cpu), "has_el3", false, &error_fatal);
@@ -2715,6 +2797,26 @@ static void qy8_tma460_profile_set(Object *obj, bool value, Error **errp)
 static void qy8_machine_instance_init(Object *obj)
 {
     Qy8MachineState *s = QY8_MACHINE(obj);
+
+    s->render = g_strdup("cpu");
+    s->render_lib = g_strdup("");
+    s->render_log = g_strdup("");
+    s->render_dump_dir = g_strdup("");
+    object_property_add_str(obj, "render", qy8_render_get, qy8_render_set);
+    object_property_set_description(obj, "render",
+        "render backend: cpu, angle, or off");
+    object_property_add_str(obj, "render-lib", qy8_render_lib_get,
+                            qy8_render_lib_set);
+    object_property_set_description(obj, "render-lib",
+        "path to the qy8r shared library for render=angle");
+    object_property_add_str(obj, "render-log", qy8_render_log_get,
+                            qy8_render_log_set);
+    object_property_set_description(obj, "render-log",
+        "optional renderer JSONL log path");
+    object_property_add_str(obj, "render-dump-dir", qy8_render_dump_dir_get,
+                            qy8_render_dump_dir_set);
+    object_property_set_description(obj, "render-dump-dir",
+        "optional directory for renderer frame and draw dumps");
 
     /*
      * За замовчуванням 5 = "NORM(RES)>>" — звичайний бут із повним

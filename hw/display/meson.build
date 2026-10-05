@@ -14,6 +14,11 @@ system_ss.add(when: 'CONFIG_JAZZ_LED', if_true: files('jazz_led.c'))
 system_ss.add(when: 'CONFIG_PL110', if_true: files('pl110.c'))
 system_ss.add(when: 'CONFIG_CLARION_DU', if_true: files('clarion_du.c'))
 system_ss.add(when: 'CONFIG_CLARION_SGX', if_true: files('clarion_sgx.c'))
+if get_option('plugins')
+  system_ss.add(when: 'CONFIG_CLARION_QY8', if_true: [
+    files('clarion_qy8_render.c', 'clarion_qy8_render_catalog.c'), qy8r_sw_dep,
+  ])
+endif
 system_ss.add(when: 'CONFIG_IMX6UL_LCDIF', if_true: files('imx6ul_lcdif.c'))
 system_ss.add(when: 'CONFIG_SII9022', if_true: files('sii9022.c'))
 system_ss.add(when: 'CONFIG_SSD0303', if_true: files('ssd0303.c'))
