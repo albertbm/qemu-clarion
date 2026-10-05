@@ -9,6 +9,7 @@
 
 #include "qemu/config-file.h"
 #include "plugins/qemu-plugin.h"
+#include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu/queue.h"
 #include "qemu/option.h"
