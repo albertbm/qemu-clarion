@@ -46,8 +46,10 @@ typedef struct qy8r_sw_target_slot {
 typedef struct qy8r_sw_program {
     qy8r_usp_program *vs;
     qy8r_usp_program *fs;
-    float uniform_values[QY8R_USP_MAX_SYMBOLS][64];
-    uint16_t uniform_counts[QY8R_USP_MAX_SYMBOLS];
+    float vs_uniform_values[QY8R_USP_MAX_SYMBOLS][64];
+    uint16_t vs_uniform_counts[QY8R_USP_MAX_SYMBOLS];
+    float fs_uniform_values[QY8R_USP_MAX_SYMBOLS][64];
+    uint16_t fs_uniform_counts[QY8R_USP_MAX_SYMBOLS];
     int sampler_units[QY8R_USP_MAX_SYMBOLS];
     qy8r_sw_attribute attributes[QY8R_SW_MAX_ATTRIBUTES];
     float *point_outputs;
@@ -426,38 +428,54 @@ static int update_uniform(qy8r_sw_program *program, const char *name,
                           const float *values, const int *integer_values,
                           int count, int integer)
 {
-    qy8r_usp_program *ir;
-    int index;
-    int cap;
+    int vs_index;
+    int fs_index;
 
     if (!program || !name || count < 1 || (!values && !integer_values)) {
         return 0;
     }
-    ir = program->fs;
-    index = symbol_index(ir, name);
-    if (index < 0) {
-        ir = program->vs;
-        index = symbol_index(ir, name);
-    }
-    if (index < 0) {
+    fs_index = symbol_index(program->fs, name);
+    vs_index = symbol_index(program->vs, name);
+    if (fs_index < 0 && vs_index < 0) {
         return 2;
     }
-    cap = (int)ir->symbols[index].component_count;
-    if (cap < 1 || count > 64 || count > cap) {
+    if (count > 64 ||
+        (vs_index >= 0 &&
+         count > program->vs->symbols[vs_index].component_count) ||
+        (fs_index >= 0 &&
+         count > program->fs->symbols[fs_index].component_count)) {
         return 0;
     }
     if (integer) {
-        if (ir->symbols[index].type == 24) {
-            program->sampler_units[index] = integer_values[0];
+        if (fs_index >= 0 && program->fs->symbols[fs_index].type == 24) {
+            program->sampler_units[fs_index] = integer_values[0];
         }
         for (int i = 0; i < count; i++) {
-            program->uniform_values[index][i] = (float)integer_values[i];
+            if (vs_index >= 0) {
+                program->vs_uniform_values[vs_index][i] =
+                    (float)integer_values[i];
+            }
+            if (fs_index >= 0) {
+                program->fs_uniform_values[fs_index][i] =
+                    (float)integer_values[i];
+            }
         }
     } else {
-        memcpy(program->uniform_values[index], values,
-               (size_t)count * sizeof(*values));
+        if (vs_index >= 0) {
+            memcpy(program->vs_uniform_values[vs_index], values,
+                   (size_t)count * sizeof(*values));
+        }
+        if (fs_index >= 0) {
+            memcpy(program->fs_uniform_values[fs_index], values,
+                   (size_t)count * sizeof(*values));
+        }
     }
-    program->uniform_counts[index] = (uint16_t)count;
+    if (vs_index >= 0) {
+        program->vs_uniform_counts[vs_index] = (uint16_t)count;
+    }
+    if (fs_index >= 0) {
+        program->fs_uniform_counts[fs_index] = (uint16_t)count;
+    }
     return 1;
 }
 
@@ -696,8 +714,8 @@ static int run_vertex(qy8r_sw_context *context, qy8r_sw_program *program,
     memset(&io, 0, sizeof(io));
     for (i = 0; i < program->vs->bindings.uniform_count; i++) {
         unsigned index = program->vs->bindings.uniforms[i];
-        inputs.symbols[index] = program->uniform_values[index];
-        inputs.symbol_counts[index] = program->uniform_counts[index];
+        inputs.symbols[index] = program->vs_uniform_values[index];
+        inputs.symbol_counts[index] = program->vs_uniform_counts[index];
     }
     for (i = 0; i < program->vs->bindings.attribute_count; i++) {
         unsigned index = program->vs->bindings.attributes[i];
@@ -789,8 +807,8 @@ static int run_fragment(void *opaque, const float *varying_values,
     memset(&io, 0, sizeof(io));
     for (unsigned i = 0; i < program->fs->bindings.uniform_count; i++) {
         unsigned index = program->fs->bindings.uniforms[i];
-        inputs.symbols[index] = program->uniform_values[index];
-        inputs.symbol_counts[index] = program->uniform_counts[index];
+        inputs.symbols[index] = program->fs_uniform_values[index];
+        inputs.symbol_counts[index] = program->fs_uniform_counts[index];
     }
     for (unsigned i = 0; i < program->fs->ps_input_count; i++) {
         unsigned coord = program->fs->ps_inputs[i].coord;
