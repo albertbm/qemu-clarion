@@ -708,9 +708,14 @@ static int load_inputs(const qy8r_usp_program *program, qy8r_usp_cpu_io *io,
     }
     for (i = 0; i < program->ps_input_count; i++) {
         unsigned coord = program->ps_inputs[i].coord;
-        unsigned dimension = program->ps_inputs[i].coord_dim + 1;
+        unsigned texture = program->ps_inputs[i].texture;
+        unsigned dimension =
+            texture < 10 ? program->texcoord_dimensions[texture] : 0;
         unsigned count;
 
+        if (!dimension) {
+            dimension = program->ps_inputs[i].coord_dim + 1;
+        }
         if (coord >= 64) {
             if (error && error_size) {
                 snprintf(error, error_size,

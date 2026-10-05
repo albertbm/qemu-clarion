@@ -812,9 +812,14 @@ static int run_fragment(void *opaque, const float *varying_values,
     }
     for (unsigned i = 0; i < program->fs->ps_input_count; i++) {
         unsigned coord = program->fs->ps_inputs[i].coord;
-        unsigned dimension = program->fs->ps_inputs[i].coord_dim + 1;
+        unsigned texture = program->fs->ps_inputs[i].texture;
+        unsigned dimension =
+            texture < 10 ? program->fs->texcoord_dimensions[texture] : 0;
         unsigned available = varying_count > 4 ? 4 : (unsigned)varying_count;
 
+        if (!dimension) {
+            dimension = program->fs->ps_inputs[i].coord_dim + 1;
+        }
         if (dimension > 4) {
             dimension = 4;
         }
@@ -839,9 +844,11 @@ static int run_fragment(void *opaque, const float *varying_values,
     if (io.state.discard) {
         return 0;
     }
-    for (unsigned i = 0; i < 4; i++) {
-        rgba[i] = ((io.result_raw >> (8 * i)) & 0xff) / 255.0f;
-    }
+    /* The GLSL lowering exposes PA fragment results as .zyxw. */
+    rgba[0] = ((io.result_raw >> 16) & 0xff) / 255.0f;
+    rgba[1] = ((io.result_raw >> 8) & 0xff) / 255.0f;
+    rgba[2] = (io.result_raw & 0xff) / 255.0f;
+    rgba[3] = ((io.result_raw >> 24) & 0xff) / 255.0f;
     return 1;
 }
 
