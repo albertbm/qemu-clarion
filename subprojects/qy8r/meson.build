@@ -11,6 +11,17 @@ qy8r_usp_cpu = static_library('qy8r_usp_cpu', 'qy8r_usp_cpu.c',
 qy8r_usp_glsl = static_library('qy8r_usp_glsl', 'qy8r_usp_glsl.c',
   link_with: qy8r_usp, install: true)
 
+qy8r_sw = static_library('qy8r_sw',
+  'qy8r.c',
+  'qy8r_sw_api.c',
+  'qy8r_sw_raster.c',
+  'qy8r_usp.c',
+  'qy8r_usp_cpu.c',
+  include_directories: include_directories('.'))
+qy8r_sw_dep = declare_dependency(
+  include_directories: include_directories('.'),
+  link_with: qy8r_sw)
+
 qy8r_sources = ['qy8r.c', 'qy8r_sw_api.c', 'qy8r_sw_raster.c']
 qy8r_links = [qy8r_usp, qy8r_usp_cpu]
 qy8r_dependencies = []
