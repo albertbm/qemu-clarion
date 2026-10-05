@@ -2,8 +2,11 @@
 #ifndef CLARION_QY8_RENDER_CATALOG_H
 #define CLARION_QY8_RENDER_CATALOG_H
 
+struct Qy8RenderDispatch;
+
 typedef struct Qy8RenderExport {
     const char *name;
+    const struct Qy8RenderDispatch *dispatch;
     uint32_t rva;
     uint32_t word;
     uint32_t base;

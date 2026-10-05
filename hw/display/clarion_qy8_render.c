@@ -29,6 +29,102 @@ typedef struct {
     const Qy8RenderExport *fn;
     uint64_t args[4], stack[8];
 } Pending;
+typedef void (*Qy8RenderEntryHandler)(Pending *pending);
+typedef void (*Qy8RenderReturnHandler)(GString *event, Pending *pending,
+                                       uint32_t result);
+typedef void (*Qy8RenderJournalHandler)(GString *capture, Pending *pending,
+                                        gboolean *comma);
+typedef struct Qy8RenderDispatch Qy8RenderDispatch;
+struct Qy8RenderDispatch {
+    const char *name;
+    Qy8RenderEntryHandler entry;
+    Qy8RenderReturnHandler returned;
+    Qy8RenderJournalHandler journal;
+    guint variant;
+    gboolean service_target;
+    guint service_class;
+    gboolean dynamic_entry;
+};
+static const Qy8RenderDispatch *render_dispatch_lookup(const char *name);
+enum {
+    QY8_RENDER_VARIANT_EGLBINDAPI,
+    QY8_RENDER_VARIANT_EGLBINDTEXIMAGE,
+    QY8_RENDER_VARIANT_EGLCHOOSECONFIG,
+    QY8_RENDER_VARIANT_EGLCREATECONTEXT,
+    QY8_RENDER_VARIANT_EGLCREATEPBUFFERSURFACE,
+    QY8_RENDER_VARIANT_EGLCREATEWINDOWSURFACE,
+    QY8_RENDER_VARIANT_EGLDESTROYCONTEXT,
+    QY8_RENDER_VARIANT_EGLDESTROYSURFACE,
+    QY8_RENDER_VARIANT_EGLGETCONFIGATTRIB,
+    QY8_RENDER_VARIANT_EGLGETCONFIGS,
+    QY8_RENDER_VARIANT_EGLGETDISPLAY,
+    QY8_RENDER_VARIANT_EGLGETERROR,
+    QY8_RENDER_VARIANT_EGLGETPROCADDRESS,
+    QY8_RENDER_VARIANT_EGLINITIALIZE,
+    QY8_RENDER_VARIANT_EGLMAKECURRENT,
+    QY8_RENDER_VARIANT_EGLRELEASETEXIMAGE,
+    QY8_RENDER_VARIANT_EGLRELEASETHREAD,
+    QY8_RENDER_VARIANT_EGLSWAPBUFFERS,
+    QY8_RENDER_VARIANT_EGLTERMINATE,
+    QY8_RENDER_VARIANT_GLACTIVETEXTURE,
+    QY8_RENDER_VARIANT_GLATTACHSHADER,
+    QY8_RENDER_VARIANT_GLBINDTEXTURE,
+    QY8_RENDER_VARIANT_GLBLENDCOLOR,
+    QY8_RENDER_VARIANT_GLBLENDFUNC,
+    QY8_RENDER_VARIANT_GLBLENDFUNCSEPARATE,
+    QY8_RENDER_VARIANT_GLCLEAR,
+    QY8_RENDER_VARIANT_GLCLEARCOLOR,
+    QY8_RENDER_VARIANT_GLCLEARDEPTHF,
+    QY8_RENDER_VARIANT_GLCLEARSTENCIL,
+    QY8_RENDER_VARIANT_GLCOLORMASK,
+    QY8_RENDER_VARIANT_GLCOMPRESSEDTEXIMAGE2D,
+    QY8_RENDER_VARIANT_GLCOMPRESSEDTEXSUBIMAGE2D,
+    QY8_RENDER_VARIANT_GLCREATEPROGRAM,
+    QY8_RENDER_VARIANT_GLCREATESHADER,
+    QY8_RENDER_VARIANT_GLCULLFACE,
+    QY8_RENDER_VARIANT_GLDELETEPROGRAM,
+    QY8_RENDER_VARIANT_GLDELETESHADER,
+    QY8_RENDER_VARIANT_GLDELETETEXTURES,
+    QY8_RENDER_VARIANT_GLDEPTHFUNC,
+    QY8_RENDER_VARIANT_GLDEPTHMASK,
+    QY8_RENDER_VARIANT_GLDETACHSHADER,
+    QY8_RENDER_VARIANT_GLDISABLE,
+    QY8_RENDER_VARIANT_GLDISABLEVERTEXATTRIBARRAY,
+    QY8_RENDER_VARIANT_GLDRAWARRAYS,
+    QY8_RENDER_VARIANT_GLDRAWELEMENTS,
+    QY8_RENDER_VARIANT_GLENABLE,
+    QY8_RENDER_VARIANT_GLENABLEVERTEXATTRIBARRAY,
+    QY8_RENDER_VARIANT_GLFRONTFACE,
+    QY8_RENDER_VARIANT_GLGENTEXTURES,
+    QY8_RENDER_VARIANT_GLGETATTRIBLOCATION,
+    QY8_RENDER_VARIANT_GLGETERROR,
+    QY8_RENDER_VARIANT_GLGETINTEGERV,
+    QY8_RENDER_VARIANT_GLGETPROGRAMIV,
+    QY8_RENDER_VARIANT_GLGETSTRING,
+    QY8_RENDER_VARIANT_GLGETUNIFORMLOCATION,
+    QY8_RENDER_VARIANT_GLLINKPROGRAM,
+    QY8_RENDER_VARIANT_GLPIXELSTOREI,
+    QY8_RENDER_VARIANT_GLREADPIXELS,
+    QY8_RENDER_VARIANT_GLSHADERBINARY,
+    QY8_RENDER_VARIANT_GLSTENCILFUNCSEPARATE,
+    QY8_RENDER_VARIANT_GLSTENCILMASK,
+    QY8_RENDER_VARIANT_GLSTENCILOPSEPARATE,
+    QY8_RENDER_VARIANT_GLTEXIMAGE2D,
+    QY8_RENDER_VARIANT_GLTEXPARAMETERI,
+    QY8_RENDER_VARIANT_GLUNIFORM1F,
+    QY8_RENDER_VARIANT_GLUNIFORM1I,
+    QY8_RENDER_VARIANT_GLUNIFORM3FV,
+    QY8_RENDER_VARIANT_GLUNIFORM4F,
+    QY8_RENDER_VARIANT_GLUNIFORMMATRIX4FV,
+    QY8_RENDER_VARIANT_GLUSEPROGRAM,
+    QY8_RENDER_VARIANT_GLVERTEXATTRIBPOINTER,
+    QY8_RENDER_VARIANT_GLVIEWPORT,
+    QY8_RENDER_VARIANT_EGLCREATEIMAGEKHR,
+    QY8_RENDER_VARIANT_GLEGLIMAGETARGETTEXTURE2DOES,
+    QY8_RENDER_VARIANT_GLFLUSH,
+    QY8_RENDER_VARIANT_GLFINISH,
+};
+
 typedef struct {
     uint32_t type;
     char *hash;
@@ -238,6 +334,7 @@ static gboolean capture_draw(uint64_t call_id, uint32_t mode, uint32_t first,
                              uint32_t count);
 static void dump_frame(uint32_t surface_handle);
 static void present_frame(uint32_t surface_handle);
+static void present_frame(uint32_t surface_handle);
 
 static gpointer idkey(uint32_t id)
 {
@@ -268,80 +365,96 @@ static gboolean mirror_fail(const char *what)
     g_string_free(s, TRUE);
     return FALSE;
 }
+/* CPU mode binds directly to the statically linked software renderer. */
+static void load_cpu_qy8r_symbols(void)
+{
+    q_open = qy8r_open;
+    q_close = qy8r_close;
+    q_program_create = qy8r_program_create;
+    q_target_create = qy8r_target_create;
+    q_target_bind = qy8r_target_bind;
+    q_viewport = qy8r_viewport;
+    q_clear = qy8r_clear;
+    q_begin_draw = qy8r_begin_draw;
+    q_uniform_f = qy8r_uniform_f32;
+    q_uniform_i = qy8r_uniform_i32;
+    q_attrib = qy8r_attribute_f32;
+    q_draw = qy8r_draw_arrays;
+    q_blend = qy8r_blend_state;
+    q_read_rect = qy8r_read_rgba8_rect;
+    q_last_error = qy8r_last_error;
+    q_tex_upload = qy8r_texture_upload_rgba8;
+    q_tex_param = qy8r_texture_parameter;
+    q_tex_bind = qy8r_texture_bind;
+    q_target_copy = qy8r_target_copy_texture;
+    q_set_sampler = qy8r_texture_set_sampler;
+}
+
+/* ANGLE resolves its symbols in a private renderer namespace. */
+static gboolean load_angle_qy8r_symbols(void)
+{
+    const char *library = qy8r_path;
+    const char *default_library;
+
+    if (!library) {
+#ifdef G_OS_DARWIN
+        default_library = "libqy8r.dylib";
+#else
+        default_library = "libqy8r.so";
+#endif
+        library = default_library;
+    }
+    mirror_lib = dlopen(library, RTLD_NOW | RTLD_LOCAL);
+    if (!mirror_lib) {
+        char *message = g_strdup_printf("cannot load render-lib '%s': %s",
+                                        library, dlerror());
+        gboolean result = mirror_fail(message);
+
+        g_free(message);
+        return result;
+    }
+#define SYM(variable, symbol)                                                  \
+    do {                                                                       \
+        *(void **)(&variable) = dlsym(mirror_lib, symbol);                     \
+        if (!variable) {                                                       \
+            return mirror_fail("missing qy8r symbol " symbol);                 \
+        }                                                                      \
+    } while (0)
+    SYM(q_open, "qy8r_open");
+    SYM(q_close, "qy8r_close");
+    SYM(q_program_create, "qy8r_program_create");
+    SYM(q_target_create, "qy8r_target_create");
+    SYM(q_target_bind, "qy8r_target_bind");
+    SYM(q_viewport, "qy8r_viewport");
+    SYM(q_clear, "qy8r_clear");
+    SYM(q_begin_draw, "qy8r_begin_draw");
+    SYM(q_uniform_f, "qy8r_uniform_f32");
+    SYM(q_uniform_i, "qy8r_uniform_i32");
+    SYM(q_attrib, "qy8r_attribute_f32");
+    SYM(q_draw, "qy8r_draw_arrays");
+    SYM(q_blend, "qy8r_blend_state");
+    SYM(q_read_rect, "qy8r_read_rgba8_rect");
+    SYM(q_last_error, "qy8r_last_error");
+    SYM(q_tex_upload, "qy8r_texture_upload_rgba8");
+    SYM(q_tex_param, "qy8r_texture_parameter");
+    SYM(q_tex_bind, "qy8r_texture_bind");
+    SYM(q_target_copy, "qy8r_target_copy_texture");
+    SYM(q_set_sampler, "qy8r_texture_set_sampler");
+#undef SYM
+    return TRUE;
+}
+
 static gboolean load_qy8r(void)
 {
     if (mirror_ctx) {
         return TRUE;
     }
-    if (!angle_backend) {
-        q_open = qy8r_open;
-        q_close = qy8r_close;
-        q_program_create = qy8r_program_create;
-        q_target_create = qy8r_target_create;
-        q_target_bind = qy8r_target_bind;
-        q_viewport = qy8r_viewport;
-        q_clear = qy8r_clear;
-        q_begin_draw = qy8r_begin_draw;
-        q_uniform_f = qy8r_uniform_f32;
-        q_uniform_i = qy8r_uniform_i32;
-        q_attrib = qy8r_attribute_f32;
-        q_draw = qy8r_draw_arrays;
-        q_blend = qy8r_blend_state;
-        q_read_rect = qy8r_read_rgba8_rect;
-        q_last_error = qy8r_last_error;
-        q_tex_upload = qy8r_texture_upload_rgba8;
-        q_tex_param = qy8r_texture_parameter;
-        q_tex_bind = qy8r_texture_bind;
-        q_target_copy = qy8r_target_copy_texture;
-        q_set_sampler = qy8r_texture_set_sampler;
+    if (angle_backend) {
+        if (!load_angle_qy8r_symbols()) {
+            return FALSE;
+        }
     } else {
-        const char *library = qy8r_path;
-        const char *default_library;
-
-        if (!library) {
-#ifdef G_OS_DARWIN
-            default_library = "libqy8r.dylib";
-#else
-            default_library = "libqy8r.so";
-#endif
-            library = default_library;
-        }
-        mirror_lib = dlopen(library, RTLD_NOW | RTLD_LOCAL);
-        if (!mirror_lib) {
-            char *message = g_strdup_printf("cannot load render-lib '%s': %s",
-                                            library, dlerror());
-            gboolean result = mirror_fail(message);
-
-            g_free(message);
-            return result;
-        }
-#define SYM(v, n)                                                              \
-    do {                                                                       \
-        *(void **)(&v) = dlsym(mirror_lib, n);                                 \
-        if (!v)                                                                \
-            return mirror_fail("missing qy8r symbol " n);                      \
-    } while (0)
-        SYM(q_open, "qy8r_open");
-        SYM(q_close, "qy8r_close");
-        SYM(q_program_create, "qy8r_program_create");
-        SYM(q_target_create, "qy8r_target_create");
-        SYM(q_target_bind, "qy8r_target_bind");
-        SYM(q_viewport, "qy8r_viewport");
-        SYM(q_clear, "qy8r_clear");
-        SYM(q_begin_draw, "qy8r_begin_draw");
-        SYM(q_uniform_f, "qy8r_uniform_f32");
-        SYM(q_uniform_i, "qy8r_uniform_i32");
-        SYM(q_attrib, "qy8r_attribute_f32");
-        SYM(q_draw, "qy8r_draw_arrays");
-        SYM(q_blend, "qy8r_blend_state");
-        SYM(q_read_rect, "qy8r_read_rgba8_rect");
-        SYM(q_last_error, "qy8r_last_error");
-        SYM(q_tex_upload, "qy8r_texture_upload_rgba8");
-        SYM(q_tex_param, "qy8r_texture_parameter");
-        SYM(q_tex_bind, "qy8r_texture_bind");
-        SYM(q_target_copy, "qy8r_target_copy_texture");
-        SYM(q_set_sampler, "qy8r_texture_set_sampler");
-#undef SYM
+        load_cpu_qy8r_symbols();
     }
     char error[512] = { 0 };
     mirror_ctx = q_open(error, sizeof error);
@@ -350,7 +463,6 @@ static gboolean load_qy8r(void)
     }
     return TRUE;
 }
-
 int clarion_qy8_render_configure(const char *render, const char *render_lib,
                                  const char *render_log,
                                  const char *render_dump_dir)
@@ -519,7 +631,9 @@ static void surface_add_from_create(const Qy8RenderExport *fn, Pending *p,
 {
     int width = 0, height = 0;
     uint64_t attributes_ptr =
-        !strcmp(fn->name, "eglCreatePbufferSurface") ? p->args[2] : p->args[3];
+        fn->dispatch->variant == QY8_RENDER_VARIANT_EGLCREATEPBUFFERSURFACE
+            ? p->args[2]
+            : p->args[3];
     for (int i = 0; i < 64; i++) {
         uint32_t k = 0, v = 0;
         if (!read_u32(attributes_ptr + i * 8, &k) || k == 0x3038) {
@@ -534,7 +648,7 @@ static void surface_add_from_create(const Qy8RenderExport *fn, Pending *p,
             height = (int)v;
         }
     }
-    if (!strcmp(fn->name, "eglCreateWindowSurface")) {
+    if (fn->dispatch->variant == QY8_RENDER_VARIANT_EGLCREATEWINDOWSURFACE) {
         width = 800;
         height = 480;
     }
@@ -723,31 +837,45 @@ static gboolean sync_guest_texture(TextureState *t, uint32_t *render_key)
     }
     return TRUE;
 }
-static gboolean capture_draw(uint64_t call_id, uint32_t mode, uint32_t first,
-                             uint32_t count)
+typedef struct DrawCapture {
+    uint64_t call_id;
+    uint32_t mode, first, count;
+    gint64 started_us;
+    const char *vertex_hash, *fragment_hash;
+    SurfaceState *surface;
+    TextureState *texture;
+    ImageState *image;
+    size_t bytes, pixel_count, mask_size;
+    unsigned char *before, *after;
+    guint8 *mask;
+    uint32_t texture_key;
+    uint64_t changed_pixels;
+    int min_x, min_y, max_x, max_y;
+    char *mask_path;
+} DrawCapture;
+
+/* Readback brackets the draw so later diagnostics can report changed pixels. */
+static gboolean prepare_draw_capture(DrawCapture *draw)
 {
-    gint64 draw_started_us = g_get_monotonic_time();
-    if (mirror_stopped) {
-        return TRUE;
-    }
     if (!have_makecurrent || !active_surface || !have_viewport) {
         return mirror_fail("draw without live EGL/viewport state");
     }
-    const char *vh = NULL, *fh = NULL;
-    if (!select_host_program(current_program, &vh, &fh)) {
+    if (!select_host_program(current_program, &draw->vertex_hash,
+                             &draw->fragment_hash)) {
         return FALSE;
     }
-    SurfaceState *surface = surface_ensure_target(active_surface);
-    if (!surface) {
+    draw->surface = surface_ensure_target(active_surface);
+    if (!draw->surface) {
         return mirror_fail("current EGL surface has no host render target");
     }
-    mirror_target = surface->target;
+    mirror_target = draw->surface->target;
     if (!q_target_bind(mirror_ctx, mirror_target)) {
         return mirror_fail("bind current surface target");
     }
-    size_t bytes = (size_t)surface->width * surface->height * 4;
-    unsigned char *before = g_malloc0(bytes), *after = g_malloc0(bytes);
-    if (!q_read_rect(mirror_ctx, mirror_target, before, bytes)) {
+    draw->bytes = (size_t)draw->surface->width * draw->surface->height * 4;
+    draw->before = g_malloc0(draw->bytes);
+    draw->after = g_malloc0(draw->bytes);
+    if (!q_read_rect(mirror_ctx, mirror_target, draw->before, draw->bytes)) {
         return mirror_fail("read target before draw");
     }
     if (!q_begin_draw(mirror_ctx, mirror_program) ||
@@ -756,38 +884,65 @@ static gboolean capture_draw(uint64_t call_id, uint32_t mode, uint32_t first,
         !set_uniforms()) {
         return mirror_fail("apply guest draw state");
     }
-    GHashTableIter ai;
-    gpointer ak, av;
-    g_hash_table_iter_init(&ai, attrib_locations);
-    while (g_hash_table_iter_next(&ai, &ak, &av)) {
-        uint32_t owner = (uint32_t)g_ascii_strtoull((char *)ak, NULL, 16);
+    return TRUE;
+}
+
+static gboolean read_vertex_values(const VertexAttr *attribute, uint32_t first,
+                                   uint32_t count, float values[16])
+{
+    int stride = attribute->stride ? attribute->stride : attribute->size * 4;
+
+    for (uint32_t j = 0; j < count; j++) {
+        for (uint32_t component = 0; component < attribute->size; component++) {
+            uint32_t raw = 0;
+            uint64_t address =
+                attribute->ptr + (uint64_t)(first + j) * stride + component * 4;
+
+            if (!read_u32(address, &raw)) {
+                return mirror_fail("guest vertex memory unreadable");
+            }
+            memcpy(&values[j * attribute->size + component], &raw, 4);
+        }
+    }
+    return TRUE;
+}
+
+/* Attribute locations belong to one program and affect its active draw. */
+static gboolean apply_draw_attributes(const DrawCapture *draw)
+{
+    GHashTableIter iterator;
+    gpointer key, value;
+
+    g_hash_table_iter_init(&iterator, attrib_locations);
+    while (g_hash_table_iter_next(&iterator, &key, &value)) {
+        uint32_t owner = (uint32_t)g_ascii_strtoull((char *)key, NULL, 16);
         if (owner != current_program) {
             continue;
         }
-        int loc = atoi(strchr((char *)ak, ':') + 1);
-        VertexAttr *a =
-            (loc >= 0 && loc < (int)G_N_ELEMENTS(attrs)) ? &attrs[loc] : NULL;
-        if (!a || !a->enabled || a->type != 0x1406 || !a->size || a->size > 4 ||
-            count > 4) {
+        int location = atoi(strchr((char *)key, ':') + 1);
+        VertexAttr *attribute =
+            location >= 0 && location < (int)G_N_ELEMENTS(attrs)
+                ? &attrs[location]
+                : NULL;
+        if (!attribute || !attribute->enabled || attribute->type != 0x1406 ||
+            !attribute->size || attribute->size > 4 || draw->count > 4) {
             return mirror_fail("unsupported active vertex attribute");
         }
-        int stride = a->stride ? a->stride : a->size * 4;
         float values[16] = { 0 };
-        for (uint32_t j = 0; j < count; j++) {
-            for (uint32_t c = 0; c < a->size; c++) {
-                uint32_t raw = 0;
-                if (!read_u32(a->ptr + (uint64_t)(first + j) * stride + c * 4,
-                              &raw)) {
-                    return mirror_fail("guest vertex memory unreadable");
-                }
-                memcpy(&values[j * a->size + c], &raw, 4);
-            }
+        if (!read_vertex_values(attribute, draw->first, draw->count, values)) {
+            return FALSE;
         }
-        if (!q_attrib(mirror_ctx, mirror_program, av, values, (int)a->size,
-                      (int)count)) {
+        if (!q_attrib(mirror_ctx, mirror_program, value, values,
+                      (int)attribute->size, (int)draw->count)) {
             return mirror_fail("apply guest vertex attribute");
         }
     }
+    return TRUE;
+}
+
+/* Sample the same guest texture unit and sampler state as the draw. */
+static gboolean bind_draw_texture(DrawCapture *draw)
+{
     char *sampler_key = g_strdup_printf("%08x:u_Sampler", current_program);
     UniformState *sampler = g_hash_table_lookup(uniform_state, sampler_key);
     g_free(sampler_key);
@@ -795,112 +950,176 @@ static gboolean capture_draw(uint64_t call_id, uint32_t mode, uint32_t first,
     if (unit < 0 || unit >= 16) {
         return mirror_fail("sampler unit outside supported range");
     }
-    TextureState *t =
-        g_hash_table_lookup(textures, idkey(bound_textures[unit]));
-    uint32_t key = 0;
-    if (t) {
-        if (!sync_guest_texture(t, &key)) {
+    draw->texture = g_hash_table_lookup(textures, idkey(bound_textures[unit]));
+    if (draw->texture) {
+        if (!sync_guest_texture(draw->texture, &draw->texture_key)) {
             return FALSE;
         }
     } else {
-        key = 0xffffffffu;
+        draw->texture_key = 0xffffffffu;
         static const unsigned char black[4] = { 0, 0, 0, 255 };
-        if (!q_tex_upload(mirror_ctx, key, 1, 1, black, 4)) {
+        if (!q_tex_upload(mirror_ctx, draw->texture_key, 1, 1, black, 4)) {
             return mirror_fail("create default black texture");
         }
     }
-    if (!q_tex_bind(mirror_ctx, key, unit) ||
-        !q_set_sampler(mirror_ctx, mirror_program, "u_Sampler", key, unit)) {
+    if (!q_tex_bind(mirror_ctx, draw->texture_key, unit) ||
+        !q_set_sampler(mirror_ctx, mirror_program, "u_Sampler",
+                       draw->texture_key, unit)) {
         return mirror_fail("bind captured texture/sampler");
     }
+    return TRUE;
+}
+
+static gboolean execute_draw_capture(DrawCapture *draw)
+{
     if (!q_blend(mirror_ctx, blend_enabled, blend_func[0], blend_func[1],
                  blend_func[2], blend_func[3], blend_color) ||
-        !q_draw(mirror_ctx, (int)mode, (int)first, (int)count) ||
-        !q_read_rect(mirror_ctx, mirror_target, after, bytes)) {
+        !q_draw(mirror_ctx, (int)draw->mode, (int)draw->first,
+                (int)draw->count) ||
+        !q_read_rect(mirror_ctx, mirror_target, draw->after, draw->bytes)) {
         return mirror_fail("draw/read target");
     }
-    size_t n_pixels = (size_t)surface->width * surface->height,
-           mask_size = (n_pixels + 7) / 8;
-    guint8 *mask = g_malloc0(mask_size);
-    uint64_t changed = 0;
-    int minx = surface->width, miny = surface->height, maxx = -1, maxy = -1;
-    for (int y = 0; y < surface->height; y++) {
-        for (int x = 0; x < surface->width; x++) {
-            size_t pixel = (size_t)y * surface->width + x, off = pixel * 4;
-            if (memcmp(before + off, after + off, 4)) {
-                mask[pixel >> 3] |= (guint8)(1u << (pixel & 7));
-                changed++;
-                if (x < minx) {
-                    minx = x;
-                }
-                if (x > maxx) {
-                    maxx = x;
-                }
-                if (y < miny) {
-                    miny = y;
-                }
-                if (y > maxy) {
-                    maxy = y;
-                }
+    if (draw->texture && draw->texture->image) {
+        draw->image = g_hash_table_lookup(images, idkey(draw->texture->image));
+    }
+    return TRUE;
+}
+
+static void record_changed_pixel(DrawCapture *draw, int x, int y, size_t pixel)
+{
+    draw->mask[pixel >> 3] |= (guint8)(1u << (pixel & 7));
+    draw->changed_pixels++;
+    if (x < draw->min_x) {
+        draw->min_x = x;
+    }
+    if (x > draw->max_x) {
+        draw->max_x = x;
+    }
+    if (y < draw->min_y) {
+        draw->min_y = y;
+    }
+    if (y > draw->max_y) {
+        draw->max_y = y;
+    }
+}
+
+/* A bit mask records pixels written by this draw for later analysis. */
+static void measure_draw_changes(DrawCapture *draw)
+{
+    draw->pixel_count = (size_t)draw->surface->width * draw->surface->height;
+    draw->mask_size = (draw->pixel_count + 7) / 8;
+    draw->mask = g_malloc0(draw->mask_size);
+    draw->min_x = draw->surface->width;
+    draw->min_y = draw->surface->height;
+    draw->max_x = -1;
+    draw->max_y = -1;
+    for (int y = 0; y < draw->surface->height; y++) {
+        for (int x = 0; x < draw->surface->width; x++) {
+            size_t pixel = (size_t)y * draw->surface->width + x;
+            size_t offset = pixel * 4;
+            if (memcmp(draw->before + offset, draw->after + offset, 4)) {
+                record_changed_pixel(draw, x, y, pixel);
             }
         }
     }
-    char *mask_path = NULL;
-    if (dump_directory) {
-        mask_path = g_strdup_printf("%s/draw-%" PRIu64 ".changed.mask",
-                                    dump_directory, call_id);
-        GError *write_error = NULL;
+}
 
-        if (!g_file_set_contents(mask_path, (const char *)mask,
-                                 (gssize)mask_size, &write_error)) {
-            g_free(mask);
-            g_free(mask_path);
-            return mirror_fail(write_error ? write_error->message
-                                           : "write changed-pixel mask");
-        }
+/* Mask files are optional diagnostics and never change the rendered frame. */
+static gboolean write_draw_mask(DrawCapture *draw)
+{
+    if (!dump_directory) {
+        return TRUE;
     }
-    g_free(mask);
-    ImageState *im =
-        t && t->image ? g_hash_table_lookup(images, idkey(t->image)) : NULL;
-    GString *s = g_string_new(NULL);
-    g_string_append_printf(
-        s,
-        "{\"kind\":\"mirror_draw\",\"call_id\":\"%" PRIu64
-        "\",\"context\":\"0x%08x\",\"surface\":\"0x%08x\",\"program\":\"0x%"
-        "08x\",\"host_program_index\":%u,\"vs_blob_sha256\":",
-        call_id, active_context, active_surface, current_program,
-        mirror_program_index);
-    json_quote(s, vh);
-    g_string_append(s, ",\"fs_blob_sha256\":");
-    json_quote(s, fh);
-    g_string_append_printf(
-        s,
-        ",\"texture\":\"0x%08x\",\"texture_unread_pages\":%u,\"viewport\":[%d,%"
-        "d,%d,%d],\"target_size\":[%d,%d],\"mode\":%u,\"first\":%u,\"count\":%"
-        "u,\"blend\":%s,\"changed_pixels\":%" PRIu64 ",\"mirror_us\":%" PRIi64
-        ",\"changed_mask_path\":",
-        key, im ? im->unread_pages : 0, viewport[0], viewport[1], viewport[2],
-        viewport[3], surface->width, surface->height, mode, first, count,
-        blend_enabled ? "true" : "false", changed,
-        (gint64)g_get_monotonic_time() - draw_started_us);
-    if (mask_path) {
-        json_quote(s, mask_path);
-    } else {
-        g_string_append(s, "null");
+    draw->mask_path = g_strdup_printf("%s/draw-%" PRIu64 ".changed.mask",
+                                      dump_directory, draw->call_id);
+    GError *write_error = NULL;
+    if (!g_file_set_contents(draw->mask_path, (const char *)draw->mask,
+                             (gssize)draw->mask_size, &write_error)) {
+        gboolean result = mirror_fail(write_error ? write_error->message
+                                                  : "write changed-pixel mask");
+        g_clear_error(&write_error);
+        return result;
     }
-    g_free(mask_path);
-    g_string_append(s, ",\"bbox\":");
-    if (maxx < 0) {
-        g_string_append(s, "null");
-    } else {
-        g_string_append_printf(s, "[%d,%d,%d,%d]", minx, miny, maxx, maxy);
-    }
-    g_string_append_c(s, '}');
-    emit(s);
-    g_string_free(s, TRUE);
-    g_free(before);
-    g_free(after);
     return TRUE;
+}
+
+static void append_draw_capture(GString *event, const DrawCapture *draw)
+{
+    g_string_append_printf(event,
+                           "{\"kind\":\"mirror_draw\",\"call_id\":\"%" PRIu64
+                           "\",\"context\":\"0x%08x\",\"surface\":\"0x%08x\","
+                           "\"program\":\"0x%08x\",\"host_program_index\":%u,"
+                           "\"vs_blob_sha256\":",
+                           draw->call_id, active_context, active_surface,
+                           current_program, mirror_program_index);
+    json_quote(event, draw->vertex_hash);
+    g_string_append(event, ",\"fs_blob_sha256\":");
+    json_quote(event, draw->fragment_hash);
+    g_string_append_printf(
+        event,
+        ",\"texture\":\"0x%08x\",\"texture_unread_pages\":%u,"
+        "\"viewport\":[%d,%d,%d,%d],\"target_size\":[%d,%d],"
+        "\"mode\":%u,\"first\":%u,\"count\":%u,\"blend\":%s,"
+        "\"changed_pixels\":%" PRIu64 ",\"mirror_us\":%" PRIi64
+        ",\"changed_mask_path\":",
+        draw->texture_key, draw->image ? draw->image->unread_pages : 0,
+        viewport[0], viewport[1], viewport[2], viewport[3],
+        draw->surface->width, draw->surface->height, draw->mode, draw->first,
+        draw->count, blend_enabled ? "true" : "false", draw->changed_pixels,
+        (gint64)g_get_monotonic_time() - draw->started_us);
+    if (draw->mask_path) {
+        json_quote(event, draw->mask_path);
+    } else {
+        g_string_append(event, "null");
+    }
+    g_string_append(event, ",\"bbox\":");
+    if (draw->max_x < 0) {
+        g_string_append(event, "null");
+    } else {
+        g_string_append_printf(event, "[%d,%d,%d,%d]", draw->min_x, draw->min_y,
+                               draw->max_x, draw->max_y);
+    }
+    g_string_append_c(event, '}');
+}
+
+static gboolean capture_draw(uint64_t call_id, uint32_t mode, uint32_t first,
+                             uint32_t count)
+{
+    gint64 started_us = g_get_monotonic_time();
+
+    if (mirror_stopped) {
+        return TRUE;
+    }
+    DrawCapture draw = { .call_id = call_id,
+                         .mode = mode,
+                         .first = first,
+                         .count = count,
+                         .started_us = started_us };
+    gboolean ok = prepare_draw_capture(&draw);
+    if (ok) {
+        ok = apply_draw_attributes(&draw);
+    }
+    if (ok) {
+        ok = bind_draw_texture(&draw);
+    }
+    if (ok) {
+        ok = execute_draw_capture(&draw);
+    }
+    if (ok) {
+        measure_draw_changes(&draw);
+        ok = write_draw_mask(&draw);
+    }
+    if (ok) {
+        GString *event = g_string_new(NULL);
+        append_draw_capture(event, &draw);
+        emit(event);
+        g_string_free(event, TRUE);
+    }
+    g_free(draw.mask_path);
+    g_free(draw.mask);
+    g_free(draw.after);
+    g_free(draw.before);
+    return ok;
 }
 static void dump_frame(uint32_t handle)
 {
@@ -994,111 +1213,170 @@ static void present_skip(const char *reason, uint32_t a, uint32_t b)
     emit(s);
     g_string_free(s, TRUE);
 }
-static void present_frame(uint32_t handle)
+typedef struct PresentBuffer {
+    uint32_t drawable, tag, index, width, height, stride, buffer, linear,
+        hw_word;
+    SurfaceState *surface;
+} PresentBuffer;
+
+typedef struct PresentWrite {
+    gboolean translated;
+    uint64_t physical_address;
+    unsigned pages, failed_pages;
+} PresentWrite;
+
+/* Validate the WSEGL ring before writing into its current buffer. */
+static gboolean read_present_buffer(uint32_t handle, PresentBuffer *buffer)
 {
-    uint32_t drawable = 0, tag = 0, idx = 0, w = 0, h = 0, stride = 0, buf = 0,
-             linear = 0, hw = 0;
-    if (mirror_stopped) {
-        present_skip("mirror_stopped", handle, 0);
-        return;
+    if (!read_u32((uint64_t)handle + 0x1c, &buffer->drawable) ||
+        !buffer->drawable || !read_u32(buffer->drawable, &buffer->tag) ||
+        !read_u32((uint64_t)buffer->drawable + 0x10, &buffer->index) ||
+        !read_u32((uint64_t)buffer->drawable + 0x7c, &buffer->width) ||
+        !read_u32((uint64_t)buffer->drawable + 0x80, &buffer->height) ||
+        !read_u32((uint64_t)buffer->drawable + 8, &buffer->stride)) {
+        present_skip("drawable_unreadable", handle, buffer->drawable);
+        return FALSE;
     }
-    if (!read_u32((uint64_t)handle + 0x1c, &drawable) || !drawable ||
-        !read_u32(drawable, &tag) ||
-        !read_u32((uint64_t)drawable + 0x10, &idx) ||
-        !read_u32((uint64_t)drawable + 0x7c, &w) ||
-        !read_u32((uint64_t)drawable + 0x80, &h) ||
-        !read_u32((uint64_t)drawable + 8, &stride)) {
-        present_skip("drawable_unreadable", handle, drawable);
-        return;
+    if (buffer->tag != 1) {
+        present_skip("drawable_tag_not_window", buffer->drawable, buffer->tag);
+        return FALSE;
     }
-    if (tag != 1) {
-        present_skip("drawable_tag_not_window", drawable, tag);
-        return;
+    if (buffer->index >= 8 ||
+        !read_u32((uint64_t)buffer->drawable + 0x14 + 4 * buffer->index,
+                  &buffer->buffer) ||
+        !buffer->buffer || !read_u32(buffer->buffer, &buffer->linear) ||
+        !read_u32((uint64_t)buffer->buffer + 8, &buffer->hw_word)) {
+        present_skip("buffer_unreadable", buffer->drawable, buffer->index);
+        return FALSE;
     }
-    if (idx >= 8 || !read_u32((uint64_t)drawable + 0x14 + 4 * idx, &buf) ||
-        !buf || !read_u32(buf, &linear) || !read_u32((uint64_t)buf + 8, &hw)) {
-        present_skip("buffer_unreadable", drawable, idx);
-        return;
-    }
+    return TRUE;
+}
+
+static gboolean present_buffer_is_supported(uint32_t handle,
+                                            PresentBuffer *buffer)
+{
     gboolean known = FALSE;
     for (int i = 0; i < 3; i++) {
-        if (wsegl_linear[i] == linear) {
+        if (wsegl_linear[i] == buffer->linear) {
             known = TRUE;
         }
     }
     if (!known) {
-        present_skip("linear_not_in_ring", linear, idx);
-        return;
+        present_skip("linear_not_in_ring", buffer->linear, buffer->index);
+        return FALSE;
     }
     SurfaceState *surface = surface_get(handle);
     if (!surface || !surface->target) {
-        present_skip("no_host_target", handle, linear);
-        return;
+        present_skip("no_host_target", handle, buffer->linear);
+        return FALSE;
     }
-    if ((int)w != surface->width || (int)h != surface->height || stride != w) {
-        present_skip("geometry_mismatch", w << 16 | h, stride);
-        return;
+    if ((int)buffer->width != surface->width ||
+        (int)buffer->height != surface->height ||
+        buffer->stride != buffer->width) {
+        present_skip("geometry_mismatch", buffer->width << 16 | buffer->height,
+                     buffer->stride);
+        return FALSE;
     }
-    size_t bytes = (size_t)w * h * 4, out_bytes = (size_t)w * h * 2;
-    unsigned char *rgba = g_malloc(bytes);
-    if (!q_target_bind(mirror_ctx, surface->target) ||
-        !q_read_rect(mirror_ctx, surface->target, rgba, bytes)) {
-        g_free(rgba);
-        present_skip("readback_failed", handle, linear);
-        return;
-    }
-    /* Read back bottom-up and reverse the rows. ARGB1555 bit 15 is alpha. */
-    unsigned char *px = g_malloc(out_bytes);
-    size_t d = 0;
-    for (uint32_t y = 0; y < h; y++) {
-        const unsigned char *row = rgba + (size_t)(h - 1 - y) * w * 4;
-        for (uint32_t x = 0; x < w; x++) {
-            const unsigned char *p = row + x * 4;
-            uint16_t word =
-                (uint16_t)((p[3] >= 128 ? 0x8000 : 0) | ((p[0] >> 3) << 10) |
-                           ((p[1] >> 3) << 5) | (p[2] >> 3));
-            px[d++] = (unsigned char)(word & 0xff);
-            px[d++] = (unsigned char)(word >> 8);
-        }
-    }
-    uint64_t pa = 0;
-    gboolean translated = qemu_plugin_translate_vaddr(linear, &pa);
-    unsigned failed = 0, pages = 0;
-    for (size_t off = 0; off < out_bytes; off += 4096) {
-        size_t n = MIN((size_t)4096, out_bytes - off);
-        GByteArray *page = g_byte_array_sized_new(n);
-        g_byte_array_append(page, px + off, n);
-        if (!qemu_plugin_write_memory_vaddr((uint64_t)linear + off, page)) {
-            failed++;
-        }
-        pages++;
-        g_byte_array_unref(page);
-    }
-    char *rh = sha256_data(rgba, bytes), *ph = sha256_data(px, out_bytes);
-    GString *s = g_string_new(NULL);
-    g_string_append_printf(s,
-                           "{\"kind\":\"present_write\",\"swap\":%" PRIu64
-                           ",\"surface\":\"0x%08x\",\"drawable\":\"0x%08x\","
-                           "\"ring_index\":%u,\"buffer\":\"0x%08x\",\"linear\":"
-                           "\"0x%08x\",\"translated\":%s,\"pa\":\"0x%08" PRIx64
-                           "\",\"buffer_hw_word\":\"0x%08x\",\"width\":%u,"
-                           "\"height\":%u,\"stride\":%u,\"bytes\":%zu,"
-                           "\"pages\":%u,\"failed_pages\":%u,\"rgba_sha256\":",
-                           frame_no, handle, drawable, idx, buf, linear,
-                           translated ? "true" : "false", pa, hw, w, h, stride,
-                           out_bytes, pages, failed);
-    json_quote(s, rh);
-    g_string_append(s, ",\"argb1555_sha256\":");
-    json_quote(s, ph);
-    g_string_append_c(s, '}');
-    emit(s);
-    g_string_free(s, TRUE);
-    g_free(rh);
-    g_free(ph);
-    g_free(px);
-    g_free(rgba);
+    buffer->surface = surface;
+    return TRUE;
 }
 
+static void convert_present_pixels(const unsigned char *rgba,
+                                   unsigned char *pixels, uint32_t width,
+                                   uint32_t height)
+{
+    size_t destination = 0;
+    for (uint32_t y = 0; y < height; y++) {
+        const unsigned char *row = rgba + (size_t)(height - 1 - y) * width * 4;
+        for (uint32_t x = 0; x < width; x++) {
+            const unsigned char *pixel = row + x * 4;
+            uint16_t word =
+                (uint16_t)((pixel[3] >= 128 ? 0x8000 : 0) |
+                           ((pixel[0] >> 3) << 10) | ((pixel[1] >> 3) << 5) |
+                           (pixel[2] >> 3));
+            pixels[destination++] = (unsigned char)(word & 0xff);
+            pixels[destination++] = (unsigned char)(word >> 8);
+        }
+    }
+}
+
+/* Write each guest page after converting the host frame to ARGB1555. */
+static PresentWrite write_present_pixels(uint32_t linear,
+                                         const unsigned char *pixels,
+                                         size_t byte_count)
+{
+    PresentWrite result = { 0 };
+
+    result.translated =
+        qemu_plugin_translate_vaddr(linear, &result.physical_address);
+    for (size_t offset = 0; offset < byte_count; offset += 4096) {
+        size_t page_size = MIN((size_t)4096, byte_count - offset);
+        GByteArray *page = g_byte_array_sized_new(page_size);
+        g_byte_array_append(page, pixels + offset, page_size);
+        if (!qemu_plugin_write_memory_vaddr((uint64_t)linear + offset, page)) {
+            result.failed_pages++;
+        }
+        result.pages++;
+        g_byte_array_unref(page);
+    }
+    return result;
+}
+
+static void emit_present_write(uint32_t handle, const PresentBuffer *buffer,
+                               const PresentWrite *write, size_t byte_count,
+                               const char *rgba_hash, const char *pixels_hash)
+{
+    GString *event = g_string_new(NULL);
+
+    g_string_append_printf(
+        event,
+        "{\"kind\":\"present_write\",\"swap\":%" PRIu64
+        ",\"surface\":\"0x%08x\",\"drawable\":\"0x%08x\","
+        "\"ring_index\":%u,\"buffer\":\"0x%08x\",\"linear\":"
+        "\"0x%08x\",\"translated\":%s,\"pa\":\"0x%08" PRIx64
+        "\",\"buffer_hw_word\":\"0x%08x\",\"width\":%u,"
+        "\"height\":%u,\"stride\":%u,\"bytes\":%zu,\"pages\":%u,"
+        "\"failed_pages\":%u,\"rgba_sha256\":",
+        frame_no, handle, buffer->drawable, buffer->index, buffer->buffer,
+        buffer->linear, write->translated ? "true" : "false",
+        write->physical_address, buffer->hw_word, buffer->width, buffer->height,
+        buffer->stride, byte_count, write->pages, write->failed_pages);
+    json_quote(event, rgba_hash);
+    g_string_append(event, ",\"argb1555_sha256\":");
+    json_quote(event, pixels_hash);
+    g_string_append_c(event, '}');
+    emit(event);
+    g_string_free(event, TRUE);
+}
+
+static void present_frame(uint32_t handle)
+{
+    if (mirror_stopped) {
+        present_skip("mirror_stopped", handle, 0);
+        return;
+    }
+    PresentBuffer buffer = { 0 };
+    if (!read_present_buffer(handle, &buffer) ||
+        !present_buffer_is_supported(handle, &buffer)) {
+        return;
+    }
+    size_t byte_count = (size_t)buffer.width * buffer.height * 2;
+    size_t rgba_size = (size_t)buffer.width * buffer.height * 4;
+    g_autofree unsigned char *rgba = g_malloc(rgba_size);
+    if (!q_target_bind(mirror_ctx, buffer.surface->target) ||
+        !q_read_rect(mirror_ctx, buffer.surface->target, rgba, rgba_size)) {
+        present_skip("readback_failed", handle, buffer.linear);
+        return;
+    }
+    g_autofree unsigned char *pixels = g_malloc(byte_count);
+    convert_present_pixels(rgba, pixels, buffer.width, buffer.height);
+    PresentWrite write =
+        write_present_pixels(buffer.linear, pixels, byte_count);
+    g_autofree char *rgba_hash = sha256_data(rgba, rgba_size);
+    g_autofree char *pixels_hash = sha256_data(pixels, byte_count);
+    emit_present_write(handle, &buffer, &write, byte_count, rgba_hash,
+                       pixels_hash);
+}
 static UniformState *uniform_get_or_add(uint32_t program, const char *name)
 {
     char *key = g_strdup_printf("%08x:%s", program, name);
@@ -1113,224 +1391,418 @@ static UniformState *uniform_get_or_add(uint32_t program, const char *name)
     return u;
 }
 
+/* Guest state follows submission order so later draws see the same GL state. */
+static void handle_state_glshaderbinary(Pending *pending_call)
+{
+    uint64_t *args = pending_call->args;
+    uint64_t *stack = pending_call->stack;
+    (void)args;
+    (void)stack;
+
+    uint32_t n = MIN((uint32_t)args[0], 8u), len = (uint32_t)stack[0];
+    GByteArray *ids = g_byte_array_new(), *blob = g_byte_array_new();
+    if (n && read_mem(args[1], n * 4, ids) && read_mem(args[3], len, blob)) {
+        char *hash = sha256_mem(args[3], len);
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t id = 0;
+            memcpy(&id, ids->data + i * 4, 4);
+            ShaderState *shader = g_hash_table_lookup(shader_state, idkey(id));
+            if (shader) {
+                g_free(shader->hash);
+                g_free(shader->blob);
+                shader->hash = g_strdup(hash);
+                shader->blob = g_memdup2(blob->data, blob->len);
+                shader->blob_size = blob->len;
+            }
+        }
+        g_free(hash);
+    }
+    g_byte_array_unref(blob);
+    g_byte_array_unref(ids);
+}
+
+/* Guest state follows submission order so later draws see the same GL state. */
+static void handle_state_glattachshader(Pending *pending_call)
+{
+    uint64_t *args = pending_call->args;
+    uint64_t *stack = pending_call->stack;
+    (void)args;
+    (void)stack;
+
+    ProgramState *program =
+        g_hash_table_lookup(program_state, idkey((uint32_t)args[0]));
+    if (program && program->n < G_N_ELEMENTS(program->shaders)) {
+        program->shaders[program->n++] = (uint32_t)args[1];
+    }
+}
+
+/* Guest state follows submission order so later draws see the same GL state. */
+static void handle_state_gllinkprogram(Pending *pending_call)
+{
+    uint64_t *args = pending_call->args;
+    uint64_t *stack = pending_call->stack;
+    (void)args;
+    (void)stack;
+
+    ProgramState *program =
+        g_hash_table_lookup(program_state, idkey((uint32_t)args[0]));
+    if (program) {
+        program->linked = FALSE;
+    }
+}
+
+/* Guest state follows submission order so later draws see the same GL state. */
+static void handle_state_gluseprogram(Pending *pending_call)
+{
+    uint64_t *args = pending_call->args;
+    uint64_t *stack = pending_call->stack;
+    (void)args;
+    (void)stack;
+
+    current_program = (uint32_t)args[0];
+}
+
+/* Guest state follows submission order so later draws see the same GL state. */
+static void handle_state_glgetuniformlocation(Pending *pending_call)
+{
+    uint64_t *args = pending_call->args;
+    uint64_t *stack = pending_call->stack;
+    (void)args;
+    (void)stack;
+
+    /* Return values are associated with the pending call in return_cb. */
+}
+
+/* Guest state follows submission order so later draws see the same GL state. */
+static void handle_state_gluniformmatrix4fv(Pending *pending_call)
+{
+    uint64_t *args = pending_call->args;
+    uint64_t *stack = pending_call->stack;
+    (void)args;
+    (void)stack;
+
+    char *location_key = loc_key(current_program, (int32_t)args[0]);
+    const char *name = g_hash_table_lookup(uniform_locations, location_key);
+    if (name) {
+        UniformState *uniform = uniform_get_or_add(current_program, name);
+        uniform->kind = 1;
+        uniform->count = 16;
+        for (int i = 0; i < 16; i++) {
+            uint32_t raw = 0;
+            if (read_u32(args[3] + i * 4, &raw)) {
+                memcpy(&uniform->f[i], &raw, 4);
+            }
+        }
+    }
+    g_free(location_key);
+}
+
+/* Guest state follows submission order so later draws see the same GL state. */
+static void handle_state_gluniform1f(Pending *pending_call)
+{
+    uint64_t *args = pending_call->args;
+    uint64_t *stack = pending_call->stack;
+    (void)args;
+    (void)stack;
+
+    char *location_key = loc_key(current_program, (int32_t)args[0]);
+    const char *name = g_hash_table_lookup(uniform_locations, location_key);
+    if (name) {
+        UniformState *uniform = uniform_get_or_add(current_program, name);
+        if (pending_call->fn->dispatch->variant ==
+            QY8_RENDER_VARIANT_GLUNIFORM1I) {
+            uniform->kind = 2;
+            uniform->count = 1;
+            uniform->i[0] = (int32_t)args[1];
+        } else {
+            uniform->kind = 1;
+            uniform->count = pending_call->fn->dispatch->variant ==
+                                     QY8_RENDER_VARIANT_GLUNIFORM4F
+                                 ? 4
+                                 : 1;
+            for (int i = 0; i < uniform->count; i++) {
+                uint32_t raw =
+                    i < 3 ? (uint32_t)args[i + 1] : (uint32_t)stack[0];
+                memcpy(&uniform->f[i], &raw, 4);
+            }
+        }
+    }
+    g_free(location_key);
+}
+
+/* Guest state follows submission order so later draws see the same GL state. */
+static void handle_state_glenablevertexattribarray(Pending *pending_call)
+{
+    uint64_t *args = pending_call->args;
+    uint64_t *stack = pending_call->stack;
+    (void)args;
+    (void)stack;
+
+    uint32_t ix = (uint32_t)args[0];
+    if (ix < G_N_ELEMENTS(attrs)) {
+        attrs[ix].enabled = pending_call->fn->dispatch->variant ==
+                            QY8_RENDER_VARIANT_GLENABLEVERTEXATTRIBARRAY;
+    }
+}
+
+/* Guest state follows submission order so later draws see the same GL state. */
+static void handle_state_glviewport(Pending *pending_call)
+{
+    uint64_t *args = pending_call->args;
+    uint64_t *stack = pending_call->stack;
+    (void)args;
+    (void)stack;
+
+    for (int i = 0; i < 4; i++) {
+        viewport[i] = (int32_t)args[i];
+    }
+    have_viewport = TRUE;
+}
+
+/* Guest state follows submission order so later draws see the same GL state. */
+static void handle_state_glenable(Pending *pending_call)
+{
+    uint64_t *args = pending_call->args;
+    uint64_t *stack = pending_call->stack;
+    (void)args;
+    (void)stack;
+
+    if (args[0] == 0x0be2) {
+        blend_enabled = 1;
+    } else {
+        mirror_fail("unsupported enabled GL capability");
+    }
+}
+
+/* Guest state follows submission order so later draws see the same GL state. */
+static void handle_state_gldisable(Pending *pending_call)
+{
+    uint64_t *args = pending_call->args;
+    uint64_t *stack = pending_call->stack;
+    (void)args;
+    (void)stack;
+
+    if (args[0] != 0x0be2 && args[0] != 0x0bd0 && args[0] != 0x0b71 &&
+        args[0] != 0x0b90) {
+        mirror_fail("unsupported disabled GL capability");
+    }
+}
+
+/* Guest state follows submission order so later draws see the same GL state. */
+static void handle_state_glblendfuncseparate(Pending *pending_call)
+{
+    uint64_t *args = pending_call->args;
+    uint64_t *stack = pending_call->stack;
+    (void)args;
+    (void)stack;
+
+    for (int i = 0; i < 4; i++) {
+        blend_func[i] = (int32_t)args[i];
+    }
+}
+
+/* Guest state follows submission order so later draws see the same GL state. */
+static void handle_state_glblendcolor(Pending *pending_call)
+{
+    uint64_t *args = pending_call->args;
+    uint64_t *stack = pending_call->stack;
+    (void)args;
+    (void)stack;
+
+    for (int i = 0; i < 4; i++) {
+        uint32_t raw = (uint32_t)args[i];
+        memcpy(&blend_color[i], &raw, 4);
+    }
+}
+
+/* Guest state follows submission order so later draws see the same GL state. */
+static void handle_state_glclearcolor(Pending *pending_call)
+{
+    uint64_t *args = pending_call->args;
+    uint64_t *stack = pending_call->stack;
+    (void)args;
+    (void)stack;
+
+    for (int i = 0; i < 4; i++) {
+        uint32_t raw = (uint32_t)args[i];
+        memcpy(&clear_rgba[i], &raw, 4);
+    }
+}
+
+/* Guest state follows submission order so later draws see the same GL state. */
+static void handle_state_glclear(Pending *pending_call)
+{
+    uint64_t *args = pending_call->args;
+    uint64_t *stack = pending_call->stack;
+    (void)args;
+    (void)stack;
+
+    uint32_t mask = (uint32_t)args[0];
+    if (mask & ~0x4100u) {
+        mirror_fail("unsupported glClear bit");
+        return;
+    }
+    if (!mirror_ctx && !load_qy8r()) {
+        return;
+    }
+    SurfaceState *surface = surface_ensure_target(active_surface);
+    if (!surface || !q_target_bind(mirror_ctx, surface->target) ||
+        !q_clear(mirror_ctx, clear_rgba[0], clear_rgba[1], clear_rgba[2],
+                 clear_rgba[3])) {
+        mirror_fail("apply guest clear");
+    }
+}
+
+/* Guest state follows submission order so later draws see the same GL state. */
+static void handle_state_eglbindteximage(Pending *pending_call)
+{
+    uint64_t *args = pending_call->args;
+    uint64_t *stack = pending_call->stack;
+    (void)args;
+    (void)stack;
+
+    if (!mirror_ctx && !load_qy8r()) {
+        return;
+    }
+    SurfaceState *surface = surface_get((uint32_t)args[1]);
+    uint32_t unit = active_texture_unit < G_N_ELEMENTS(bound_textures)
+                        ? active_texture_unit
+                        : 0,
+             id = bound_textures[unit];
+    if (!surface || !surface->target || !id) {
+        mirror_fail("eglBindTexImage lacks known pbuffer target/texture");
+        return;
+    }
+    if (!q_target_copy(mirror_ctx, surface->target, id)) {
+        mirror_fail("copy pbuffer target into guest texture");
+    } else {
+        GString *message = g_string_new(NULL);
+        g_string_append_printf(
+            message,
+            "{\"kind\":\"pbuffer_texture_copy\",\"call_id\":\"%" PRIu64
+            "\",\"surface\":\"0x%08x\",\"texture\":\"0x%08x\",\"unit\":%u,"
+            "\"size\":[%d,%d],\"status\":\"copied\"}",
+            pending_call->id, (uint32_t)args[1], id, unit, surface->width,
+            surface->height);
+        emit(message);
+        g_string_free(message, TRUE);
+    }
+}
+
+/* Guest state follows submission order so later draws see the same GL state. */
+static void handle_state_glactivetexture(Pending *pending_call)
+{
+    uint64_t *args = pending_call->args;
+    uint64_t *stack = pending_call->stack;
+    (void)args;
+    (void)stack;
+
+    uint32_t unit = (uint32_t)args[0];
+    if (unit < 0x84c0 || unit >= 0x84d0) {
+        mirror_fail("unsupported active texture unit");
+        return;
+    }
+    active_texture_unit = unit - 0x84c0;
+}
+
+/* Guest state follows submission order so later draws see the same GL state. */
+static void handle_state_glbindtexture(Pending *pending_call)
+{
+    uint64_t *args = pending_call->args;
+    uint64_t *stack = pending_call->stack;
+    (void)args;
+    (void)stack;
+
+    if ((uint32_t)args[0] != 0x0de1 ||
+        active_texture_unit >= G_N_ELEMENTS(bound_textures)) {
+        mirror_fail("unsupported texture binding target/unit");
+        return;
+    }
+    bound_textures[active_texture_unit] = (uint32_t)args[1];
+}
+
+/* Guest state follows submission order so later draws see the same GL state. */
+static void handle_state_gltexparameteri(Pending *pending_call)
+{
+    uint64_t *args = pending_call->args;
+    uint64_t *stack = pending_call->stack;
+    (void)args;
+    (void)stack;
+
+    uint32_t target = (uint32_t)args[0], pname = (uint32_t)args[1],
+             value = (uint32_t)args[2],
+             id = active_texture_unit < G_N_ELEMENTS(bound_textures)
+                      ? bound_textures[active_texture_unit]
+                      : 0;
+    if (target != 0x0de1 || !id) {
+        mirror_fail(
+            "texture parameter has unsupported target or no bound texture");
+        return;
+    }
+    if ((pname == 0x2800 || pname == 0x2801)
+            ? (value != 0x2600 && value != 0x2601)
+        : (pname == 0x2802 || pname == 0x2803)
+            ? (value != 0x2901 && value != 0x812f && value != 0x8370)
+            : TRUE) {
+        mirror_fail("unsupported texture parameter pname/value");
+        return;
+    }
+    TextureState *texture = g_hash_table_lookup(textures, idkey(id));
+    if (!texture) {
+        texture = g_new0(TextureState, 1);
+        texture->id = id;
+        texture->min_filter = texture->mag_filter = 0x2601;
+        texture->wrap_s = texture->wrap_t = 0x2901;
+        g_hash_table_insert(textures, idkey(id), texture);
+    }
+    if (pname == 0x2801) {
+        texture->min_filter = value;
+    } else if (pname == 0x2800) {
+        texture->mag_filter = value;
+    } else if (pname == 0x2802) {
+        texture->wrap_s = value;
+    } else {
+        texture->wrap_t = value;
+    }
+    if (!mirror_ctx || !q_tex_param) {
+        return;
+    }
+    if (!q_tex_param(mirror_ctx, id, (int)pname, (int)value)) {
+        mirror_fail("apply texture parameter");
+    }
+}
+
+/* Guest state follows submission order so later draws see the same GL state. */
+static void handle_state_gldrawarrays(Pending *pending_call)
+{
+    uint64_t *args = pending_call->args;
+    uint64_t *stack = pending_call->stack;
+    (void)args;
+    (void)stack;
+
+    capture_draw(pending_call->id, (uint32_t)args[0], (uint32_t)args[1],
+                 (uint32_t)args[2]);
+}
+
+/* Guest state follows submission order so later draws see the same GL state. */
+static void handle_state_eglswapbuffers(Pending *pending_call)
+{
+    uint64_t *args = pending_call->args;
+    uint64_t *stack = pending_call->stack;
+    (void)args;
+    (void)stack;
+
+    if (present_enabled) {
+        present_frame((uint32_t)args[1]);
+    }
+    dump_frame((uint32_t)args[1]);
+}
+
 static void update_live_state(const Qy8RenderExport *fn, Pending *p)
 {
-    uint64_t *a = p->args, *st = p->stack;
-    if (!strcmp(fn->name, "glShaderBinary")) {
-        uint32_t n = MIN((uint32_t)a[0], 8u), len = (uint32_t)st[0];
-        GByteArray *ids = g_byte_array_new(), *blob = g_byte_array_new();
-        if (n && read_mem(a[1], n * 4, ids) && read_mem(a[3], len, blob)) {
-            char *hash = sha256_mem(a[3], len);
-            for (uint32_t i = 0; i < n; i++) {
-                uint32_t id = 0;
-                memcpy(&id, ids->data + i * 4, 4);
-                ShaderState *sh = g_hash_table_lookup(shader_state, idkey(id));
-                if (sh) {
-                    g_free(sh->hash);
-                    g_free(sh->blob);
-                    sh->hash = g_strdup(hash);
-                    sh->blob = g_memdup2(blob->data, blob->len);
-                    sh->blob_size = blob->len;
-                }
-            }
-            g_free(hash);
-        }
-        g_byte_array_unref(blob);
-        g_byte_array_unref(ids);
-    } else if (!strcmp(fn->name, "glAttachShader")) {
-        ProgramState *pr =
-            g_hash_table_lookup(program_state, idkey((uint32_t)a[0]));
-        if (pr && pr->n < G_N_ELEMENTS(pr->shaders)) {
-            pr->shaders[pr->n++] = (uint32_t)a[1];
-        }
-    } else if (!strcmp(fn->name, "glLinkProgram")) {
-        ProgramState *pr =
-            g_hash_table_lookup(program_state, idkey((uint32_t)a[0]));
-        if (pr) {
-            pr->linked = FALSE;
-        }
-    } else if (!strcmp(fn->name, "glUseProgram")) {
-        current_program = (uint32_t)a[0];
-    } else if (!strcmp(fn->name, "glGetUniformLocation") ||
-               !strcmp(fn->name, "glGetAttribLocation")) {
-        /* Return values are associated with the pending call in return_cb. */
-    } else if (!strcmp(fn->name, "glUniformMatrix4fv")) {
-        char *k = loc_key(current_program, (int32_t)a[0]);
-        const char *name = g_hash_table_lookup(uniform_locations, k);
-        if (name) {
-            UniformState *u = uniform_get_or_add(current_program, name);
-            u->kind = 1;
-            u->count = 16;
-            for (int i = 0; i < 16; i++) {
-                uint32_t raw = 0;
-                if (read_u32(a[3] + i * 4, &raw)) {
-                    memcpy(&u->f[i], &raw, 4);
-                }
-            }
-        }
-        g_free(k);
-    } else if (!strcmp(fn->name, "glUniform1f") ||
-               !strcmp(fn->name, "glUniform1i") ||
-               !strcmp(fn->name, "glUniform4f")) {
-        char *k = loc_key(current_program, (int32_t)a[0]);
-        const char *name = g_hash_table_lookup(uniform_locations, k);
-        if (name) {
-            UniformState *u = uniform_get_or_add(current_program, name);
-            if (!strcmp(fn->name, "glUniform1i")) {
-                u->kind = 2;
-                u->count = 1;
-                u->i[0] = (int32_t)a[1];
-            } else {
-                u->kind = 1;
-                u->count = !strcmp(fn->name, "glUniform4f") ? 4 : 1;
-                for (int i = 0; i < u->count; i++) {
-                    uint32_t raw = i < 3 ? (uint32_t)a[i + 1] : (uint32_t)st[0];
-                    memcpy(&u->f[i], &raw, 4);
-                }
-            }
-        }
-        g_free(k);
-    } else if (!strcmp(fn->name, "glEnableVertexAttribArray") ||
-               !strcmp(fn->name, "glDisableVertexAttribArray")) {
-        uint32_t ix = (uint32_t)a[0];
-        if (ix < G_N_ELEMENTS(attrs)) {
-            attrs[ix].enabled = !strcmp(fn->name, "glEnableVertexAttribArray");
-        }
-    } else if (!strcmp(fn->name, "glViewport")) {
-        for (int i = 0; i < 4; i++) {
-            viewport[i] = (int32_t)a[i];
-        }
-        have_viewport = TRUE;
-    } else if (!strcmp(fn->name, "glEnable")) {
-        if (a[0] == 0x0be2) {
-            blend_enabled = 1;
-        } else {
-            mirror_fail("unsupported enabled GL capability");
-        }
-    } else if (!strcmp(fn->name, "glDisable")) {
-        if (a[0] != 0x0be2 && a[0] != 0x0bd0 && a[0] != 0x0b71 &&
-            a[0] != 0x0b90) {
-            mirror_fail("unsupported disabled GL capability");
-        }
-    } else if (!strcmp(fn->name, "glBlendFuncSeparate")) {
-        for (int i = 0; i < 4; i++) {
-            blend_func[i] = (int32_t)a[i];
-        }
-    } else if (!strcmp(fn->name, "glBlendColor")) {
-        for (int i = 0; i < 4; i++) {
-            uint32_t raw = (uint32_t)a[i];
-            memcpy(&blend_color[i], &raw, 4);
-        }
-    } else if (!strcmp(fn->name, "glClearColor")) {
-        for (int i = 0; i < 4; i++) {
-            uint32_t raw = (uint32_t)a[i];
-            memcpy(&clear_rgba[i], &raw, 4);
-        }
-    } else if (!strcmp(fn->name, "glClear")) {
-        uint32_t mask = (uint32_t)a[0];
-        if (mask & ~0x4100u) {
-            mirror_fail("unsupported glClear bit");
-            return;
-        }
-        if (!mirror_ctx && !load_qy8r()) {
-            return;
-        }
-        SurfaceState *surface = surface_ensure_target(active_surface);
-        if (!surface || !q_target_bind(mirror_ctx, surface->target) ||
-            !q_clear(mirror_ctx, clear_rgba[0], clear_rgba[1], clear_rgba[2],
-                     clear_rgba[3])) {
-            mirror_fail("apply guest clear");
-        }
-    } else if (!strcmp(fn->name, "eglBindTexImage")) {
-        if (!mirror_ctx && !load_qy8r()) {
-            return;
-        }
-        SurfaceState *surface = surface_get((uint32_t)a[1]);
-        uint32_t unit = active_texture_unit < G_N_ELEMENTS(bound_textures)
-                            ? active_texture_unit
-                            : 0,
-                 id = bound_textures[unit];
-        if (!surface || !surface->target || !id) {
-            mirror_fail("eglBindTexImage lacks known pbuffer target/texture");
-            return;
-        }
-        if (!q_target_copy(mirror_ctx, surface->target, id)) {
-            mirror_fail("copy pbuffer target into guest texture");
-        } else {
-            GString *s = g_string_new(NULL);
-            g_string_append_printf(
-                s,
-                "{\"kind\":\"pbuffer_texture_copy\",\"call_id\":\"%" PRIu64
-                "\",\"surface\":\"0x%08x\",\"texture\":\"0x%08x\",\"unit\":%u,"
-                "\"size\":[%d,%d],\"status\":\"copied\"}",
-                p->id, (uint32_t)a[1], id, unit, surface->width,
-                surface->height);
-            emit(s);
-            g_string_free(s, TRUE);
-        }
-    } else if (!strcmp(fn->name, "glActiveTexture")) {
-        uint32_t unit = (uint32_t)a[0];
-        if (unit < 0x84c0 || unit >= 0x84d0) {
-            mirror_fail("unsupported active texture unit");
-            return;
-        }
-        active_texture_unit = unit - 0x84c0;
-    } else if (!strcmp(fn->name, "glBindTexture")) {
-        if ((uint32_t)a[0] != 0x0de1 ||
-            active_texture_unit >= G_N_ELEMENTS(bound_textures)) {
-            mirror_fail("unsupported texture binding target/unit");
-            return;
-        }
-        bound_textures[active_texture_unit] = (uint32_t)a[1];
-    } else if (!strcmp(fn->name, "glTexParameteri")) {
-        uint32_t target = (uint32_t)a[0], pname = (uint32_t)a[1],
-                 value = (uint32_t)a[2],
-                 id = active_texture_unit < G_N_ELEMENTS(bound_textures)
-                          ? bound_textures[active_texture_unit]
-                          : 0;
-        if (target != 0x0de1 || !id) {
-            mirror_fail(
-                "texture parameter has unsupported target or no bound texture");
-            return;
-        }
-        if ((pname == 0x2800 || pname == 0x2801)
-                ? (value != 0x2600 && value != 0x2601)
-            : (pname == 0x2802 || pname == 0x2803)
-                ? (value != 0x2901 && value != 0x812f && value != 0x8370)
-                : TRUE) {
-            mirror_fail("unsupported texture parameter pname/value");
-            return;
-        }
-        TextureState *t = g_hash_table_lookup(textures, idkey(id));
-        if (!t) {
-            t = g_new0(TextureState, 1);
-            t->id = id;
-            t->min_filter = t->mag_filter = 0x2601;
-            t->wrap_s = t->wrap_t = 0x2901;
-            g_hash_table_insert(textures, idkey(id), t);
-        }
-        if (pname == 0x2801) {
-            t->min_filter = value;
-        } else if (pname == 0x2800) {
-            t->mag_filter = value;
-        } else if (pname == 0x2802) {
-            t->wrap_s = value;
-        } else {
-            t->wrap_t = value;
-        }
-        if (!mirror_ctx || !q_tex_param) {
-            return;
-        }
-        if (!q_tex_param(mirror_ctx, id, (int)pname, (int)value)) {
-            mirror_fail("apply texture parameter");
-        }
-    } else if (!strcmp(fn->name, "glDrawArrays")) {
-        capture_draw(p->id, (uint32_t)a[0], (uint32_t)a[1], (uint32_t)a[2]);
-    } else if (!strcmp(fn->name, "eglSwapBuffers")) {
-        if (present_enabled) {
-            present_frame((uint32_t)a[1]);
-        }
-        dump_frame((uint32_t)a[1]);
+    (void)fn;
+    if (p->fn->dispatch && p->fn->dispatch->entry) {
+        p->fn->dispatch->entry(p);
     }
 }
 
@@ -1771,195 +2243,335 @@ static size_t gl_type_width(uint32_t type)
     }
 }
 
-static void append_capture(GString *s, const Qy8RenderExport *fn, Pending *p)
+static void capture_separator(GString *capture, gboolean *comma)
 {
-    uint64_t *a = p->args, *st = p->stack;
-    gboolean comma = FALSE;
-#define SEP()                                                                  \
-    do {                                                                       \
-        if (comma)                                                             \
-            g_string_append_c(s, ',');                                         \
-        comma = TRUE;                                                          \
-    } while (0)
-#define KEY(k)                                                                 \
-    do {                                                                       \
-        SEP();                                                                 \
-        json_quote(s, k);                                                      \
-        g_string_append_c(s, ':');                                             \
-    } while (0)
-    g_string_append_c(s, '{');
-    if (!strcmp(fn->name, "eglGetProcAddress")) {
-        KEY("name");
-        char *v = read_cstr(a[0]);
-        if (v) {
-            json_quote(s, v);
-            g_free(v);
-        } else {
-            g_string_append(s, "null");
-        }
-    } else if (!strcmp(fn->name, "glGetUniformLocation") ||
-               !strcmp(fn->name, "glGetAttribLocation")) {
-        KEY("name");
-        char *v = read_cstr(a[1]);
-        if (v) {
-            json_quote(s, v);
-            g_free(v);
-        } else {
-            g_string_append(s, "null");
-        }
-    } else if (!strcmp(fn->name, "eglChooseConfig") ||
-               !strcmp(fn->name, "eglCreateWindowSurface") ||
-               !strcmp(fn->name, "eglCreatePbufferSurface") ||
-               !strcmp(fn->name, "eglCreateContext")) {
-        uint64_t ptr =
-            !strcmp(fn->name, "eglChooseConfig")
-                ? a[1]
-                : (!strcmp(fn->name, "eglCreatePbufferSurface") ? a[2] : a[3]);
-        KEY("attributes");
-        append_attr_list(s, ptr);
-    } else if (!strcmp(fn->name, "glShaderBinary")) {
-        uint32_t n = (uint32_t)a[0], len = (uint32_t)st[0];
-        KEY("shader_ids");
-        append_word_array(s, a[1], MIN(n, 64));
-        KEY("length");
-        g_string_append_printf(s, "%u", len);
-        KEY("blob_sha256");
-        char *hash = sha256_mem(a[3], len);
-        if (hash) {
-            json_quote(s, hash);
-            g_free(hash);
-        } else {
-            g_string_append(s, "null");
-        }
-        KEY("blob_base64");
-        char *blob = len <= 4u * 1024u * 1024u ? base64_mem(a[3], len) : NULL;
-        if (blob) {
-            json_quote(s, blob);
-            g_free(blob);
-        } else {
-            g_string_append(s, "null");
-        }
-    } else if (!strcmp(fn->name, "glCompressedTexImage2D") ||
-               !strcmp(fn->name, "glCompressedTexSubImage2D")) {
-        uint32_t len =
-            (uint32_t)(!strcmp(fn->name, "glCompressedTexImage2D") ? st[2]
-                                                                   : st[3]);
-        uint64_t ptr =
-            !strcmp(fn->name, "glCompressedTexImage2D") ? st[3] : st[4];
-        KEY("image_size");
-        g_string_append_printf(s, "%u", len);
-        KEY("data_sha256");
-        char *hash = sha256_mem(ptr, len);
-        if (hash) {
-            json_quote(s, hash);
-            g_free(hash);
-        } else {
-            g_string_append(s, "null");
-        }
-    } else if (!strcmp(fn->name, "glUniformMatrix4fv")) {
-        size_t len = (size_t)MIN((uint64_t)4096, a[1]) * 64;
-        KEY("values_base64");
-        char *v = base64_mem(a[3], len);
-        if (v) {
-            json_quote(s, v);
-            g_free(v);
-        } else {
-            g_string_append(s, "null");
-        }
-    } else if (!strcmp(fn->name, "glUniform1f") ||
-               !strcmp(fn->name, "glUniform1i")) {
-        KEY("location");
-        g_string_append_printf(s, "%u", (uint32_t)a[0]);
-        KEY("value_bits");
-        g_string_append_printf(s, "\"0x%08x\"", (uint32_t)a[1]);
-    } else if (!strcmp(fn->name, "glUniform4f")) {
-        KEY("location");
-        g_string_append_printf(s, "%u", (uint32_t)a[0]);
-        KEY("value_bits");
-        g_string_append_c(s, '[');
-        for (int i = 1; i < 4; i++) {
-            if (i > 1) {
-                g_string_append_c(s, ',');
-            }
-            g_string_append_printf(s, "\"0x%08x\"", (uint32_t)a[i]);
-        }
-        g_string_append_printf(s, ",\"0x%08x\"]", (uint32_t)st[0]);
-    } else if (!strcmp(fn->name, "glUniform3fv")) {
-        size_t len = (size_t)MIN((uint64_t)4096, a[0]) * 12;
-        KEY("values_base64");
-        char *v = base64_mem(a[1], len);
-        if (v) {
-            json_quote(s, v);
-            g_free(v);
-        } else {
-            g_string_append(s, "null");
-        }
-    } else if (!strcmp(fn->name, "glVertexAttribPointer")) {
-        uint32_t ix = (uint32_t)a[0];
-        if (ix < G_N_ELEMENTS(attrs)) {
-            attrs[ix] = (VertexAttr){ .index = ix,
-                                      .size = (uint32_t)a[1],
-                                      .type = (uint32_t)a[2],
-                                      .normalized = (uint32_t)a[3],
-                                      .stride = (uint32_t)st[0],
-                                      .ptr = st[1],
-                                      .valid = TRUE,
-                                      .enabled = attrs[ix].enabled };
-        }
-        KEY("stride");
-        g_string_append_printf(s, "%" PRIu64, st[0]);
-        KEY("pointer");
-        g_string_append_printf(s, "\"0x%08" PRIx64 "\"", st[1]);
-    } else if (!strcmp(fn->name, "glEnableVertexAttribArray") ||
-               !strcmp(fn->name, "glDisableVertexAttribArray")) {
-        uint32_t ix = (uint32_t)a[0];
-        if (ix < G_N_ELEMENTS(attrs)) {
-            attrs[ix].enabled = !strcmp(fn->name, "glEnableVertexAttribArray");
-        }
-    } else if (!strcmp(fn->name, "glDrawArrays")) {
-        uint32_t first = (uint32_t)a[1], count = MIN((uint32_t)a[2], 4096u);
-        KEY("attributes");
-        g_string_append_c(s, '[');
-        gboolean first_attr = TRUE;
-        for (size_t i = 0; i < G_N_ELEMENTS(attrs); ++i) {
-            if (attrs[i].valid && attrs[i].enabled) {
-                VertexAttr *v = &attrs[i];
-                size_t width = gl_type_width(v->type), elem = width * v->size,
-                       stride = v->stride ? v->stride : elem;
-                size_t len = count ? ((size_t)(count - 1) * stride + elem) : 0;
-                uint64_t address = v->ptr + (uint64_t)first * stride;
-                char *b64 = len && len <= 4u * 1024u * 1024u
-                                ? base64_mem(address, len)
-                                : g_strdup("");
-                if (!first_attr) {
-                    g_string_append_c(s, ',');
-                }
-                first_attr = FALSE;
-                g_string_append_printf(
-                    s,
-                    "{\"index\":%zu,\"size\":%u,\"type\":\"0x%x\","
-                    "\"normalized\":%s,\"stride\":%zu,\"pointer\":\"0x%"
-                    "08" PRIx64
-                    "\",\"byte_offset\":%zu,\"count\":%u,\"data_base64\":",
-                    i, v->size, v->type, v->normalized ? "true" : "false",
-                    stride, v->ptr, (size_t)first * stride, count);
-                if (b64) {
-                    json_quote(s, b64);
-                    g_free(b64);
-                } else {
-                    g_string_append(s, "null");
-                }
-                g_string_append_c(s, '}');
-            }
-        }
-        g_string_append_c(s, ']');
-    } else if (!strcmp(fn->name, "eglSwapBuffers")) {
-        KEY("frame");
-        g_string_append_printf(s, "%" PRIu64, ++frame_no);
+    if (*comma) {
+        g_string_append_c(capture, ',');
     }
-    g_string_append_c(s, '}');
-#undef KEY
-#undef SEP
+    *comma = TRUE;
+}
+
+static void capture_key(GString *capture, gboolean *comma, const char *key)
+{
+    capture_separator(capture, comma);
+    json_quote(capture, key);
+    g_string_append_c(capture, ':');
+}
+
+/* Capture guest data before its address can be reused by a later call. */
+static void handle_capture_eglgetprocaddress(GString *capture,
+                                             Pending *pending_call,
+                                             gboolean *comma)
+{
+    uint64_t *args = pending_call->args;
+    uint64_t *stack = pending_call->stack;
+    (void)args;
+    (void)stack;
+
+    capture_key(capture, comma, "name");
+    char *value = read_cstr(args[0]);
+    if (value) {
+        json_quote(capture, value);
+        g_free(value);
+    } else {
+        g_string_append(capture, "null");
+    }
+}
+
+/* Capture guest data before its address can be reused by a later call. */
+static void handle_capture_glgetuniformlocation(GString *capture,
+                                                Pending *pending_call,
+                                                gboolean *comma)
+{
+    uint64_t *args = pending_call->args;
+    uint64_t *stack = pending_call->stack;
+    (void)args;
+    (void)stack;
+
+    capture_key(capture, comma, "name");
+    char *value = read_cstr(args[1]);
+    if (value) {
+        json_quote(capture, value);
+        g_free(value);
+    } else {
+        g_string_append(capture, "null");
+    }
+}
+
+/* Capture guest data before its address can be reused by a later call. */
+static void handle_capture_eglchooseconfig(GString *capture,
+                                           Pending *pending_call,
+                                           gboolean *comma)
+{
+    uint64_t *args = pending_call->args;
+    uint64_t *stack = pending_call->stack;
+    (void)args;
+    (void)stack;
+
+    uint64_t ptr = pending_call->fn->dispatch->variant ==
+                           QY8_RENDER_VARIANT_EGLCHOOSECONFIG
+                       ? args[1]
+                       : (pending_call->fn->dispatch->variant ==
+                                  QY8_RENDER_VARIANT_EGLCREATEPBUFFERSURFACE
+                              ? args[2]
+                              : args[3]);
+    capture_key(capture, comma, "attributes");
+    append_attr_list(capture, ptr);
+}
+
+/* Capture guest data before its address can be reused by a later call. */
+static void handle_capture_glshaderbinary(GString *capture,
+                                          Pending *pending_call,
+                                          gboolean *comma)
+{
+    uint64_t *args = pending_call->args;
+    uint64_t *stack = pending_call->stack;
+    (void)args;
+    (void)stack;
+
+    uint32_t n = (uint32_t)args[0], len = (uint32_t)stack[0];
+    capture_key(capture, comma, "shader_ids");
+    append_word_array(capture, args[1], MIN(n, 64));
+    capture_key(capture, comma, "length");
+    g_string_append_printf(capture, "%u", len);
+    capture_key(capture, comma, "blob_sha256");
+    char *hash = sha256_mem(args[3], len);
+    if (hash) {
+        json_quote(capture, hash);
+        g_free(hash);
+    } else {
+        g_string_append(capture, "null");
+    }
+    capture_key(capture, comma, "blob_base64");
+    char *blob = len <= 4u * 1024u * 1024u ? base64_mem(args[3], len) : NULL;
+    if (blob) {
+        json_quote(capture, blob);
+        g_free(blob);
+    } else {
+        g_string_append(capture, "null");
+    }
+}
+
+/* Capture guest data before its address can be reused by a later call. */
+static void handle_capture_glcompressedteximage2d(GString *capture,
+                                                  Pending *pending_call,
+                                                  gboolean *comma)
+{
+    uint64_t *args = pending_call->args;
+    uint64_t *stack = pending_call->stack;
+    (void)args;
+    (void)stack;
+
+    uint32_t len = (uint32_t)(pending_call->fn->dispatch->variant ==
+                                      QY8_RENDER_VARIANT_GLCOMPRESSEDTEXIMAGE2D
+                                  ? stack[2]
+                                  : stack[3]);
+    uint64_t ptr = pending_call->fn->dispatch->variant ==
+                           QY8_RENDER_VARIANT_GLCOMPRESSEDTEXIMAGE2D
+                       ? stack[3]
+                       : stack[4];
+    capture_key(capture, comma, "image_size");
+    g_string_append_printf(capture, "%u", len);
+    capture_key(capture, comma, "data_sha256");
+    char *hash = sha256_mem(ptr, len);
+    if (hash) {
+        json_quote(capture, hash);
+        g_free(hash);
+    } else {
+        g_string_append(capture, "null");
+    }
+}
+
+/* Capture guest data before its address can be reused by a later call. */
+static void handle_capture_gluniformmatrix4fv(GString *capture,
+                                              Pending *pending_call,
+                                              gboolean *comma)
+{
+    uint64_t *args = pending_call->args;
+    uint64_t *stack = pending_call->stack;
+    (void)args;
+    (void)stack;
+
+    size_t len = (size_t)MIN((uint64_t)4096, args[1]) * 64;
+    capture_key(capture, comma, "values_base64");
+    char *value = base64_mem(args[3], len);
+    if (value) {
+        json_quote(capture, value);
+        g_free(value);
+    } else {
+        g_string_append(capture, "null");
+    }
+}
+
+/* Capture guest data before its address can be reused by a later call. */
+static void handle_capture_gluniform1f(GString *capture, Pending *pending_call,
+                                       gboolean *comma)
+{
+    uint64_t *args = pending_call->args;
+    uint64_t *stack = pending_call->stack;
+    (void)args;
+    (void)stack;
+
+    capture_key(capture, comma, "location");
+    g_string_append_printf(capture, "%u", (uint32_t)args[0]);
+    capture_key(capture, comma, "value_bits");
+    g_string_append_printf(capture, "\"0x%08x\"", (uint32_t)args[1]);
+}
+
+/* Capture guest data before its address can be reused by a later call. */
+static void handle_capture_gluniform4f(GString *capture, Pending *pending_call,
+                                       gboolean *comma)
+{
+    uint64_t *args = pending_call->args;
+    uint64_t *stack = pending_call->stack;
+    (void)args;
+    (void)stack;
+
+    capture_key(capture, comma, "location");
+    g_string_append_printf(capture, "%u", (uint32_t)args[0]);
+    capture_key(capture, comma, "value_bits");
+    g_string_append_c(capture, '[');
+    for (int i = 1; i < 4; i++) {
+        if (i > 1) {
+            g_string_append_c(capture, ',');
+        }
+        g_string_append_printf(capture, "\"0x%08x\"", (uint32_t)args[i]);
+    }
+    g_string_append_printf(capture, ",\"0x%08x\"]", (uint32_t)stack[0]);
+}
+
+/* Capture guest data before its address can be reused by a later call. */
+static void handle_capture_gluniform3fv(GString *capture, Pending *pending_call,
+                                        gboolean *comma)
+{
+    uint64_t *args = pending_call->args;
+    uint64_t *stack = pending_call->stack;
+    (void)args;
+    (void)stack;
+
+    size_t len = (size_t)MIN((uint64_t)4096, args[0]) * 12;
+    capture_key(capture, comma, "values_base64");
+    char *value = base64_mem(args[1], len);
+    if (value) {
+        json_quote(capture, value);
+        g_free(value);
+    } else {
+        g_string_append(capture, "null");
+    }
+}
+
+/* Capture guest data before its address can be reused by a later call. */
+static void handle_capture_glvertexattribpointer(GString *capture,
+                                                 Pending *pending_call,
+                                                 gboolean *comma)
+{
+    uint64_t *args = pending_call->args;
+    uint64_t *stack = pending_call->stack;
+    (void)args;
+    (void)stack;
+
+    uint32_t ix = (uint32_t)args[0];
+    if (ix < G_N_ELEMENTS(attrs)) {
+        attrs[ix] = (VertexAttr){ .index = ix,
+                                  .size = (uint32_t)args[1],
+                                  .type = (uint32_t)args[2],
+                                  .normalized = (uint32_t)args[3],
+                                  .stride = (uint32_t)stack[0],
+                                  .ptr = stack[1],
+                                  .valid = TRUE,
+                                  .enabled = attrs[ix].enabled };
+    }
+    capture_key(capture, comma, "stride");
+    g_string_append_printf(capture, "%" PRIu64, stack[0]);
+    capture_key(capture, comma, "pointer");
+    g_string_append_printf(capture, "\"0x%08" PRIx64 "\"", stack[1]);
+}
+
+/* Capture guest data before its address can be reused by a later call. */
+static void handle_capture_glenablevertexattribarray(GString *capture,
+                                                     Pending *pending_call,
+                                                     gboolean *comma)
+{
+    uint64_t *args = pending_call->args;
+    (void)capture;
+    (void)comma;
+
+    uint32_t ix = (uint32_t)args[0];
+    if (ix < G_N_ELEMENTS(attrs)) {
+        attrs[ix].enabled = pending_call->fn->dispatch->variant ==
+                            QY8_RENDER_VARIANT_GLENABLEVERTEXATTRIBARRAY;
+    }
+}
+
+/* Capture guest data before its address can be reused by a later call. */
+static void handle_capture_gldrawarrays(GString *capture, Pending *pending_call,
+                                        gboolean *comma)
+{
+    uint64_t *args = pending_call->args;
+    (void)args;
+
+    uint32_t first = (uint32_t)args[1];
+    uint32_t count = MIN((uint32_t)args[2], 4096u);
+    capture_key(capture, comma, "attributes");
+    g_string_append_c(capture, '[');
+    gboolean first_attr = TRUE;
+    for (size_t i = 0; i < G_N_ELEMENTS(attrs); ++i) {
+        if (attrs[i].valid && attrs[i].enabled) {
+            VertexAttr *value = &attrs[i];
+            size_t width = gl_type_width(value->type),
+                   elem = width * value->size,
+                   stride = value->stride ? value->stride : elem;
+            size_t len = count ? ((size_t)(count - 1) * stride + elem) : 0;
+            uint64_t address = value->ptr + (uint64_t)first * stride;
+            char *b64 = len && len <= 4u * 1024u * 1024u
+                            ? base64_mem(address, len)
+                            : g_strdup("");
+            if (!first_attr) {
+                g_string_append_c(capture, ',');
+            }
+            first_attr = FALSE;
+            g_string_append_printf(
+                capture,
+                "{\"index\":%zu,\"size\":%u,\"type\":\"0x%x\","
+                "\"normalized\":%s,\"stride\":%zu,\"pointer\":\"0x%"
+                "08" PRIx64
+                "\",\"byte_offset\":%zu,\"count\":%u,\"data_base64\":",
+                i, value->size, value->type,
+                value->normalized ? "true" : "false", stride, value->ptr,
+                (size_t)first * stride, count);
+            if (b64) {
+                json_quote(capture, b64);
+                g_free(b64);
+            } else {
+                g_string_append(capture, "null");
+            }
+            g_string_append_c(capture, '}');
+        }
+    }
+    g_string_append_c(capture, ']');
+}
+
+/* Capture guest data before its address can be reused by a later call. */
+static void handle_capture_eglswapbuffers(GString *capture,
+                                          Pending *pending_call,
+                                          gboolean *comma)
+{
+    (void)pending_call;
+
+    capture_key(capture, comma, "frame");
+    g_string_append_printf(capture, "%" PRIu64, ++frame_no);
+}
+
+static void append_capture(GString *capture, const Qy8RenderExport *fn,
+                           Pending *pending_call)
+{
+    gboolean comma = FALSE;
+
+    g_string_append_c(capture, '{');
+    if (fn->dispatch && fn->dispatch->journal) {
+        fn->dispatch->journal(capture, pending_call, &comma);
+    }
+    g_string_append_c(capture, '}');
 }
 
 static void check_all_export_words(void)
@@ -2043,132 +2655,190 @@ static void append_return_string(GString *s, const char *key, uint64_t ptr)
     g_free(v);
 }
 
-static void entry_cb(unsigned int cpu, void *userdata)
+static gboolean read_entry_registers(unsigned int cpu,
+                                     const Qy8RenderExport *function,
+                                     uint32_t registers[4],
+                                     uint32_t *stack_pointer,
+                                     uint32_t *link_register, uint32_t *ttbr)
 {
-    check_all_export_words();
-    const Qy8RenderExport *fn = userdata;
-    uint32_t r[4] = { 0 }, sp = 0, lr = 0, pcword = 0, ttbr = 0;
-    gboolean ok = read_reg(cpu, 0, &r[0]) && read_reg(cpu, 1, &r[1]) &&
-                  read_reg(cpu, 2, &r[2]) && read_reg(cpu, 3, &r[3]) &&
-                  read_reg(cpu, 13, &sp) && read_reg(cpu, 14, &lr);
+    gboolean ok =
+        read_reg(cpu, 0, &registers[0]) && read_reg(cpu, 1, &registers[1]) &&
+        read_reg(cpu, 2, &registers[2]) && read_reg(cpu, 3, &registers[3]) &&
+        read_reg(cpu, 13, stack_pointer) && read_reg(cpu, 14, link_register);
+
     if (!ok) {
-        emit_invalid("register_read", fn->base + fn->rva, fn->word, 0);
-        return;
+        emit_invalid("register_read", function->base + function->rva,
+                     function->word, 0);
+        return FALSE;
     }
-    if (!read_ttbr(cpu, &ttbr)) {
-        emit_invalid("ttbr0_read", fn->base + fn->rva, fn->word, 0);
+    if (!read_ttbr(cpu, ttbr)) {
+        emit_invalid("ttbr0_read", function->base + function->rva,
+                     function->word, 0);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static void account_export_call(const Qy8RenderExport *function,
+                                const char *module)
+{
+    g_mutex_lock(&lock);
+    if (function->index < G_N_ELEMENTS(required_names)) {
+        fn_counts[function->index]++;
+    }
+    uint64_t *module_count = g_hash_table_lookup(module_counts, module);
+    if (!module_count) {
+        module_count = g_new0(uint64_t, 1);
+        g_hash_table_insert(module_counts, g_strdup(module), module_count);
+    }
+    (*module_count)++;
+    g_mutex_unlock(&lock);
+}
+
+static void emit_foreign_entry(const Qy8RenderExport *function,
+                               const char *module, uint32_t link_register)
+{
+    GString *event = g_string_new(NULL);
+
+    g_string_append_printf(
+        event,
+        "{\"seq\":\"%" PRIu64 "\",\"kind\":\"count\",\"name\":", next_seq++);
+    json_quote(event, function->name);
+    g_string_append(event, ",\"lr_module\":");
+    json_quote(event, module);
+    g_string_append_printf(event, ",\"lr\":\"0x%08x\"}", link_register);
+    emit(event);
+    g_string_free(event, TRUE);
+}
+
+static void emit_entry_event(const Qy8RenderExport *function, Pending *call,
+                             gboolean is_dynamic, uint32_t registers[4],
+                             uint32_t link_register, uint32_t pc_word,
+                             uint64_t stack_values[8])
+{
+    GString *event = g_string_new(NULL);
+
+    g_string_append_printf(event,
+                           "{\"seq\":\"%" PRIu64 "\",\"kind\":\"%s\","
+                           "\"call_id\":\"%" PRIu64 "\",\"name\":",
+                           next_seq++, is_dynamic ? "dynamic_entry" : "entry",
+                           call->id);
+    json_quote(event, function->name);
+    g_string_append_printf(
+        event,
+        ",\"lr\":\"0x%08x\",\"lr_module\":\"auirtdll.dll\","
+        "\"sp\":\"0x%08x\",\"word\":\"0x%08x\",\"args\":["
+        "\"0x%08x\",\"0x%08x\",\"0x%08x\",\"0x%08x\"],\"stack\":[",
+        link_register, (uint32_t)call->sp, pc_word, registers[0], registers[1],
+        registers[2], registers[3]);
+    for (int i = 0; i < 8; i++) {
+        if (i) {
+            g_string_append_c(event, ',');
+        }
+        g_string_append_printf(event, "\"0x%08" PRIx64 "\"", stack_values[i]);
+    }
+    g_string_append(event, "],\"capture\":");
+    append_capture(event, function, call);
+    g_string_append_c(event, '}');
+    emit(event);
+    g_string_free(event, TRUE);
+}
+
+static void skip_service_call(const Qy8RenderExport *function, Pending *call,
+                              uint32_t link_register)
+{
+    uint64_t count;
+
+    if (function->dispatch->service_class == 1) {
+        count = ++service_draw_calls;
+    } else if (function->dispatch->service_class == 2) {
+        count = ++service_clear_calls;
+    } else {
+        count = ++service_other_calls;
+    }
+    GString *event = g_string_new(NULL);
+    g_string_append_printf(event,
+                           "{\"seq\":\"%" PRIu64
+                           "\",\"kind\":\"service_skip\",\"function\":",
+                           next_seq++);
+    json_quote(event, function->name);
+    g_string_append_printf(
+        event, ",\"call\":\"%" PRIu64 "\",\"call_id\":\"%" PRIu64 "\"}", count,
+        call->id);
+    emit(event);
+    g_string_free(event, TRUE);
+    g_free(call);
+    qemu_plugin_set_pc(link_register);
+}
+
+static void process_entry(unsigned int cpu, const Qy8RenderExport *function)
+{
+    uint32_t registers[4] = { 0 };
+    uint32_t stack_pointer = 0;
+    uint32_t link_register = 0;
+    uint32_t ttbr = 0;
+    uint32_t pc_word = 0;
+
+    check_all_export_words();
+    if (!read_entry_registers(cpu, function, registers, &stack_pointer,
+                              &link_register, &ttbr)) {
         return;
     }
     current_proc = proc_get(ttbr);
-    uint32_t pc = fn->base + fn->rva;
-    if (!read_u32(pc, &pcword) || pcword != fn->word) {
-        emit_invalid("export_word", pc, fn->word, pcword);
+    uint32_t pc = function->base + function->rva;
+    if (!read_u32(pc, &pc_word) || pc_word != function->word) {
+        emit_invalid("export_word", pc, function->word, pc_word);
         return;
     }
-    uint64_t stack[8] = { 0 };
-    read_stack(sp, stack);
-    char unknown[48];
-    const char *module = module_for_lr(lr, unknown, sizeof(unknown));
-    g_mutex_lock(&lock);
-    if (fn->index < G_N_ELEMENTS(required_names)) {
-        fn_counts[fn->index]++;
-    }
-    uint64_t *mc = g_hash_table_lookup(module_counts, module);
-    if (!mc) {
-        mc = g_new0(uint64_t, 1);
-        g_hash_table_insert(module_counts, g_strdup(module), mc);
-    }
-    (*mc)++;
-    g_mutex_unlock(&lock);
-    gboolean service_target =
-        service_draws &&
-        (!strcmp(fn->name, "glDrawArrays") ||
-         !strcmp(fn->name, "glDrawElements") || !strcmp(fn->name, "glClear") ||
-         !strcmp(fn->name, "glFlush") || !strcmp(fn->name, "glFinish"));
+    uint64_t stack_values[8] = { 0 };
+    read_stack(stack_pointer, stack_values);
+    char unknown_module[48];
+    const char *module =
+        module_for_lr(link_register, unknown_module, sizeof(unknown_module));
+    account_export_call(function, module);
+
+    gboolean service_target = service_draws && function->dispatch &&
+                              function->dispatch->service_target;
     uint32_t current_process = 0;
     gboolean process_is_aui =
         service_target && current_process_is_aui(&current_process);
     gboolean caller_is_aui = !strcmp(module, "auirtdll.dll");
     if (service_target && (!caller_is_aui || !process_is_aui)) {
-        emit_service_foreign(fn->name, module, lr, current_process,
-                             current_process != 0);
+        emit_service_foreign(function->name, module, link_register,
+                             current_process, current_process != 0);
     }
-    if (strcmp(module, "auirtdll.dll")) {
-        GString *s = g_string_new(NULL);
-        g_string_append_printf(
-            s, "{\"seq\":\"%" PRIu64 "\",\"kind\":\"count\",\"name\":",
-            next_seq++);
-        json_quote(s, fn->name);
-        g_string_append(s, ",\"lr_module\":");
-        json_quote(s, module);
-        g_string_append_printf(s, ",\"lr\":\"0x%08x\"}", lr);
-        emit(s);
-        g_string_free(s, TRUE);
+    if (!caller_is_aui) {
+        emit_foreign_entry(function, module, link_register);
         return;
     }
     gboolean is_dynamic =
-        g_hash_table_lookup(dynamic_exports, GUINT_TO_POINTER(fn->base)) == fn;
-    Pending *p = g_new0(Pending, 1);
-    p->id = is_dynamic ? next_dynamic_call++ : next_call++;
-    p->lr = lr;
-    p->sp = sp;
-    p->return_pc = lr & ~1u;
-    p->fn = fn;
-    p->ttbr = ttbr;
+        g_hash_table_lookup(dynamic_exports,
+                            GUINT_TO_POINTER(function->base)) == function;
+    Pending *call = g_new0(Pending, 1);
+    call->id = is_dynamic ? next_dynamic_call++ : next_call++;
+    call->lr = link_register;
+    call->sp = stack_pointer;
+    call->return_pc = link_register & ~1u;
+    call->fn = function;
+    call->ttbr = ttbr;
     for (int i = 0; i < 4; i++) {
-        p->args[i] = r[i];
+        call->args[i] = registers[i];
     }
-    memcpy(p->stack, stack, sizeof(stack));
-    GString *s = g_string_new(NULL);
-    g_string_append_printf(
-        s,
-        "{\"seq\":\"%" PRIu64 "\",\"kind\":\"%s\",\"call_id\":\"%" PRIu64
-        "\",\"name\":",
-        next_seq++, is_dynamic ? "dynamic_entry" : "entry", p->id);
-    json_quote(s, fn->name);
-    g_string_append_printf(
-        s,
-        ",\"lr\":\"0x%08x\",\"lr_module\":\"auirtdll.dll\",\"sp\":\"0x%08x\","
-        "\"word\":\"0x%08x\",\"args\":[\"0x%08x\",\"0x%08x\",\"0x%08x\",\"0x%"
-        "08x\"],\"stack\":[",
-        lr, sp, pcword, r[0], r[1], r[2], r[3]);
-    for (int i = 0; i < 8; i++) {
-        if (i) {
-            g_string_append_c(s, ',');
-        }
-        g_string_append_printf(s, "\"0x%08" PRIx64 "\"", stack[i]);
-    }
-    g_string_append(s, "],\"capture\":");
-    append_capture(s, fn, p);
-    g_string_append_c(s, '}');
-    emit(s);
-    g_string_free(s, TRUE);
-    update_live_state(fn, p);
+    memcpy(call->stack, stack_values, sizeof(stack_values));
+    emit_entry_event(function, call, is_dynamic, registers, link_register,
+                     pc_word, stack_values);
+    update_live_state(function, call);
     if (service_target && caller_is_aui && process_is_aui) {
-        uint64_t n =
-            (!strcmp(fn->name, "glDrawArrays") ||
-             !strcmp(fn->name, "glDrawElements"))
-                ? ++service_draw_calls
-                : (!strcmp(fn->name, "glClear") ? ++service_clear_calls
-                                                : ++service_other_calls);
-        GString *skip = g_string_new(NULL);
-        g_string_append_printf(skip,
-                               "{\"seq\":\"%" PRIu64
-                               "\",\"kind\":\"service_skip\",\"function\":",
-                               next_seq++);
-        json_quote(skip, fn->name);
-        g_string_append_printf(
-            skip, ",\"call\":\"%" PRIu64 "\",\"call_id\":\"%" PRIu64 "\"}", n,
-            p->id);
-        emit(skip);
-        g_string_free(skip, TRUE);
-        g_free(p);
-        qemu_plugin_set_pc(lr);
+        skip_service_call(function, call, link_register);
         return;
     }
-    g_ptr_array_add(pending, p);
+    g_ptr_array_add(pending, call);
 }
 
+static void entry_cb(unsigned int cpu, void *userdata)
+{
+    process_entry(cpu, userdata);
+}
 static gboolean callsite_valid(const Qy8RenderReturnSite *site)
 {
     for (int i = 0; i < site->count; i++) {
@@ -2184,189 +2854,974 @@ static gboolean callsite_valid(const Qy8RenderReturnSite *site)
     return FALSE;
 }
 
+/* Return data completes state associated with the pending guest call. */
+static void handle_return_eglgetprocaddress(GString *event,
+                                            Pending *pending_call,
+                                            uint32_t result)
+{
+    (void)event;
+    (void)pending_call;
+    (void)result;
+
+    char *name = read_cstr(pending_call->args[0]);
+    const Qy8RenderDispatch *dispatch =
+        name ? render_dispatch_lookup(name) : NULL;
+    if (dispatch && dispatch->dynamic_entry && result) {
+        uint32_t va = result & ~1u, word = 0;
+        if (!read_u32(va, &word)) {
+            mirror_fail("cannot read dynamically resolved EGL/GLES entry word");
+        } else {
+            Qy8RenderExport *x = g_new0(Qy8RenderExport, 1);
+            x->name = g_strdup(name);
+            x->base = va;
+            x->rva = 0;
+            x->word = word;
+            x->index = G_MAXSIZE;
+            x->dispatch = dispatch;
+            g_hash_table_replace(dynamic_exports, GUINT_TO_POINTER(va), x);
+        }
+    }
+    g_free(name);
+}
+
+/* Return data completes state associated with the pending guest call. */
+static void handle_return_eglcreateimagekhr(GString *event,
+                                            Pending *pending_call,
+                                            uint32_t result)
+{
+    (void)event;
+    (void)pending_call;
+    (void)result;
+
+    uint32_t words[12] = { 0 };
+    for (int j = 0; j < 12; j++) {
+        read_u32((uint64_t)result + j * 4, &words[j]);
+    }
+    ImageState *im = g_new0(ImageState, 1);
+    im->handle = result;
+    im->width = words[1];
+    im->height = words[2];
+    im->format = words[3];
+    im->stride = words[5];
+    im->linear = ((uint64_t)words[6]);
+    uint32_t bitmap = 0;
+    read_u32((uint64_t)result + 0x2c, &bitmap);
+    im->handle = bitmap;
+    g_hash_table_replace(images, idkey(result), im);
+    GString *extra = g_string_new(NULL);
+    g_string_append_printf(
+        extra,
+        "{\"kind\":\"image_state\",\"image\":\"0x%08x\",\"handle\":"
+        "\"0x%08x\",\"width\":%u,\"height\":%u,\"format\":\"0x%08x\","
+        "\"stride\":%u,\"pvLinAddr\":\"0x%08" PRIx64 "\"}",
+        result, bitmap, im->width, im->height, im->format, im->stride,
+        im->linear);
+    emit(extra);
+    g_string_free(extra, TRUE);
+}
+
+/* Return data completes state associated with the pending guest call. */
+static void handle_return_eglcreatewindowsurface(GString *event,
+                                                 Pending *pending_call,
+                                                 uint32_t result)
+{
+    (void)event;
+    (void)pending_call;
+    (void)result;
+
+    if (result) {
+        surface_add_from_create(pending_call->fn, pending_call, result);
+    }
+}
+
+/* Return data completes state associated with the pending guest call. */
+static void handle_return_gleglimagetargettexture2does(GString *event,
+                                                       Pending *pending_call,
+                                                       uint32_t result)
+{
+    (void)event;
+    (void)pending_call;
+    (void)result;
+
+    uint32_t texture = active_texture_unit < G_N_ELEMENTS(bound_textures)
+                           ? bound_textures[active_texture_unit]
+                           : 0;
+    TextureState *guest_texture = g_hash_table_lookup(textures, idkey(texture));
+    if (texture && !guest_texture) {
+        guest_texture = g_new0(TextureState, 1);
+        guest_texture->id = texture;
+        guest_texture->min_filter = guest_texture->mag_filter = 0x2601;
+        guest_texture->wrap_s = guest_texture->wrap_t = 0x2901;
+        g_hash_table_insert(textures, idkey(texture), guest_texture);
+    }
+    if (guest_texture) {
+        guest_texture->image = (uint32_t)pending_call->args[1];
+    } else {
+        mirror_fail("EGLImageTarget without guest texture");
+    }
+}
+
+/* Return data completes state associated with the pending guest call. */
+static void handle_return_glgetprogramiv(GString *event, Pending *pending_call,
+                                         uint32_t result)
+{
+    (void)event;
+    (void)pending_call;
+    (void)result;
+
+    append_u32_outputs(event, "words", pending_call->args[2], 1);
+    uint32_t value = 0;
+    if (pending_call->args[1] == 0x8b82 &&
+        read_u32(pending_call->args[2], &value)) {
+        ProgramState *program = g_hash_table_lookup(
+            program_state, idkey((uint32_t)pending_call->args[0]));
+        if (program) {
+            program->linked = value != 0;
+        }
+    }
+}
+
+/* Return data completes state associated with the pending guest call. */
+static void handle_return_glcreateshader(GString *event, Pending *pending_call,
+                                         uint32_t result)
+{
+    (void)event;
+    (void)pending_call;
+    (void)result;
+
+    ShaderState *shader = g_new0(ShaderState, 1);
+    shader->type = (uint32_t)pending_call->args[0];
+    g_hash_table_replace(shader_state, idkey(result), shader);
+}
+
+/* Return data completes state associated with the pending guest call. */
+static void handle_return_glcreateprogram(GString *event, Pending *pending_call,
+                                          uint32_t result)
+{
+    (void)event;
+    (void)pending_call;
+    (void)result;
+
+    ProgramState *program = g_new0(ProgramState, 1);
+    g_hash_table_replace(program_state, idkey(result), program);
+}
+
+/* Return data completes state associated with the pending guest call. */
+static void handle_return_glgetuniformlocation(GString *event,
+                                               Pending *pending_call,
+                                               uint32_t result)
+{
+    (void)event;
+    (void)pending_call;
+    (void)result;
+
+    char *name = read_cstr(pending_call->args[1]);
+    if (name && ((int32_t)result) >= 0) {
+        char *key = loc_key((uint32_t)pending_call->args[0], (int32_t)result);
+        g_hash_table_replace(pending_call->fn->dispatch->variant ==
+                                     QY8_RENDER_VARIANT_GLGETUNIFORMLOCATION
+                                 ? uniform_locations
+                                 : attrib_locations,
+                             key, name);
+    } else {
+        g_free(name);
+    }
+}
+
+/* Return data completes state associated with the pending guest call. */
+static void handle_return_eglmakecurrent(GString *event, Pending *pending_call,
+                                         uint32_t result)
+{
+    (void)event;
+    (void)pending_call;
+    (void)result;
+
+    if (pending_call->args[1] != pending_call->args[2]) {
+        emit_invalid(
+            "makecurrent_draw_read_surface", (uint32_t)pending_call->args[1],
+            (uint32_t)pending_call->args[1], (uint32_t)pending_call->args[2]);
+    }
+    uint32_t next = (uint32_t)pending_call->args[3];
+    if (active_context != next) {
+        save_context_state(active_context);
+        load_context_state(next);
+    }
+    active_context = next;
+    active_surface = (uint32_t)pending_call->args[1];
+    have_makecurrent = TRUE;
+}
+
+/* Return data completes state associated with the pending guest call. */
+static void handle_return_glgentextures(GString *event, Pending *pending_call,
+                                        uint32_t result)
+{
+    (void)event;
+    (void)pending_call;
+    (void)result;
+
+    append_u32_outputs(event, "words", pending_call->args[1],
+                       MIN(pending_call->args[0], 64));
+}
+
+/* Return data completes state associated with the pending guest call. */
+static void handle_return_eglinitialize(GString *event, Pending *pending_call,
+                                        uint32_t result)
+{
+    (void)event;
+    (void)pending_call;
+    (void)result;
+
+    append_u32_outputs(event, "major", pending_call->args[1], 1);
+    append_u32_outputs(event, "minor", pending_call->args[2], 1);
+}
+
+/* Return data completes state associated with the pending guest call. */
+static void handle_return_eglchooseconfig(GString *event, Pending *pending_call,
+                                          uint32_t result)
+{
+    (void)event;
+    (void)pending_call;
+    (void)result;
+
+    append_u32_outputs(event, "num_configs", pending_call->stack[0], 1);
+    append_u32_outputs(event, "configs", pending_call->args[2],
+                       MIN(pending_call->args[3], 64));
+}
+
+/* Return data completes state associated with the pending guest call. */
+static void handle_return_eglgetconfigs(GString *event, Pending *pending_call,
+                                        uint32_t result)
+{
+    (void)event;
+    (void)pending_call;
+    (void)result;
+
+    append_u32_outputs(event, "num_configs", pending_call->args[3], 1);
+    append_u32_outputs(event, "configs", pending_call->args[1],
+                       MIN(pending_call->args[2], 64));
+}
+
+/* Return data completes state associated with the pending guest call. */
+static void handle_return_eglgetconfigattrib(GString *event,
+                                             Pending *pending_call,
+                                             uint32_t result)
+{
+    (void)event;
+    (void)pending_call;
+    (void)result;
+
+    append_u32_outputs(event, "value", pending_call->args[3], 1);
+}
+
+/* Return data completes state associated with the pending guest call. */
+static void handle_return_glgetintegerv(GString *event, Pending *pending_call,
+                                        uint32_t result)
+{
+    (void)event;
+    (void)pending_call;
+    (void)result;
+
+    append_u32_outputs(event, "words", pending_call->args[1], 4);
+}
+
+/* Return data completes state associated with the pending guest call. */
+static void handle_return_glgetstring(GString *event, Pending *pending_call,
+                                      uint32_t result)
+{
+    (void)event;
+    (void)pending_call;
+    (void)result;
+
+    append_return_string(event, "string", result);
+}
+
+static void complete_return(unsigned int cpu, const Qy8RenderReturnSite *site,
+                            Pending *pending_call, guint pending_index,
+                            uint32_t ttbr)
+{
+    uint32_t result = 0;
+
+    current_proc = proc_get(ttbr);
+    if (!callsite_valid(site)) {
+        emit_invalid("return_callsite_word", site->site, site->word, 0);
+        return;
+    }
+    if (!read_reg(cpu, 0, &result)) {
+        emit_invalid("return_r0", site->site, site->word, 0);
+        return;
+    }
+    gboolean is_dynamic =
+        g_hash_table_lookup(dynamic_exports,
+                            GUINT_TO_POINTER(pending_call->fn->base)) ==
+        pending_call->fn;
+    GString *event = g_string_new(NULL);
+    g_string_append_printf(event,
+                           "{\"seq\":\"%" PRIu64 "\",\"kind\":\"%s\","
+                           "\"call_id\":\"%" PRIu64 "\",\"name\":",
+                           next_seq++, is_dynamic ? "dynamic_return" : "return",
+                           pending_call->id);
+    json_quote(event, pending_call->fn->name);
+    g_string_append_printf(event,
+                           ",\"lr\":\"0x%08" PRIx64 "\",\"sp\":\"0x%08" PRIx64
+                           "\",\"r0\":\"0x%08x\",\"return_site\":"
+                           "\"0x%08x\"",
+                           pending_call->lr, pending_call->sp, result,
+                           site->site);
+    if (pending_call->fn->dispatch && pending_call->fn->dispatch->returned) {
+        pending_call->fn->dispatch->returned(event, pending_call, result);
+    }
+    g_string_append_c(event, '}');
+    emit(event);
+    g_string_free(event, TRUE);
+    if (pending_call->fn->dispatch && pending_call->fn->dispatch->variant ==
+                                          QY8_RENDER_VARIANT_EGLSWAPBUFFERS) {
+        completed_swaps++;
+    }
+    g_ptr_array_remove_index(pending, pending_index);
+    g_free(pending_call);
+}
+
 static void return_cb(unsigned int cpu, void *userdata)
 {
     const Qy8RenderReturnSite *site = userdata;
-    if (!pending->len) {
-        return;
-    }
-    uint32_t sp = 0, r0 = 0, ttbr = 0;
-    if (!read_reg(cpu, 13, &sp) || !read_ttbr(cpu, &ttbr)) {
+    uint32_t stack_pointer = 0;
+    uint32_t ttbr = 0;
+
+    if (!pending->len || !read_reg(cpu, 13, &stack_pointer) ||
+        !read_ttbr(cpu, &ttbr)) {
         return;
     }
     for (gint i = (gint)pending->len - 1; i >= 0; --i) {
-        Pending *p = g_ptr_array_index(pending, i);
-        if (p->return_pc != site->site || p->sp != sp || p->ttbr != ttbr) {
+        Pending *pending_call = g_ptr_array_index(pending, i);
+
+        if (pending_call->return_pc != site->site ||
+            pending_call->sp != stack_pointer || pending_call->ttbr != ttbr) {
             continue;
         }
-        current_proc = proc_get(ttbr);
-        if (!callsite_valid(site)) {
-            emit_invalid("return_callsite_word", site->site, site->word, 0);
-            return;
-        }
-        if (!read_reg(cpu, 0, &r0)) {
-            emit_invalid("return_r0", site->site, site->word, 0);
-            return;
-        }
-        gboolean is_dynamic =
-            g_hash_table_lookup(dynamic_exports,
-                                GUINT_TO_POINTER(p->fn->base)) == p->fn;
-        GString *s = g_string_new(NULL);
-        g_string_append_printf(
-            s,
-            "{\"seq\":\"%" PRIu64 "\",\"kind\":\"%s\",\"call_id\":\"%" PRIu64
-            "\",\"name\":",
-            next_seq++, is_dynamic ? "dynamic_return" : "return", p->id);
-        json_quote(s, p->fn->name);
-        g_string_append_printf(
-            s,
-            ",\"lr\":\"0x%08" PRIx64 "\",\"sp\":\"0x%08" PRIx64
-            "\",\"r0\":\"0x%08x\",\"return_site\":\"0x%08x\"",
-            p->lr, p->sp, r0, site->site);
-        if (!strcmp(p->fn->name, "eglGetProcAddress")) {
-            char *name = read_cstr(p->args[0]);
-            if (name &&
-                (!strcmp(name, "eglCreateImageKHR") ||
-                 !strcmp(name, "glEGLImageTargetTexture2DOES") ||
-                 !strcmp(name, "glFlush") || !strcmp(name, "glFinish")) &&
-                r0) {
-                uint32_t va = r0 & ~1u, word = 0;
-                if (!read_u32(va, &word)) {
-                    mirror_fail(
-                        "cannot read dynamically resolved EGL/GLES entry word");
-                } else {
-                    Qy8RenderExport *x = g_new0(Qy8RenderExport, 1);
-                    x->name = g_strdup(name);
-                    x->base = va;
-                    x->rva = 0;
-                    x->word = word;
-                    x->index = G_MAXSIZE;
-                    g_hash_table_replace(dynamic_exports, GUINT_TO_POINTER(va),
-                                         x);
-                }
-            }
-            g_free(name);
-        } else if (!strcmp(p->fn->name, "eglCreateImageKHR") && r0) {
-            uint32_t words[12] = { 0 };
-            for (int j = 0; j < 12; j++) {
-                read_u32((uint64_t)r0 + j * 4, &words[j]);
-            }
-            ImageState *im = g_new0(ImageState, 1);
-            im->handle = r0;
-            im->width = words[1];
-            im->height = words[2];
-            im->format = words[3];
-            im->stride = words[5];
-            im->linear = ((uint64_t)words[6]);
-            uint32_t bm = 0;
-            read_u32((uint64_t)r0 + 0x2c, &bm);
-            im->handle = bm;
-            g_hash_table_replace(images, idkey(r0), im);
-            GString *extra = g_string_new(NULL);
-            g_string_append_printf(
-                extra,
-                "{\"kind\":\"image_state\",\"image\":\"0x%08x\",\"handle\":"
-                "\"0x%08x\",\"width\":%u,\"height\":%u,\"format\":\"0x%08x\","
-                "\"stride\":%u,\"pvLinAddr\":\"0x%08" PRIx64 "\"}",
-                r0, bm, im->width, im->height, im->format, im->stride,
-                im->linear);
-            emit(extra);
-            g_string_free(extra, TRUE);
-        } else if (!strcmp(p->fn->name, "eglCreateWindowSurface") ||
-                   !strcmp(p->fn->name, "eglCreatePbufferSurface")) {
-            if (r0) {
-                surface_add_from_create(p->fn, p, r0);
-            }
-        } else if (!strcmp(p->fn->name, "glEGLImageTargetTexture2DOES")) {
-            uint32_t texture =
-                active_texture_unit < G_N_ELEMENTS(bound_textures)
-                    ? bound_textures[active_texture_unit]
-                    : 0;
-            TextureState *t = g_hash_table_lookup(textures, idkey(texture));
-            if (texture && !t) {
-                t = g_new0(TextureState, 1);
-                t->id = texture;
-                t->min_filter = t->mag_filter = 0x2601;
-                t->wrap_s = t->wrap_t = 0x2901;
-                g_hash_table_insert(textures, idkey(texture), t);
-            }
-            if (t) {
-                t->image = (uint32_t)p->args[1];
-            } else {
-                mirror_fail("EGLImageTarget without guest texture");
-            }
-        } else if (!strcmp(p->fn->name, "glGetProgramiv")) {
-            append_u32_outputs(s, "words", p->args[2], 1);
-            uint32_t value = 0;
-            if (p->args[1] == 0x8b82 && read_u32(p->args[2], &value)) {
-                ProgramState *pr = g_hash_table_lookup(
-                    program_state, idkey((uint32_t)p->args[0]));
-                if (pr) {
-                    pr->linked = value != 0;
-                }
-            }
-        } else if (!strcmp(p->fn->name, "glCreateShader")) {
-            ShaderState *sh = g_new0(ShaderState, 1);
-            sh->type = (uint32_t)p->args[0];
-            g_hash_table_replace(shader_state, idkey(r0), sh);
-        } else if (!strcmp(p->fn->name, "glCreateProgram")) {
-            ProgramState *pr = g_new0(ProgramState, 1);
-            g_hash_table_replace(program_state, idkey(r0), pr);
-        } else if (!strcmp(p->fn->name, "glGetUniformLocation") ||
-                   !strcmp(p->fn->name, "glGetAttribLocation")) {
-            char *name = read_cstr(p->args[1]);
-            if (name && ((int32_t)r0) >= 0) {
-                char *k = loc_key((uint32_t)p->args[0], (int32_t)r0);
-                g_hash_table_replace(
-                    !strcmp(p->fn->name, "glGetUniformLocation")
-                        ? uniform_locations
-                        : attrib_locations,
-                    k, name);
-            } else {
-                g_free(name);
-            }
-        } else if (!strcmp(p->fn->name, "eglMakeCurrent") && r0 == 1) {
-            if (p->args[1] != p->args[2]) {
-                emit_invalid("makecurrent_draw_read_surface",
-                             (uint32_t)p->args[1], (uint32_t)p->args[1],
-                             (uint32_t)p->args[2]);
-            }
-            uint32_t next = (uint32_t)p->args[3];
-            if (active_context != next) {
-                save_context_state(active_context);
-                load_context_state(next);
-            }
-            active_context = next;
-            active_surface = (uint32_t)p->args[1];
-            have_makecurrent = TRUE;
-        } else if (!strcmp(p->fn->name, "glGenTextures")) {
-            append_u32_outputs(s, "words", p->args[1], MIN(p->args[0], 64));
-        } else if (!strcmp(p->fn->name, "eglInitialize")) {
-            append_u32_outputs(s, "major", p->args[1], 1);
-            append_u32_outputs(s, "minor", p->args[2], 1);
-        } else if (!strcmp(p->fn->name, "eglChooseConfig")) {
-            append_u32_outputs(s, "num_configs", p->stack[0], 1);
-            append_u32_outputs(s, "configs", p->args[2], MIN(p->args[3], 64));
-        } else if (!strcmp(p->fn->name, "eglGetConfigs")) {
-            append_u32_outputs(s, "num_configs", p->args[3], 1);
-            append_u32_outputs(s, "configs", p->args[1], MIN(p->args[2], 64));
-        } else if (!strcmp(p->fn->name, "eglGetConfigAttrib")) {
-            append_u32_outputs(s, "value", p->args[3], 1);
-        } else if (!strcmp(p->fn->name, "glGetIntegerv")) {
-            append_u32_outputs(s, "words", p->args[1], 4);
-        } else if (!strcmp(p->fn->name, "glGetString")) {
-            append_return_string(s, "string", r0);
-        }
-        g_string_append_c(s, '}');
-        emit(s);
-        g_string_free(s, TRUE);
-        if (!strcmp(p->fn->name, "eglSwapBuffers")) {
-            completed_swaps++;
-        }
-        g_ptr_array_remove_index(pending, i);
-        g_free(p);
+        complete_return(cpu, site, pending_call, (guint)i, ttbr);
         return;
     }
+}
+
+static const Qy8RenderDispatch render_dispatch_table[] = {
+    { .name = "eglBindAPI",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_EGLBINDAPI,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "eglBindTexImage",
+      .entry = handle_state_eglbindteximage,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_EGLBINDTEXIMAGE,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "eglChooseConfig",
+      .entry = NULL,
+      .returned = handle_return_eglchooseconfig,
+      .journal = handle_capture_eglchooseconfig,
+      .variant = QY8_RENDER_VARIANT_EGLCHOOSECONFIG,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "eglCreateContext",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = handle_capture_eglchooseconfig,
+      .variant = QY8_RENDER_VARIANT_EGLCREATECONTEXT,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "eglCreatePbufferSurface",
+      .entry = NULL,
+      .returned = handle_return_eglcreatewindowsurface,
+      .journal = handle_capture_eglchooseconfig,
+      .variant = QY8_RENDER_VARIANT_EGLCREATEPBUFFERSURFACE,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "eglCreateWindowSurface",
+      .entry = NULL,
+      .returned = handle_return_eglcreatewindowsurface,
+      .journal = handle_capture_eglchooseconfig,
+      .variant = QY8_RENDER_VARIANT_EGLCREATEWINDOWSURFACE,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "eglDestroyContext",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_EGLDESTROYCONTEXT,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "eglDestroySurface",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_EGLDESTROYSURFACE,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "eglGetConfigAttrib",
+      .entry = NULL,
+      .returned = handle_return_eglgetconfigattrib,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_EGLGETCONFIGATTRIB,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "eglGetConfigs",
+      .entry = NULL,
+      .returned = handle_return_eglgetconfigs,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_EGLGETCONFIGS,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "eglGetDisplay",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_EGLGETDISPLAY,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "eglGetError",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_EGLGETERROR,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "eglGetProcAddress",
+      .entry = NULL,
+      .returned = handle_return_eglgetprocaddress,
+      .journal = handle_capture_eglgetprocaddress,
+      .variant = QY8_RENDER_VARIANT_EGLGETPROCADDRESS,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "eglInitialize",
+      .entry = NULL,
+      .returned = handle_return_eglinitialize,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_EGLINITIALIZE,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "eglMakeCurrent",
+      .entry = NULL,
+      .returned = handle_return_eglmakecurrent,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_EGLMAKECURRENT,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "eglReleaseTexImage",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_EGLRELEASETEXIMAGE,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "eglReleaseThread",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_EGLRELEASETHREAD,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "eglSwapBuffers",
+      .entry = handle_state_eglswapbuffers,
+      .returned = NULL,
+      .journal = handle_capture_eglswapbuffers,
+      .variant = QY8_RENDER_VARIANT_EGLSWAPBUFFERS,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "eglTerminate",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_EGLTERMINATE,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glActiveTexture",
+      .entry = handle_state_glactivetexture,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLACTIVETEXTURE,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glAttachShader",
+      .entry = handle_state_glattachshader,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLATTACHSHADER,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glBindTexture",
+      .entry = handle_state_glbindtexture,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLBINDTEXTURE,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glBlendColor",
+      .entry = handle_state_glblendcolor,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLBLENDCOLOR,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glBlendFunc",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLBLENDFUNC,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glBlendFuncSeparate",
+      .entry = handle_state_glblendfuncseparate,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLBLENDFUNCSEPARATE,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glClear",
+      .entry = handle_state_glclear,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLCLEAR,
+      .service_target = TRUE,
+      .service_class = 2,
+      .dynamic_entry = FALSE },
+    { .name = "glClearColor",
+      .entry = handle_state_glclearcolor,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLCLEARCOLOR,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glClearDepthf",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLCLEARDEPTHF,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glClearStencil",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLCLEARSTENCIL,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glColorMask",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLCOLORMASK,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glCompressedTexImage2D",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = handle_capture_glcompressedteximage2d,
+      .variant = QY8_RENDER_VARIANT_GLCOMPRESSEDTEXIMAGE2D,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glCompressedTexSubImage2D",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = handle_capture_glcompressedteximage2d,
+      .variant = QY8_RENDER_VARIANT_GLCOMPRESSEDTEXSUBIMAGE2D,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glCreateProgram",
+      .entry = NULL,
+      .returned = handle_return_glcreateprogram,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLCREATEPROGRAM,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glCreateShader",
+      .entry = NULL,
+      .returned = handle_return_glcreateshader,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLCREATESHADER,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glCullFace",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLCULLFACE,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glDeleteProgram",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLDELETEPROGRAM,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glDeleteShader",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLDELETESHADER,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glDeleteTextures",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLDELETETEXTURES,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glDepthFunc",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLDEPTHFUNC,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glDepthMask",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLDEPTHMASK,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glDetachShader",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLDETACHSHADER,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glDisable",
+      .entry = handle_state_gldisable,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLDISABLE,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glDisableVertexAttribArray",
+      .entry = handle_state_glenablevertexattribarray,
+      .returned = NULL,
+      .journal = handle_capture_glenablevertexattribarray,
+      .variant = QY8_RENDER_VARIANT_GLDISABLEVERTEXATTRIBARRAY,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glDrawArrays",
+      .entry = handle_state_gldrawarrays,
+      .returned = NULL,
+      .journal = handle_capture_gldrawarrays,
+      .variant = QY8_RENDER_VARIANT_GLDRAWARRAYS,
+      .service_target = TRUE,
+      .service_class = 1,
+      .dynamic_entry = FALSE },
+    { .name = "glDrawElements",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLDRAWELEMENTS,
+      .service_target = TRUE,
+      .service_class = 1,
+      .dynamic_entry = FALSE },
+    { .name = "glEnable",
+      .entry = handle_state_glenable,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLENABLE,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glEnableVertexAttribArray",
+      .entry = handle_state_glenablevertexattribarray,
+      .returned = NULL,
+      .journal = handle_capture_glenablevertexattribarray,
+      .variant = QY8_RENDER_VARIANT_GLENABLEVERTEXATTRIBARRAY,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glFrontFace",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLFRONTFACE,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glGenTextures",
+      .entry = NULL,
+      .returned = handle_return_glgentextures,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLGENTEXTURES,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glGetAttribLocation",
+      .entry = handle_state_glgetuniformlocation,
+      .returned = handle_return_glgetuniformlocation,
+      .journal = handle_capture_glgetuniformlocation,
+      .variant = QY8_RENDER_VARIANT_GLGETATTRIBLOCATION,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glGetError",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLGETERROR,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glGetIntegerv",
+      .entry = NULL,
+      .returned = handle_return_glgetintegerv,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLGETINTEGERV,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glGetProgramiv",
+      .entry = NULL,
+      .returned = handle_return_glgetprogramiv,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLGETPROGRAMIV,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glGetString",
+      .entry = NULL,
+      .returned = handle_return_glgetstring,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLGETSTRING,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glGetUniformLocation",
+      .entry = handle_state_glgetuniformlocation,
+      .returned = handle_return_glgetuniformlocation,
+      .journal = handle_capture_glgetuniformlocation,
+      .variant = QY8_RENDER_VARIANT_GLGETUNIFORMLOCATION,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glLinkProgram",
+      .entry = handle_state_gllinkprogram,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLLINKPROGRAM,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glPixelStorei",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLPIXELSTOREI,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glReadPixels",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLREADPIXELS,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glShaderBinary",
+      .entry = handle_state_glshaderbinary,
+      .returned = NULL,
+      .journal = handle_capture_glshaderbinary,
+      .variant = QY8_RENDER_VARIANT_GLSHADERBINARY,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glStencilFuncSeparate",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLSTENCILFUNCSEPARATE,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glStencilMask",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLSTENCILMASK,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glStencilOpSeparate",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLSTENCILOPSEPARATE,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glTexImage2D",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLTEXIMAGE2D,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glTexParameteri",
+      .entry = handle_state_gltexparameteri,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLTEXPARAMETERI,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glUniform1f",
+      .entry = handle_state_gluniform1f,
+      .returned = NULL,
+      .journal = handle_capture_gluniform1f,
+      .variant = QY8_RENDER_VARIANT_GLUNIFORM1F,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glUniform1i",
+      .entry = handle_state_gluniform1f,
+      .returned = NULL,
+      .journal = handle_capture_gluniform1f,
+      .variant = QY8_RENDER_VARIANT_GLUNIFORM1I,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glUniform3fv",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = handle_capture_gluniform3fv,
+      .variant = QY8_RENDER_VARIANT_GLUNIFORM3FV,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glUniform4f",
+      .entry = handle_state_gluniform1f,
+      .returned = NULL,
+      .journal = handle_capture_gluniform4f,
+      .variant = QY8_RENDER_VARIANT_GLUNIFORM4F,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glUniformMatrix4fv",
+      .entry = handle_state_gluniformmatrix4fv,
+      .returned = NULL,
+      .journal = handle_capture_gluniformmatrix4fv,
+      .variant = QY8_RENDER_VARIANT_GLUNIFORMMATRIX4FV,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glUseProgram",
+      .entry = handle_state_gluseprogram,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLUSEPROGRAM,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glVertexAttribPointer",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = handle_capture_glvertexattribpointer,
+      .variant = QY8_RENDER_VARIANT_GLVERTEXATTRIBPOINTER,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "glViewport",
+      .entry = handle_state_glviewport,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLVIEWPORT,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = FALSE },
+    { .name = "eglCreateImageKHR",
+      .entry = NULL,
+      .returned = handle_return_eglcreateimagekhr,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_EGLCREATEIMAGEKHR,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = TRUE },
+    { .name = "glEGLImageTargetTexture2DOES",
+      .entry = NULL,
+      .returned = handle_return_gleglimagetargettexture2does,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLEGLIMAGETARGETTEXTURE2DOES,
+      .service_target = FALSE,
+      .service_class = 0,
+      .dynamic_entry = TRUE },
+    { .name = "glFlush",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLFLUSH,
+      .service_target = TRUE,
+      .service_class = 3,
+      .dynamic_entry = TRUE },
+    { .name = "glFinish",
+      .entry = NULL,
+      .returned = NULL,
+      .journal = NULL,
+      .variant = QY8_RENDER_VARIANT_GLFINISH,
+      .service_target = TRUE,
+      .service_class = 3,
+      .dynamic_entry = TRUE },
+};
+
+static const Qy8RenderDispatch *render_dispatch_lookup(const char *name)
+{
+    for (size_t i = 0; i < G_N_ELEMENTS(render_dispatch_table); i++) {
+        if (!strcmp(render_dispatch_table[i].name, name)) {
+            return &render_dispatch_table[i];
+        }
+    }
+    return NULL;
 }
 
 static void tb_trans_cb(struct qemu_plugin_tb *tb, void *userdata)
@@ -2380,6 +3835,7 @@ static void tb_trans_cb(struct qemu_plugin_tb *tb, void *userdata)
                 qy8_render_export_by_name(export_map, required_names[i]);
 
             entry->index = i;
+            entry->dispatch = render_dispatch_lookup(entry->name);
         }
         if (!catalog_logged) {
             catalog_logged = TRUE;
@@ -2402,11 +3858,7 @@ static void tb_trans_cb(struct qemu_plugin_tb *tb, void *userdata)
                 emit_invalid("translation_export_word", pc, fn->word, word);
             } else {
                 enum qemu_plugin_cb_flags flags =
-                    (!strcmp(fn->name, "glDrawArrays") ||
-                     !strcmp(fn->name, "glDrawElements") ||
-                     !strcmp(fn->name, "glClear") ||
-                     !strcmp(fn->name, "glFlush") ||
-                     !strcmp(fn->name, "glFinish"))
+                    (fn->dispatch && fn->dispatch->service_target)
                         ? QEMU_PLUGIN_CB_RW_REGS_PC
                         : QEMU_PLUGIN_CB_R_REGS;
                 qemu_plugin_register_vcpu_insn_exec_cb(insn, entry_cb, flags,
