@@ -237,7 +237,57 @@ render as complete without drawing anything; the pixels come from the
 plugin only. Current limitation: only the first few frames are presented;
 the guest is not redrawn after that.
 
-## 9. Limitations
+## 9. GNSS
+
+The unit's GNSS receiver is a u-blox on `SCI2:`. `tools/qy8/ublox.py` stands in
+for it over a socket, and the unit then takes a fix: Info > GPS Position lists 11
+satellites and the coordinates, and the map moves there. Give it a speed in knots
+and a course and the position walks, so the icon tracks.
+
+SCIF2 is the fourth `-serial` (section 5), so two nulls fill the two in between:
+
+```sh
+build-release/qemu-system-arm -M clarion-qy8 \
+    -drive if=pflash,format=raw,file=flash-rw.bin \
+    -serial mon:stdio -serial null -serial null \
+    -serial unix:/tmp/gps.sock,server=on,wait=off
+
+python3 tools/qy8/ublox.py 52.5200 13.4050      # LAT LON [SPEED_KN] [COURSE]
+```
+
+`QY8_GPS_SOCK` moves the socket if `/tmp/gps.sock` does not suit.
+
+**What the driver does.** `navdrv.dll` only frames what arrives: `SetGpsData`
+reads SCI2 into a 128-byte buffer, `CheckOnePacket` cuts one packet out of it and
+`SetGpsDataBuff` drops it into a 128-slot ring, while `NAV_Read` and `NAV_Write`
+both return -1. Everything goes through `NAV_IOControl`. The decisions belong to
+`Navi.exe`, which opens `NAV1:` and pumps the device at `0x358314`, up to ten
+packets an event, using `0x8011200c` to read, `0x80112010` to write and
+`0x80112014` for status. Its log tag is `=SNSW=`. The UBX configuration the
+receiver sees comes from there: `CFG-NAV5` with dynModel 4 and fixMode 2,
+`CFG-GNSS`, four `CFG-MSG`s that enable NAV-POSECEF, NAV-POSLLH and NAV-VELNED at
+1 Hz and disable NMEA-GNS, then `CFG-CFG` and a `MON-VER` poll.
+
+**The GLL trigger.** Feeding NMEA at the port is not enough, and neither is
+answering the UBX. The NMEA handler at `0x357bd0` parses nothing. It appends each
+sentence to a 1280-byte block and hands the block to the locator only when one
+arrives whose id ends in `GLL`, which is the only NMEA sentence id in `Navi.exe`.
+A feed without `$GPGLL` grows the block until it overflows and is discarded, so
+the locator never sees a sentence. The unit reads that as a sick receiver and
+reissues `CFG-RST` on a timer, which looks like a cold-start loop and is only the
+symptom. `ublox.py` sends `$GPGLL` last in every burst for that reason.
+
+**Limits.** A packet over 128 bytes is dropped at three separate checks.
+`Navi.exe` also bounds the fix by mesh primary from a shipment-area table, 16 rows
+of lon_max, lon_min, lat_min, lat_max in whole degrees with longitude offset by
+-100. The address moves with the build: va `0xe6558` on `G214ELNI.062`, `0xe7ca0`
+on `G218ENNI.120`. Europe is lon -20..68, so a position west of 20 W is dropped
+before the locator sees it and the parser logs `GPS without Shipment Area!!`. Test inside the area
+first. `NavDrv >> GPS:SetGpsDataBuff NAV_BUFFER_FULL` means the consumer is
+behind; it appears once while `Navi.exe` starts and clears by itself. `SckDrv.cpp
+SckGpsCheck changed OK` means the port is receiving at all.
+
+## 10. Limitations
 
 * The GPU model does not rasterize; GPU-rendered content appears in the
   window only through MIRROR (section 8).
