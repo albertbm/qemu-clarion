@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
-#include <qemu-plugin.h>
+#include "plugins/qemu-plugin.h"
 #include <glib.h>
 #include <inttypes.h>
 #include <stdio.h>
