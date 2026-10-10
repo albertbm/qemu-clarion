@@ -12,6 +12,7 @@
 #include "hw/misc/clarion_usbphy.h"
 #include "hw/misc/clarion_dispmicom.h"
 #include "hw/misc/clarion_boards.h"
+#include "hw/display/clarion_du.h"
 #include "hw/sh4/clarion_sh4_core.h"
 #include "hw/sh4/sh.h"
 #include "hw/intc/clarion_qy7_int2.h"
@@ -50,6 +51,7 @@
 #define QY7_SCIF7_BASE 0xffe47000
 #define QY7_USBPHY_BASE 0xffe70800
 #define QY7_INT2_BASE 0xff804000
+#define QY7_DU_BASE 0xfff80000
 
 typedef struct QY7MachineState {
     MachineState parent_obj;
@@ -148,6 +150,8 @@ static void qy7_init(MachineState *machine)
     DeviceState *dispmicom;
     ClarionScif *scif3;
     QY7DispSink *disp_sink;
+    DeviceState *du;
+    MemoryRegion *du_alias;
     DriveInfo *dinfo;
     char model[CLARION_PROD_MODEL_LEN + 1] = "";
     const ClarionBoardInfo *board;
@@ -209,6 +213,14 @@ static void qy7_init(MachineState *machine)
                           0);
 
     clarion_sh4_core_init(cpu, sysmem);
+    du = qdev_new(TYPE_CLARION_DU);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(du), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(du), 0, QY7_DU_BASE);
+    du_alias = g_new0(MemoryRegion, 1);
+    memory_region_init_alias(du_alias, NULL, "qy7.du-a7",
+                             sysbus_mmio_get_region(SYS_BUS_DEVICE(du), 0),
+                             0, CLARION_DU_SIZE);
+    memory_region_add_subregion(sysmem, A7ADDR(QY7_DU_BASE), du_alias);
     clarion_scif_init(g_new0(ClarionScif, 1), sysmem, QY7_SCIF_BASE, "qy7.scif",
                       0, 0, NULL, NULL, false);
     /*
