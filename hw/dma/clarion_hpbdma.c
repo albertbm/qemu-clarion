@@ -53,6 +53,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
 #include "hw/dma/clarion_hpbdma.h"
+#include "hw/core/qdev-properties.h"
 #include "system/address-spaces.h"
 #include "qom/object.h"
 #include "trace.h"
@@ -115,6 +116,8 @@
 #define HPB_DINTCR1     0x18
 #define HPB_DINTMR0     0x1C
 #define HPB_DINTMR1     0x20
+#define HPB_QY7_DTE0    0x810
+#define HPB_QY7_DTE1    0x814
 #define HPB_DACTSR0     0x24
 #define HPB_DACTSR1     0x28
 #define HPB_HSRSTR(n)   (0x40 + (n) * 4)
@@ -152,10 +155,12 @@ struct ClarionHpbDmaState {
     uint32_t dintsr[2];                 /* стан переривань */
     uint32_t dintmr[2];                 /* маски */
     uint32_t dtimr;
+    uint32_t qy7_dte[2];
 
     ClarionHpbModule module[HPB_MAX_MODULE];
     unsigned n_module;
     bool servicing;                     /* захист від повторного входу */
+    bool qy7_mode;
 };
 
 OBJECT_DECLARE_SIMPLE_TYPE(ClarionHpbDmaState, CLARION_HPBDMA)
@@ -210,6 +215,15 @@ static void hpb_update_irq(ClarionHpbDmaState *s)
 {
     bool raised[CLARION_HPBDMA_NUM_IRQ] = { false };
     int ch, i;
+
+    if (s->qy7_mode) {
+        /* QY7 exposes DTE1 where QY8 decodes channel 32 DTCR1. */
+        raised[0] = !!(s->dintsr[0] & s->qy7_dte[1] & BIT(3));
+        for (i = 0; i < CLARION_HPBDMA_NUM_IRQ; i++) {
+            qemu_set_irq(s->irq[i], raised[i]);
+        }
+        return;
+    }
 
     for (ch = 0; ch < CLARION_HPBDMA_NUM_CHAN; ch++) {
         int w = ch / 32, b = ch % 32;
@@ -670,10 +684,16 @@ void clarion_hpbdma_eod(DeviceState *dev, hwaddr periph_addr)
 static uint64_t hpb_chan_read(void *opaque, hwaddr addr, unsigned size)
 {
     ClarionHpbDmaState *s = opaque;
+    if (s->qy7_mode && addr == HPB_QY7_DTE0) {
+        return s->qy7_dte[0];
+    }
+    if (s->qy7_mode && addr == HPB_QY7_DTE1) {
+        return s->qy7_dte[1];
+    }
     int ch = addr / HPB_CHAN_STRIDE;
     hwaddr off = addr % HPB_CHAN_STRIDE;
 
-    if (ch >= CLARION_HPBDMA_NUM_CHAN) {
+    if (ch >= (s->qy7_mode ? 32 : CLARION_HPBDMA_NUM_CHAN)) {
         return 0;
     }
 
@@ -707,10 +727,22 @@ static void hpb_chan_write(void *opaque, hwaddr addr, uint64_t val,
                            unsigned size)
 {
     ClarionHpbDmaState *s = opaque;
+    if (s->qy7_mode && addr == HPB_QY7_DTE0) {
+        s->qy7_dte[0] = val;
+        return;
+    }
+    if (s->qy7_mode && addr == HPB_QY7_DTE1) {
+        uint32_t old = s->qy7_dte[1];
+
+        s->qy7_dte[1] = val;
+        s->dintsr[0] &= ~(old & ~(uint32_t)val);
+        hpb_update_irq(s);
+        return;
+    }
     int ch = addr / HPB_CHAN_STRIDE;
     hwaddr off = addr % HPB_CHAN_STRIDE;
 
-    if (ch >= CLARION_HPBDMA_NUM_CHAN) {
+    if (ch >= (s->qy7_mode ? 32 : CLARION_HPBDMA_NUM_CHAN)) {
         return;
     }
 
@@ -885,6 +917,7 @@ static void clarion_hpbdma_reset_hold(Object *obj, ResetType type)
     s->dintsr[0] = s->dintsr[1] = 0;
     s->dintmr[0] = s->dintmr[1] = 0;
     s->dtimr = 0;
+    s->qy7_dte[0] = s->qy7_dte[1] = 0;
     hpb_update_irq(s);
 }
 
@@ -910,9 +943,13 @@ static void clarion_hpbdma_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     ResettableClass *rc = RESETTABLE_CLASS(klass);
+    static const Property props[] = {
+        DEFINE_PROP_BOOL("qy7-mode", ClarionHpbDmaState, qy7_mode, false),
+    };
 
     dc->realize = clarion_hpbdma_realize;
     dc->desc = "Renesas HPB-DMAC (R-Car Gen1)";
+    device_class_set_props(dc, props);
     rc->phases.hold = clarion_hpbdma_reset_hold;
 }
 

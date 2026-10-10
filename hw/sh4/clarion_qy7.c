@@ -205,6 +205,7 @@ static void qy7_init(MachineState *machine)
     int2 = clarion_qy7_int2_init(sysmem, QY7_INT2_BASE, CPU(cpu),
                                  &cpu->env.intc_handle);
     dmac = qdev_new(TYPE_CLARION_HPBDMA);
+    qdev_prop_set_bit(dmac, "qy7-mode", true);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dmac), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dmac), 0, CLARION_HPBDMA_CHAN_BASE);
     sysbus_mmio_map(SYS_BUS_DEVICE(dmac), 1, CLARION_HPBDMA_COMM_BASE);
@@ -220,6 +221,8 @@ static void qy7_init(MachineState *machine)
                              0, CLARION_HPBDMA_COMM_SIZE);
     memory_region_add_subregion(sysmem, A7ADDR(CLARION_HPBDMA_COMM_BASE),
                                 hpb_comm_alias);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dmac), 0,
+                       clarion_qy7_int2_hpb_irq(int2));
     tmu012_init(sysmem, 0xffd80000,
                 TMU012_FEAT_TOCR | TMU012_FEAT_3CHAN | TMU012_FEAT_EXTCLK,
                 QY7_TMU_CLOCK, clarion_qy7_int2_timer_irq(int2, 0),

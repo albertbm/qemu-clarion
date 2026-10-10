@@ -39,8 +39,12 @@
  */
 #define INT2_TMU_PRIORITY   1
 
+#define INT2_HPB_GROUP_BIT  19
+#define INT2_HPB_VECTOR     0xBC0
+#define INT2_HPB_PRIORITY   0x0e
+
 #define INT2_TMU_CHANNELS 3
-#define INT2_SOURCE_COUNT INT2_TMU_CHANNELS
+#define INT2_SOURCE_COUNT (INT2_TMU_CHANNELS + 1)
 #define INT2_UNK_SLOTS    (INT2_SIZE / 4)
 
 struct ClarionQy7Int2 {
@@ -49,9 +53,11 @@ struct ClarionQy7Int2 {
     struct intc_desc desc;
     struct intc_source src[INT2_SOURCE_COUNT];
     qemu_irq tmu_irq[INT2_TMU_CHANNELS];
+    qemu_irq hpb_irq;
     uint32_t prio[2];
     uint32_t mask;
     uint32_t tmu_lines;
+    bool hpb_pending;
     uint32_t unk[INT2_UNK_SLOTS];
 };
 
@@ -65,6 +71,10 @@ static void int2_update(ClarionQy7Int2 *s)
         s->src[i].pending = open && (s->tmu_lines & BIT(i));
         pending += s->src[i].pending;
     }
+    s->src[INT2_TMU_CHANNELS].priority = INT2_HPB_PRIORITY;
+    s->src[INT2_TMU_CHANNELS].pending =
+        !(s->mask & BIT(INT2_HPB_GROUP_BIT)) && s->hpb_pending;
+    pending += s->src[INT2_TMU_CHANNELS].pending;
     s->desc.pending = pending;
     if (pending) {
         cpu_interrupt(s->cpu, CPU_INTERRUPT_HARD);
@@ -78,6 +88,15 @@ static void int2_tmu_set(void *opaque, int n, int level)
     ClarionQy7Int2 *s = opaque;
 
     s->tmu_lines = deposit32(s->tmu_lines, n, 1, !!level);
+    int2_update(s);
+}
+
+static void int2_hpb_set(void *opaque, int n, int level)
+{
+    ClarionQy7Int2 *s = opaque;
+
+    (void)n;
+    s->hpb_pending = !!level;
     int2_update(s);
 }
 
@@ -152,6 +171,7 @@ static void int2_reset(void *opaque)
      */
     s->mask = 0xffffffff;
     s->prio[0] = s->prio[1] = 0;
+    s->hpb_pending = false;
     memset(s->unk, 0, sizeof(s->unk));
     int2_update(s);
 }
@@ -161,7 +181,9 @@ ClarionQy7Int2 *clarion_qy7_int2_init(MemoryRegion *sysmem, hwaddr base,
 {
     ClarionQy7Int2 *s = g_new0(ClarionQy7Int2, 1);
     /* Vectors the guest installs for TMU0..2 (tick ISR at vector 0x400). */
-    static const unsigned short vect[INT2_SOURCE_COUNT] = { 0x400, 0x420, 0x440 };
+    static const unsigned short vect[INT2_SOURCE_COUNT] = {
+        0x400, 0x420, 0x440, INT2_HPB_VECTOR,
+    };
 
     s->cpu = cpu;
     s->desc.nr_sources = INT2_SOURCE_COUNT;
@@ -175,6 +197,7 @@ ClarionQy7Int2 *clarion_qy7_int2_init(MemoryRegion *sysmem, hwaddr base,
     for (int i = 0; i < INT2_TMU_CHANNELS; i++) {
         s->tmu_irq[i] = qemu_allocate_irq(int2_tmu_set, s, i);
     }
+    s->hpb_irq = qemu_allocate_irq(int2_hpb_set, s, 0);
     memory_region_init_io(&s->iomem, NULL, &int2_ops, s, "qy7.int2",
                           INT2_SIZE);
     memory_region_add_subregion(sysmem, base, &s->iomem);
@@ -186,5 +209,10 @@ qemu_irq clarion_qy7_int2_timer_irq(ClarionQy7Int2 *s, int channel)
 {
     g_assert(channel >= 0 && channel < INT2_TMU_CHANNELS);
     return s->tmu_irq[channel];
+}
+
+qemu_irq clarion_qy7_int2_hpb_irq(ClarionQy7Int2 *s)
+{
+    return s->hpb_irq;
 }
 
