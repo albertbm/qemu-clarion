@@ -76,6 +76,9 @@ config FRAMEBUFFER
 config CLARION_DU
     bool
 
+config CLARION_2DG
+    bool
+
 config CLARION_SGX
     bool
 

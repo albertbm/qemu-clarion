@@ -740,6 +740,7 @@ config CLARION_QY8
     select ARM_GIC
     select UNIMP
     select CLARION_DU
+    select CLARION_2DG
     select CLARION_SGX
     select CLARION_HPBDMA
     select CLARION_LBDMA

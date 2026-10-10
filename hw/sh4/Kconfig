@@ -26,6 +26,7 @@ config CLARION_QY7
     select CLARION_QY7_INT2
     select CLARION_DISPMICOM
     select CLARION_DU
+    select CLARION_2DG
     select CLARION_USBPHY
     select PFLASH_CFI02
     select CLARION_SCIF
