@@ -242,8 +242,7 @@ static void qy7_init(MachineState *machine)
      */
     qy7_scif_with_alias(sysmem, QY7_SCIF1_BASE, "qy7.scif1", 1, NULL);
     /* SCIF3: the same polling routine, SCFSR at VA 0x2b0010. */
-    scif3 = qy7_scif_with_alias(sysmem, QY7_SCIF3_BASE, "qy7.scif3", 3,
-                                clarion_qy7_int2_scif3_rx_irq(int2));
+    scif3 = qy7_scif_with_alias(sysmem, QY7_SCIF3_BASE, "qy7.scif3", 3, NULL);
     dispmicom = qdev_new(TYPE_CLARION_DISPMICOM);
     qdev_realize_and_unref(dispmicom, NULL, &error_fatal);
     disp_sink = g_new0(QY7DispSink, 1);
