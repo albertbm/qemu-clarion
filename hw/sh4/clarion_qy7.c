@@ -128,13 +128,14 @@ static void qy7_report_invalid_model(const char *model)
  * needs an alias at A7ADDR(base), as the timer has.
  */
 static ClarionScif *qy7_scif_with_alias(MemoryRegion *sysmem, hwaddr base,
-                                        const char *name, int index)
+                                        const char *name, int index,
+                                        qemu_irq irq)
 {
     ClarionScif *scif = g_new0(ClarionScif, 1);
     MemoryRegion *alias = g_new0(MemoryRegion, 1);
     g_autofree char *alias_name = g_strdup_printf("%s-a7", name);
 
-    clarion_scif_init(scif, sysmem, base, name, index, index, NULL, NULL,
+    clarion_scif_init(scif, sysmem, base, name, index, index, irq, NULL,
                       false);
     memory_region_init_alias(alias, NULL, alias_name, &scif->mr, 0, 0x100);
     memory_region_add_subregion(sysmem, A7ADDR(base), alias);
@@ -239,9 +240,10 @@ static void qy7_init(MachineState *machine)
      * SCIF1: the routine at serial_scif.dll+0x8c18 polls SCFSR.TEND
      * (bit 6, offset 0x10) of this channel.
      */
-    qy7_scif_with_alias(sysmem, QY7_SCIF1_BASE, "qy7.scif1", 1);
+    qy7_scif_with_alias(sysmem, QY7_SCIF1_BASE, "qy7.scif1", 1, NULL);
     /* SCIF3: the same polling routine, SCFSR at VA 0x2b0010. */
-    scif3 = qy7_scif_with_alias(sysmem, QY7_SCIF3_BASE, "qy7.scif3", 3);
+    scif3 = qy7_scif_with_alias(sysmem, QY7_SCIF3_BASE, "qy7.scif3", 3,
+                                clarion_qy7_int2_scif3_rx_irq(int2));
     dispmicom = qdev_new(TYPE_CLARION_DISPMICOM);
     qdev_realize_and_unref(dispmicom, NULL, &error_fatal);
     disp_sink = g_new0(QY7DispSink, 1);
@@ -250,7 +252,7 @@ static void qy7_init(MachineState *machine)
     scif3->dispmicom_tx = clarion_dispmicom_rx_byte;
     clarion_dispmicom_set_sink(dispmicom, qy7_dispmicom_sink, disp_sink);
     /* SCIF7: the same polling routine, SCFSR at VA 0x2f0010. */
-    qy7_scif_with_alias(sysmem, QY7_SCIF7_BASE, "qy7.scif7", 7);
+    qy7_scif_with_alias(sysmem, QY7_SCIF7_BASE, "qy7.scif7", 7, NULL);
     clarion_usbphy_init(sysmem, QY7_USBPHY_BASE, 2, "qy7.usbphy");
 
     create_unimplemented_device("qy7.dbsc", 0xfe800000, 0x10000);

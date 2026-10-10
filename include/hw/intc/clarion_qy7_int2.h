@@ -22,4 +22,6 @@ ClarionQy7Int2 *clarion_qy7_int2_init(MemoryRegion *sysmem, hwaddr base,
 
 qemu_irq clarion_qy7_int2_timer_irq(ClarionQy7Int2 *s, int channel);
 
+qemu_irq clarion_qy7_int2_scif3_rx_irq(ClarionQy7Int2 *s);
+
 #endif

@@ -39,18 +39,32 @@
  */
 #define INT2_TMU_PRIORITY   1
 
+/*
+ * The guest maps serial interrupt 29 to status bit 1 and vector 0x580.
+ * Vector and priority are in the live guest tables at 0x8A642040 and
+ * 0x8A64280C; the grouped ISR is 0x8803F1AC.
+ */
+#define INT2_SCIF3_GROUP_BIT 8
+#define INT2_SCIF3_STATUS_BIT 1
+#define INT2_SCIF3_VECTOR 0x580
+#define INT2_SCIF3_PRIORITY 8
+#define INT2_SCIF3_STATUS  0x58
+
 #define INT2_TMU_CHANNELS 3
+#define INT2_SOURCE_COUNT (INT2_TMU_CHANNELS + 1)
 #define INT2_UNK_SLOTS    (INT2_SIZE / 4)
 
 struct ClarionQy7Int2 {
     MemoryRegion iomem;
     CPUState *cpu;
     struct intc_desc desc;
-    struct intc_source src[INT2_TMU_CHANNELS];
+    struct intc_source src[INT2_SOURCE_COUNT];
     qemu_irq tmu_irq[INT2_TMU_CHANNELS];
+    qemu_irq scif3_rx_irq;
     uint32_t prio[2];
     uint32_t mask;
     uint32_t tmu_lines;
+    bool scif3_rx_pending;
     uint32_t unk[INT2_UNK_SLOTS];
 };
 
@@ -64,6 +78,10 @@ static void int2_update(ClarionQy7Int2 *s)
         s->src[i].pending = open && (s->tmu_lines & BIT(i));
         pending += s->src[i].pending;
     }
+    s->src[INT2_TMU_CHANNELS].priority = INT2_SCIF3_PRIORITY;
+    s->src[INT2_TMU_CHANNELS].pending =
+        !(s->mask & BIT(INT2_SCIF3_GROUP_BIT)) && s->scif3_rx_pending;
+    pending += s->src[INT2_TMU_CHANNELS].pending;
     s->desc.pending = pending;
     if (pending) {
         cpu_interrupt(s->cpu, CPU_INTERRUPT_HARD);
@@ -80,6 +98,15 @@ static void int2_tmu_set(void *opaque, int n, int level)
     int2_update(s);
 }
 
+static void int2_scif3_rx_set(void *opaque, int n, int level)
+{
+    ClarionQy7Int2 *s = opaque;
+
+    (void)n;
+    s->scif3_rx_pending = !!level;
+    int2_update(s);
+}
+
 static uint64_t int2_reg_read(ClarionQy7Int2 *s, hwaddr addr)
 {
     switch (addr) {
@@ -89,6 +116,8 @@ static uint64_t int2_reg_read(ClarionQy7Int2 *s, hwaddr addr)
         return s->prio[1];
     case INT2_MASK_SET:
         return s->mask;
+    case INT2_SCIF3_STATUS:
+        return s->scif3_rx_pending ? BIT(INT2_SCIF3_STATUS_BIT) : 0;
     default:
         qemu_log_mask(LOG_UNIMP,
                       "clarion-qy7-int2: unimp read +0x%02" HWADDR_PRIx
@@ -151,6 +180,7 @@ static void int2_reset(void *opaque)
      */
     s->mask = 0xffffffff;
     s->prio[0] = s->prio[1] = 0;
+    s->scif3_rx_pending = false;
     memset(s->unk, 0, sizeof(s->unk));
     int2_update(s);
 }
@@ -160,14 +190,14 @@ ClarionQy7Int2 *clarion_qy7_int2_init(MemoryRegion *sysmem, hwaddr base,
 {
     ClarionQy7Int2 *s = g_new0(ClarionQy7Int2, 1);
     /* Vectors the guest installs for TMU0..2 (tick ISR at vector 0x400) */
-    static const unsigned short vect[INT2_TMU_CHANNELS] = {
-        0x400, 0x420, 0x440,
+    static const unsigned short vect[INT2_SOURCE_COUNT] = {
+        0x400, 0x420, 0x440, INT2_SCIF3_VECTOR,
     };
 
     s->cpu = cpu;
-    s->desc.nr_sources = INT2_TMU_CHANNELS;
+    s->desc.nr_sources = INT2_SOURCE_COUNT;
     s->desc.sources = s->src;
-    for (int i = 0; i < INT2_TMU_CHANNELS; i++) {
+    for (int i = 0; i < INT2_SOURCE_COUNT; i++) {
         s->src[i].parent = &s->desc;
         s->src[i].vect = vect[i];
     }
@@ -176,6 +206,7 @@ ClarionQy7Int2 *clarion_qy7_int2_init(MemoryRegion *sysmem, hwaddr base,
     for (int i = 0; i < INT2_TMU_CHANNELS; i++) {
         s->tmu_irq[i] = qemu_allocate_irq(int2_tmu_set, s, i);
     }
+    s->scif3_rx_irq = qemu_allocate_irq(int2_scif3_rx_set, s, 0);
     memory_region_init_io(&s->iomem, NULL, &int2_ops, s, "qy7.int2",
                           INT2_SIZE);
     memory_region_add_subregion(sysmem, base, &s->iomem);
@@ -187,4 +218,9 @@ qemu_irq clarion_qy7_int2_timer_irq(ClarionQy7Int2 *s, int channel)
 {
     g_assert(channel >= 0 && channel < INT2_TMU_CHANNELS);
     return s->tmu_irq[channel];
+}
+
+qemu_irq clarion_qy7_int2_scif3_rx_irq(ClarionQy7Int2 *s)
+{
+    return s->scif3_rx_irq;
 }
