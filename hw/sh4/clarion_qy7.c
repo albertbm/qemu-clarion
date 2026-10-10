@@ -10,6 +10,7 @@
 #include "hw/misc/unimp.h"
 #include "hw/misc/clarion_qy7_regs.h"
 #include "hw/misc/clarion_usbphy.h"
+#include "hw/misc/clarion_dispmicom.h"
 #include "hw/misc/clarion_boards.h"
 #include "hw/sh4/clarion_sh4_core.h"
 #include "hw/sh4/sh.h"
@@ -54,6 +55,21 @@ typedef struct QY7MachineState {
     MachineState parent_obj;
     uint8_t dipsw;
 } QY7MachineState;
+
+typedef struct QY7DispSink {
+    ClarionScif *scif;
+} QY7DispSink;
+
+static int qy7_dispmicom_sink(void *opaque, const uint8_t *buf, int len)
+{
+    QY7DispSink *sink = opaque;
+    int n = MIN(clarion_scif_can_receive(sink->scif), len);
+
+    if (n > 0) {
+        clarion_scif_receive(sink->scif, buf, n);
+    }
+    return n;
+}
 
 static void qy7_machine_instance_init(Object *obj)
 {
@@ -107,8 +123,8 @@ static void qy7_report_invalid_model(const char *model)
  * 0x1fe41010 (area 7). Besides the P4 address, each channel therefore
  * needs an alias at A7ADDR(base), as the timer has.
  */
-static void qy7_scif_with_alias(MemoryRegion *sysmem, hwaddr base,
-                                const char *name, int index)
+static ClarionScif *qy7_scif_with_alias(MemoryRegion *sysmem, hwaddr base,
+                                        const char *name, int index)
 {
     ClarionScif *scif = g_new0(ClarionScif, 1);
     MemoryRegion *alias = g_new0(MemoryRegion, 1);
@@ -118,6 +134,7 @@ static void qy7_scif_with_alias(MemoryRegion *sysmem, hwaddr base,
                       false);
     memory_region_init_alias(alias, NULL, alias_name, &scif->mr, 0, 0x100);
     memory_region_add_subregion(sysmem, A7ADDR(base), alias);
+    return scif;
 }
 
 static void qy7_init(MachineState *machine)
@@ -128,6 +145,9 @@ static void qy7_init(MachineState *machine)
     SuperHCPU *cpu = SUPERH_CPU(cpu_create(machine->cpu_type));
     QY7ResetData *reset;
     ClarionQy7Int2 *int2;
+    DeviceState *dispmicom;
+    ClarionScif *scif3;
+    QY7DispSink *disp_sink;
     DriveInfo *dinfo;
     char model[CLARION_PROD_MODEL_LEN + 1] = "";
     const ClarionBoardInfo *board;
@@ -197,7 +217,14 @@ static void qy7_init(MachineState *machine)
      */
     qy7_scif_with_alias(sysmem, QY7_SCIF1_BASE, "qy7.scif1", 1);
     /* SCIF3: the same polling routine, SCFSR at VA 0x2b0010. */
-    qy7_scif_with_alias(sysmem, QY7_SCIF3_BASE, "qy7.scif3", 3);
+    scif3 = qy7_scif_with_alias(sysmem, QY7_SCIF3_BASE, "qy7.scif3", 3);
+    dispmicom = qdev_new(TYPE_CLARION_DISPMICOM);
+    qdev_realize_and_unref(dispmicom, NULL, &error_fatal);
+    disp_sink = g_new0(QY7DispSink, 1);
+    disp_sink->scif = scif3;
+    scif3->dispmicom = dispmicom;
+    scif3->dispmicom_tx = clarion_dispmicom_rx_byte;
+    clarion_dispmicom_set_sink(dispmicom, qy7_dispmicom_sink, disp_sink);
     /* SCIF7: the same polling routine, SCFSR at VA 0x2f0010. */
     qy7_scif_with_alias(sysmem, QY7_SCIF7_BASE, "qy7.scif7", 7);
     clarion_usbphy_init(sysmem, QY7_USBPHY_BASE, 2, "qy7.usbphy");
