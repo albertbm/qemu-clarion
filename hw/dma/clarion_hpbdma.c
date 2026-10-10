@@ -288,6 +288,7 @@ static void hpb_chan_complete(ClarionHpbDmaState *s, int ch)
 #define HPB_NO_MODULE   0
 
 static const hwaddr hpb_chan_module[CLARION_HPBDMA_NUM_CHAN] = {
+    [3]  = 0xFFE43014,      /* SCIF3 SCFRDR */
     [4]  = 0xFFE44014,      /* SCIF4  SCFRDR  — з гостя                 */
     [6]  = 0xFFE4400C,      /* SCIF4  SCFTDR  — з гостя                 */
     [14] = 0xFFE60018,      /* USB-функція D0 — Linux, не перевірено    */
