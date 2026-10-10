@@ -32,8 +32,8 @@ No firmware is included. You supply dumps taken from your own unit.
      - SH-4A
      - ``clarion-qy7``
      - ``qemu-system-sh4``
-     - first-stage Windows CE 5.0 kernel and its drivers start; serial
-       console only, no display or SD card yet
+     - first-stage Windows CE 5.0 kernel and its drivers start; Display
+       Micom, DU and 2DG models are connected, but the display remains black
 
 Developed and tested on macOS (Apple Silicon). A Linux build should work
 the same way but is not covered here.
@@ -131,8 +131,10 @@ Limitations
   through a built-in software path (``render=cpu``, the default).
 * Not modelled on QY8: the vehicle CAN bus beyond the controller itself,
   USB, I2C devices other than the touch controller.
-* QY7221NL has no display, SD card or watchdog reset yet, so it stops where
-  its launcher would ask for the map card.
+* QY7221NL display output is incomplete: the guest does not consume the
+  Display Micom reply, DU scanout is black, and the 2DG model stops at
+  command ``0xa1002900``. SD card and watchdog reset are not modelled, so the
+  launcher still stops where it would ask for the map card.
 
 Relation to QEMU
 ================
