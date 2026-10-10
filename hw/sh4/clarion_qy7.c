@@ -7,6 +7,7 @@
 #include "system/block-backend.h"
 #include "hw/block/flash.h"
 #include "hw/char/clarion_scif.h"
+#include "hw/dma/clarion_hpbdma.h"
 #include "hw/misc/unimp.h"
 #include "hw/misc/clarion_qy7_regs.h"
 #include "hw/misc/clarion_usbphy.h"
@@ -151,12 +152,15 @@ static void qy7_init(MachineState *machine)
     QY7ResetData *reset;
     ClarionQy7Int2 *int2;
     DeviceState *dispmicom;
+    DeviceState *dmac;
     ClarionScif *scif3;
     QY7DispSink *disp_sink;
     DeviceState *du;
     DeviceState *g2d;
     MemoryRegion *du_alias;
     MemoryRegion *g2d_alias;
+    MemoryRegion *hpb_chan_alias;
+    MemoryRegion *hpb_comm_alias;
     DriveInfo *dinfo;
     char model[CLARION_PROD_MODEL_LEN + 1] = "";
     const ClarionBoardInfo *board;
@@ -200,6 +204,22 @@ static void qy7_init(MachineState *machine)
     }
     int2 = clarion_qy7_int2_init(sysmem, QY7_INT2_BASE, CPU(cpu),
                                  &cpu->env.intc_handle);
+    dmac = qdev_new(TYPE_CLARION_HPBDMA);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dmac), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dmac), 0, CLARION_HPBDMA_CHAN_BASE);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dmac), 1, CLARION_HPBDMA_COMM_BASE);
+    hpb_chan_alias = g_new0(MemoryRegion, 1);
+    memory_region_init_alias(hpb_chan_alias, NULL, "qy7.hpb-channel-a7",
+                             sysbus_mmio_get_region(SYS_BUS_DEVICE(dmac), 0),
+                             0, CLARION_HPBDMA_CHAN_SIZE);
+    memory_region_add_subregion(sysmem, A7ADDR(CLARION_HPBDMA_CHAN_BASE),
+                                hpb_chan_alias);
+    hpb_comm_alias = g_new0(MemoryRegion, 1);
+    memory_region_init_alias(hpb_comm_alias, NULL, "qy7.hpb-common-a7",
+                             sysbus_mmio_get_region(SYS_BUS_DEVICE(dmac), 1),
+                             0, CLARION_HPBDMA_COMM_SIZE);
+    memory_region_add_subregion(sysmem, A7ADDR(CLARION_HPBDMA_COMM_BASE),
+                                hpb_comm_alias);
     tmu012_init(sysmem, 0xffd80000,
                 TMU012_FEAT_TOCR | TMU012_FEAT_3CHAN | TMU012_FEAT_EXTCLK,
                 QY7_TMU_CLOCK, clarion_qy7_int2_timer_irq(int2, 0),
@@ -259,7 +279,6 @@ static void qy7_init(MachineState *machine)
     /* 0xff804000..0xff8040ff is the INT2 controller (qy7.int2) */
     create_unimplemented_device("qy7.lbsc-window", 0xff801000, 0x3000);
     create_unimplemented_device("qy7.lbsc-window2", 0xff804100, 0xf00);
-    create_unimplemented_device("qy7.hpb", 0xffc08000, 0x1000);
     create_unimplemented_device("qy7.gpio", 0xffc40000, 0x4000);
     create_unimplemented_device("qy7.cpg", 0xffc80000, 0x1000);
     create_unimplemented_device("qy7.wdt", 0xffcc0000, 0x1000);
