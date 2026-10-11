@@ -103,9 +103,9 @@ static void int2_update(ClarionQy7Int2 *s)
         struct intc_source *source = &s->src[INT2_SOURCE_COUNT - 1];
 
         /* The installed completion ISR masks bit 12 and returns SYSINTR 34. */
-        cpu_memory_rw_debug(s->cpu, INT2_HPB_PRIO_BASE + 0x3c,
+        cpu_memory_rw_debug(s->cpu, INT2_HPB_PRIO_BASE + 0x2c,
                             &priority, sizeof(priority), false);
-        source->vect = 0x980;
+        source->vect = 0x780;
         source->priority = priority;
         source->pending = s->g2d_pending && !(s->mask & BIT(12));
         pending += source->pending;
