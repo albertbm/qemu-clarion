@@ -309,8 +309,11 @@ static void qy7_init(MachineState *machine)
 
         sysbus_realize_and_unref(SYS_BUS_DEVICE(sdhi), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(sdhi), 0, 0xffe4c000);
+        sysbus_connect_irq(SYS_BUS_DEVICE(sdhi), 0,
+                           clarion_qy7_int2_sdhi_irq(int2, 0));
         memory_region_init_alias(alias, NULL, "qy7.sdhi0-a7",
-                                 sysbus_mmio_get_region(SYS_BUS_DEVICE(sdhi), 0),
+                                 sysbus_mmio_get_region(
+                                     SYS_BUS_DEVICE(sdhi), 0),
                                  0, RENESAS_SDHI_SIZE);
         memory_region_add_subregion(sysmem, A7ADDR(0xffe4c000), alias);
         if (di) {

@@ -48,8 +48,11 @@
 
 #define INT2_TMU_CHANNELS 3
 #define INT2_DISPLAY_SOURCES 1
+#define INT2_SDHI_SOURCES 2
+#define INT2_DISPLAY_INDEX (INT2_TMU_CHANNELS + INT2_HPB_CHANNELS)
+#define INT2_SDHI_INDEX (INT2_DISPLAY_INDEX + INT2_DISPLAY_SOURCES)
 #define INT2_SOURCE_COUNT (INT2_TMU_CHANNELS + INT2_HPB_CHANNELS + \
-                           INT2_DISPLAY_SOURCES)
+                           INT2_DISPLAY_SOURCES + INT2_SDHI_SOURCES)
 #define INT2_UNK_SLOTS    (INT2_SIZE / 4)
 
 struct ClarionQy7Int2 {
@@ -65,6 +68,8 @@ struct ClarionQy7Int2 {
     uint32_t hpb_pending;
     qemu_irq g2d_irq;
     bool g2d_pending;
+    qemu_irq sdhi_irq[INT2_SDHI_SOURCES];
+    uint32_t sdhi_pending;
     uint32_t unk[INT2_UNK_SLOTS];
 };
 
@@ -100,7 +105,7 @@ static void int2_update(ClarionQy7Int2 *s)
     }
     {
         uint8_t priority = 0;
-        struct intc_source *source = &s->src[INT2_SOURCE_COUNT - 1];
+        struct intc_source *source = &s->src[INT2_DISPLAY_INDEX];
 
         /* The installed completion ISR masks bit 12 and returns SYSINTR 34. */
         cpu_memory_rw_debug(s->cpu, INT2_HPB_PRIO_BASE + 0x2c,
@@ -108,6 +113,19 @@ static void int2_update(ClarionQy7Int2 *s)
         source->vect = 0x780;
         source->priority = priority;
         source->pending = s->g2d_pending && !(s->mask & BIT(12));
+        pending += source->pending;
+    }
+    for (int i = 0; i < INT2_SDHI_SOURCES; i++) {
+        uint8_t priority = 0;
+        struct intc_source *source = &s->src[INT2_SDHI_INDEX + i];
+
+        /* Installed SD host ISRs share pending and mask bit 29. */
+        cpu_memory_rw_debug(s->cpu, INT2_HPB_PRIO_BASE + 0x47 + i,
+                            &priority, sizeof(priority), false);
+        source->vect = 0xae0 + i * 0x20;
+        source->priority = priority;
+        source->pending = (s->sdhi_pending & BIT(i)) &&
+                          !(s->mask & BIT(29));
         pending += source->pending;
     }
     s->desc.pending = pending;
@@ -143,6 +161,14 @@ static void int2_g2d_set(void *opaque, int n, int level)
     int2_update(s);
 }
 
+static void int2_sdhi_set(void *opaque, int n, int level)
+{
+    ClarionQy7Int2 *s = opaque;
+
+    s->sdhi_pending = deposit32(s->sdhi_pending, n, 1, !!level);
+    int2_update(s);
+}
+
 static uint64_t int2_reg_read(ClarionQy7Int2 *s, hwaddr addr)
 {
     switch (addr) {
@@ -150,6 +176,8 @@ static uint64_t int2_reg_read(ClarionQy7Int2 *s, hwaddr addr)
         return s->prio[0];
     case INT2_PRIO1:
         return s->prio[1];
+    case 0x3c:
+        return s->sdhi_pending ? BIT(29) : 0;
     case INT2_MASK_SET:
         return s->mask;
     default:
@@ -216,6 +244,7 @@ static void int2_reset(void *opaque)
     s->prio[0] = s->prio[1] = 0;
     s->hpb_pending = 0;
     s->g2d_pending = false;
+    s->sdhi_pending = 0;
     memset(s->unk, 0, sizeof(s->unk));
     int2_update(s);
 }
@@ -250,6 +279,9 @@ ClarionQy7Int2 *clarion_qy7_int2_init(MemoryRegion *sysmem, hwaddr base,
         s->hpb_irq[i] = qemu_allocate_irq(int2_hpb_set, s, i);
     }
     s->g2d_irq = qemu_allocate_irq(int2_g2d_set, s, 0);
+    for (int i = 0; i < INT2_SDHI_SOURCES; i++) {
+        s->sdhi_irq[i] = qemu_allocate_irq(int2_sdhi_set, s, i);
+    }
     memory_region_init_io(&s->iomem, NULL, &int2_ops, s, "qy7.int2",
                           INT2_SIZE);
     memory_region_add_subregion(sysmem, base, &s->iomem);
@@ -278,4 +310,10 @@ qemu_irq clarion_qy7_int2_hpb_channel_irq(ClarionQy7Int2 *s, int channel)
 qemu_irq clarion_qy7_int2_g2d_irq(ClarionQy7Int2 *s)
 {
     return s->g2d_irq;
+}
+
+qemu_irq clarion_qy7_int2_sdhi_irq(ClarionQy7Int2 *s, int unit)
+{
+    g_assert(unit >= 0 && unit < INT2_SDHI_SOURCES);
+    return s->sdhi_irq[unit];
 }
