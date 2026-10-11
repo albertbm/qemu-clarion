@@ -58,6 +58,7 @@
 #define M2DG_POLY4C 0x80
 #define M2DG_POLY4T 0x82
 #define M2DG_BITBLTC 0xa0
+#define M2DG_BITBLTM 0xa1
 #define M2DG_BITBLTA 0xa2
 #define M2DG_BITBLTK 0xa8
 #define M2DG_BITBLTR 0xaa
@@ -432,6 +433,60 @@ static void clarion_2dg_blit(ListCtx *c, int sx, int sy, int w, int h, int dx,
     }
 }
 
+/*
+ * Packed monochrome source, MSB first; source pitch is measured in bits.
+ * The guest's software counterpart tests bit 7, shifts left and advances
+ * the source byte after eight pixels. The two palette entries are packed
+ * low/high in the colour word. Only the observed source-copy form is used.
+ */
+static void clarion_2dg_blit_mono(ListCtx *c, int sx, int sy, int w, int h,
+                                 int dx, int dy, uint32_t colours)
+{
+    Clarion2DGState *s = c->s;
+    hwaddr src = s->lreg[M2DG_R_SRC / 4];
+    uint32_t pitch = s->lreg[M2DG_R_SRC_STRIDE / 4];
+    uint16_t key = s->lreg[M2DG_R_STRANS / 4];
+    int cx0, cy0, cx1, cy1;
+
+    /* SH direct-segment addresses name the low 29-bit physical bus. */
+    if ((src & 0xe0000000) == 0xa0000000) {
+        src &= 0x1fffffff;
+    }
+    if (!clarion_2dg_dst_map(c) ||
+        !clarion_2dg_clip(c, &cx0, &cy0, &cx1, &cy1) ||
+        !s->lreg_set[M2DG_R_SRC / 4] || !pitch || (pitch & 7) ||
+        sx < 0 || sy < 0 || w <= 0 || h <= 0 ||
+        w > CLARION_2DG_MAX_DIM || h > CLARION_2DG_MAX_DIM) {
+        return;
+    }
+    for (int j = 0; j < h; j++) {
+        int y = dy + j;
+
+        if (y < cy0 || y > cy1) {
+            continue;
+        }
+        for (int i = 0; i < w; i++) {
+            int x = dx + i;
+            unsigned bit = sx + i;
+            uint8_t byte = 0;
+            uint16_t colour;
+
+            if (x < cx0 || x > cx1 ||
+                address_space_read(&address_space_memory,
+                                   src + (hwaddr)(sy + j) * (pitch / 8) +
+                                   bit / 8, MEMTXATTRS_UNSPECIFIED,
+                                   &byte, 1) != MEMTX_OK) {
+                continue;
+            }
+            colour = (byte & (0x80 >> (bit & 7))) ?
+                     colours >> 16 : colours & 0xffff;
+            if (colour != key) {
+                clarion_2dg_put(c, x, y, colour);
+            }
+        }
+    }
+}
+
 /* Blend colour over dst per 5-bit channel with coverage a (0..255). */
 static inline uint16_t clarion_2dg_mix(uint16_t dst, uint16_t col, unsigned a)
 {
@@ -779,6 +834,26 @@ static unsigned clarion_2dg_run(Clarion2DGState *s, hwaddr list,
             c->path_n = a1;
             c->path_on = clarion_2dg_read_xy(pc + 16, a1, c->px, c->py);
             break;
+        case M2DG_BITBLTM: {
+            uint32_t a6 = 0;
+            int l = a4 >> 16, r = a4 & 0xffff;
+            int u = a5 >> 16, d = a5 & 0xffff;
+            int cx, cy;
+
+            /* Other ROPs and header flag combinations are unestablished. */
+            if (w != 0xa1002900 || a1 != 0xcc ||
+                !clarion_2dg_rd32(pc + 24, &a6)) {
+                goto unknown;
+            }
+            cx = clarion_2dg_xy_x(a6);
+            cy = clarion_2dg_xy_y(a6);
+            words = 7;
+            clarion_2dg_blit_mono(c, clarion_2dg_xy_x(a3),
+                                 clarion_2dg_xy_y(a3), l + r + 1,
+                                 u + d + 1, cx - l, cy - u, a2);
+            c->rc_on = c->path_on = false;
+            break;
+        }
         case M2DG_BITBLTC:
         case M2DG_BITBLTA:
         case M2DG_BITBLTK:
