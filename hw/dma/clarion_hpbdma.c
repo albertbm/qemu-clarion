@@ -325,6 +325,14 @@ static unsigned hpb_unit(ClarionHpbDmaState *s, int ch)
     return 1u << MAX(spds > 2 ? 2 : spds, dpds > 2 ? 2 : dpds);
 }
 
+static hwaddr hpb_dma_addr(ClarionHpbDmaState *s, hwaddr addr)
+{
+    if (s->qy7_mode && addr >= 0xa0000000 && addr < 0xc0000000) {
+        return addr & 0x1fffffff;
+    }
+    return addr;
+}
+
 /*
  * Перенести одну одиницю. Бік, позначений «MDL», — це модуль (периферія),
  * його адреса не рухається; інший бік інкрементується.
@@ -354,9 +362,9 @@ static void hpb_move_one(ClarionHpbDmaState *s, int ch)
                       "регістра, як було\n", ch);
     }
 
-    address_space_read(&address_space_memory, src,
+    address_space_read(&address_space_memory, hpb_dma_addr(s, src),
                        MEMTXATTRS_UNSPECIFIED, buf, unit);
-    address_space_write(&address_space_memory, dst,
+    address_space_write(&address_space_memory, hpb_dma_addr(s, dst),
                         MEMTXATTRS_UNSPECIFIED, buf, unit);
 
     if (!(c->dcr & DCR_SMDL)) {
@@ -449,7 +457,8 @@ static bool hpb_dbg(void)
  * би сам себе. Саме цими рядками доведено перше читання блоку SD
  * (docs/qy8-sdhi-dma-read-20260924.log у репозиторії nissan-can-explore).
  */
-static void hpb_dbg_dest(int ch, hwaddr addr, uint32_t dar,
+static void hpb_dbg_dest(ClarionHpbDmaState *s, int ch, hwaddr addr,
+                         uint32_t dar,
                          uint32_t moved, uint32_t asked)
 {
     uint8_t back[16];
@@ -458,8 +467,8 @@ static void hpb_dbg_dest(int ch, hwaddr addr, uint32_t dar,
     if (!hpb_dbg()) {
         return;
     }
-    address_space_read(&address_space_memory, dar, MEMTXATTRS_UNSPECIFIED,
-                       back, sizeof(back));
+    address_space_read(&address_space_memory, hpb_dma_addr(s, dar),
+                       MEMTXATTRS_UNSPECIFIED, back, sizeof(back));
     fprintf(stderr, "[dma] ch%d модуль %08x -> %08x: перенесено %u од. з %u, "
             "у пам'яті:", ch, (unsigned)addr, dar, moved, asked);
     for (k = 0; k < sizeof(back); k++) {
@@ -524,7 +533,7 @@ static void hpb_service_module(ClarionHpbDmaState *s, hwaddr addr)
             hpb_chan_finish(s, ch);
         }
 
-        hpb_dbg_dest(ch, addr, dar0, n0 - c->left, n0);
+        hpb_dbg_dest(s, ch, addr, dar0, n0 - c->left, n0);
         break;                          /* один канал на одну адресу */
     }
 
@@ -625,7 +634,8 @@ bool clarion_hpbdma_feed(DeviceState *dev, hwaddr periph_addr, uint8_t val)
                                  : c->dsasr != periph_addr) {
             continue;
         }
-        address_space_write(&address_space_memory, c->ddasr,
+        address_space_write(&address_space_memory,
+                            hpb_dma_addr(s, c->ddasr),
                             MEMTXATTRS_UNSPECIFIED, &val, 1);
         c->ddasr++;
         c->left--;
