@@ -85,8 +85,8 @@ starts QEMU. You never pass ``-M`` or ``-drive`` yourself.
      - raw dump of the unit's NOR flash: 64 MiB for QY8652NB and QY8202NA,
        8 MiB for QY7221NL
    * - ``SD``
-     - optional raw image of the SD card for the front slot; rejected for
-       units whose machine has no SD controller yet (QY7221NL)
+     - optional raw image of the SD card for the front slot, including
+       QY7221NL (SDHI0)
    * - ``--read-only``
      - open both images with ``snapshot=on``: guest writes go to temporary
        storage and the files do not change
