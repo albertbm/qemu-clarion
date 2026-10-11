@@ -47,7 +47,9 @@
 #define INT2_DEFAULT_ISR    0x8800F654
 
 #define INT2_TMU_CHANNELS 3
-#define INT2_SOURCE_COUNT (INT2_TMU_CHANNELS + INT2_HPB_CHANNELS)
+#define INT2_DISPLAY_SOURCES 1
+#define INT2_SOURCE_COUNT (INT2_TMU_CHANNELS + INT2_HPB_CHANNELS + \
+                           INT2_DISPLAY_SOURCES)
 #define INT2_UNK_SLOTS    (INT2_SIZE / 4)
 
 struct ClarionQy7Int2 {
@@ -61,6 +63,8 @@ struct ClarionQy7Int2 {
     uint32_t mask;
     uint32_t tmu_lines;
     uint32_t hpb_pending;
+    qemu_irq g2d_irq;
+    bool g2d_pending;
     uint32_t unk[INT2_UNK_SLOTS];
 };
 
@@ -94,6 +98,18 @@ static void int2_update(ClarionQy7Int2 *s)
                           isr != INT2_DEFAULT_ISR;
         pending += source->pending;
     }
+    {
+        uint8_t priority = 0;
+        struct intc_source *source = &s->src[INT2_SOURCE_COUNT - 1];
+
+        /* The installed completion ISR masks bit 12 and returns SYSINTR 34. */
+        cpu_memory_rw_debug(s->cpu, INT2_HPB_PRIO_BASE + 0x3c,
+                            &priority, sizeof(priority), false);
+        source->vect = 0x980;
+        source->priority = priority;
+        source->pending = s->g2d_pending && !(s->mask & BIT(12));
+        pending += source->pending;
+    }
     s->desc.pending = pending;
     if (pending) {
         cpu_interrupt(s->cpu, CPU_INTERRUPT_HARD);
@@ -115,6 +131,15 @@ static void int2_hpb_set(void *opaque, int n, int level)
     ClarionQy7Int2 *s = opaque;
 
     s->hpb_pending = deposit32(s->hpb_pending, n, 1, !!level);
+    int2_update(s);
+}
+
+static void int2_g2d_set(void *opaque, int n, int level)
+{
+    ClarionQy7Int2 *s = opaque;
+
+    (void)n;
+    s->g2d_pending = !!level;
     int2_update(s);
 }
 
@@ -190,6 +215,7 @@ static void int2_reset(void *opaque)
     s->mask = 0xffffffff;
     s->prio[0] = s->prio[1] = 0;
     s->hpb_pending = 0;
+    s->g2d_pending = false;
     memset(s->unk, 0, sizeof(s->unk));
     int2_update(s);
 }
@@ -223,6 +249,7 @@ ClarionQy7Int2 *clarion_qy7_int2_init(MemoryRegion *sysmem, hwaddr base,
     for (int i = 0; i < INT2_HPB_CHANNELS; i++) {
         s->hpb_irq[i] = qemu_allocate_irq(int2_hpb_set, s, i);
     }
+    s->g2d_irq = qemu_allocate_irq(int2_g2d_set, s, 0);
     memory_region_init_io(&s->iomem, NULL, &int2_ops, s, "qy7.int2",
                           INT2_SIZE);
     memory_region_add_subregion(sysmem, base, &s->iomem);
@@ -247,3 +274,8 @@ qemu_irq clarion_qy7_int2_hpb_channel_irq(ClarionQy7Int2 *s, int channel)
     return s->hpb_irq[channel];
 }
 
+
+qemu_irq clarion_qy7_int2_g2d_irq(ClarionQy7Int2 *s)
+{
+    return s->g2d_irq;
+}

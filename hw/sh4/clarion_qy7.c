@@ -262,6 +262,8 @@ static void qy7_init(MachineState *machine)
     g2d = qdev_new(TYPE_CLARION_2DG);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(g2d), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(g2d), 0, QY7_2DG_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(g2d), 0,
+                       clarion_qy7_int2_g2d_irq(int2));
     g2d_alias = g_new0(MemoryRegion, 1);
     memory_region_init_alias(g2d_alias, NULL, "qy7.2dg-a7",
                              sysbus_mmio_get_region(SYS_BUS_DEVICE(g2d), 0),
