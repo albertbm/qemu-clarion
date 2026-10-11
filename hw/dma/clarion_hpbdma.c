@@ -347,7 +347,8 @@ static void hpb_move_one(ClarionHpbDmaState *s, int ch)
     unsigned unit = hpb_unit(s, ch);
     hwaddr mod = hpb_module_addr(s, ch);
     hwaddr src = c->dsasr, dst = c->ddasr;
-    bool sd_burst = s->qy7_mode && ch == 8 && (c->dcr & BIT(21));
+    bool sd_burst = s->qy7_mode && ch == 8 && (c->dcr & BIT(21)) &&
+                    (c->dcr & DCR_SMDL) && !(c->dcr & DCR_DMDL);
     unsigned bytes = sd_burst ? 16 : unit;
     uint8_t buf[16];
 
