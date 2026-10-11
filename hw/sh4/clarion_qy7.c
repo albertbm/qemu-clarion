@@ -19,6 +19,8 @@
 #include "hw/sh4/sh.h"
 #include "hw/intc/clarion_qy7_int2.h"
 #include "hw/timer/tmu012.h"
+#include "hw/sd/renesas_sdhi.h"
+#include "hw/sd/sd.h"
 #include "hw/core/irq.h"
 #include "target/sh4/cpu-qom.h"
 #include "target/sh4/cpu.h"
@@ -300,7 +302,26 @@ static void qy7_init(MachineState *machine)
     create_unimplemented_device("qy7.gpio", 0xffc40000, 0x4000);
     create_unimplemented_device("qy7.cpg", 0xffc80000, 0x1000);
     create_unimplemented_device("qy7.wdt", 0xffcc0000, 0x1000);
-    create_unimplemented_device("qy7.sdhi0", 0xffe4c000, 0x1000);
+    {
+        DeviceState *sdhi = qdev_new(TYPE_RENESAS_SDHI);
+        DriveInfo *di = drive_get(IF_SD, 0, 0);
+        MemoryRegion *alias = g_new0(MemoryRegion, 1);
+
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(sdhi), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(sdhi), 0, 0xffe4c000);
+        memory_region_init_alias(alias, NULL, "qy7.sdhi0-a7",
+                                 sysbus_mmio_get_region(SYS_BUS_DEVICE(sdhi), 0),
+                                 0, RENESAS_SDHI_SIZE);
+        memory_region_add_subregion(sysmem, A7ADDR(0xffe4c000), alias);
+        if (di) {
+            DeviceState *card = qdev_new(TYPE_SD_CARD);
+
+            qdev_prop_set_drive_err(card, "drive",
+                                   blk_by_legacy_dinfo(di), &error_fatal);
+            qdev_realize_and_unref(card, qdev_get_child_bus(sdhi, "sd-bus"),
+                                   &error_fatal);
+        }
+    }
     create_unimplemented_device("qy7.sdhi1", 0xffe4d000, 0x1000);
     create_unimplemented_device("qy7.pfc", 0xfffc0000, 0x10000);
     create_unimplemented_device("qy7.intc", 0xffd00000, 0x1000);

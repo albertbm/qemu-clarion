@@ -33,3 +33,4 @@ config CLARION_QY7
     select CLARION_SCIF
     select UNIMP
     select SH_TIMER
+    select RENESAS_SDHI
