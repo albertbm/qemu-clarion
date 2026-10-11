@@ -347,7 +347,9 @@ static void hpb_move_one(ClarionHpbDmaState *s, int ch)
     unsigned unit = hpb_unit(s, ch);
     hwaddr mod = hpb_module_addr(s, ch);
     hwaddr src = c->dsasr, dst = c->ddasr;
-    uint8_t buf[4];
+    bool sd_burst = s->qy7_mode && ch == 8 && (c->dcr & BIT(21));
+    unsigned bytes = sd_burst ? 16 : unit;
+    uint8_t buf[16];
 
     /*
      * Бік, позначений MDL, адресується прив'язкою каналу. Записане гостем
@@ -366,16 +368,21 @@ static void hpb_move_one(ClarionHpbDmaState *s, int ch)
                       "регістра, як було\n", ch);
     }
 
-    address_space_read(&address_space_memory, hpb_dma_addr(s, src),
-                       MEMTXATTRS_UNSPECIFIED, buf, unit);
+    /* Burst mode counts 16 bytes while the SD FIFO port stays 16-bit. */
+    for (unsigned offset = 0; offset < bytes; offset += unit) {
+        hwaddr read_addr = src + ((c->dcr & DCR_SMDL) ? 0 : offset);
+
+        address_space_read(&address_space_memory, hpb_dma_addr(s, read_addr),
+                           MEMTXATTRS_UNSPECIFIED, buf + offset, unit);
+    }
     address_space_write(&address_space_memory, hpb_dma_addr(s, dst),
-                        MEMTXATTRS_UNSPECIFIED, buf, unit);
+                        MEMTXATTRS_UNSPECIFIED, buf, bytes);
 
     if (!(c->dcr & DCR_SMDL)) {
-        c->dsasr += unit;
+        c->dsasr += bytes;
     }
     if (!(c->dcr & DCR_DMDL)) {
-        c->ddasr += unit;
+        c->ddasr += bytes;
     }
     c->left--;
     c->dtcsr = c->left;
