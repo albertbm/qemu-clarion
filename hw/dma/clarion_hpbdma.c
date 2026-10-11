@@ -241,6 +241,8 @@ static void hpb_chan_complete(ClarionHpbDmaState *s, int ch)
 {
     int w = ch / 32, b = ch % 32;
 
+    trace_clarion_hpbdma_complete(ch, s->ch[ch].dcr, s->ch[ch].dsasr,
+                                  s->ch[ch].ddasr, s->ch[ch].dtcsr);
     s->dintsr[w] |= 1u << b;
     hpb_update_irq(s);
 }
