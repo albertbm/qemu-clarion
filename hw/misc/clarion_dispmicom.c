@@ -293,6 +293,14 @@ static void disp_frame(ClarionDispMicomState *s)
         disp_queue(s, (const uint8_t[]){ 0x71 }, 1);
         break;
 
+    case 0x42:
+        /*
+         * SH4 handler 0x03cf677c accepts ready 0x42 in link state 1,
+         * reads no payload, and queues the 0x43 settings report.
+         */
+        disp_queue(s, (const uint8_t[]){ 0x42 }, 1);
+        break;
+
     default:
         /* Решта команд панелі не розібрана — лише квитанція, без вигадок. */
         break;
