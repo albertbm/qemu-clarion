@@ -53,6 +53,14 @@
 #define QY7_SCIF1_BASE 0xffe41000
 #define QY7_SCIF3_BASE 0xffe43000
 #define QY7_SCIF7_BASE 0xffe47000
+/*
+ * The ninth serial_scif.dll instance (registry key Drivers\BuiltIn\HSCIF,
+ * Index 8, Prefix SCI) is opened by the device manager at boot.  Its
+ * HWSetCommState (serial_scif.dll 0x03C88C40) polls SCFSR.TEND at
+ * 0xffe48010; the context's register table covers offsets 0x00..0x24, 0x30
+ * and 0x34 only.
+ */
+#define QY7_HSCIF_BASE 0xffe48000
 #define QY7_USBPHY_BASE 0xffe70800
 #define QY7_INT2_BASE 0xff804000
 #define QY7_DU_BASE 0xfff80000
@@ -306,6 +314,8 @@ static void qy7_init(MachineState *machine)
     clarion_dispmicom_set_sink(dispmicom, qy7_dispmicom_sink, disp_sink);
     /* SCIF7: the same polling routine, SCFSR at VA 0x2f0010. */
     qy7_scif_with_alias(sysmem, QY7_SCIF7_BASE, "qy7.scif7", 7, NULL);
+    /* HSCIF: the same polling routine, SCFSR at VA 0x00e40010 (area 7). */
+    qy7_scif_with_alias(sysmem, QY7_HSCIF_BASE, "qy7.hscif", 8, NULL);
     clarion_usbphy_init(sysmem, QY7_USBPHY_BASE, 2, "qy7.usbphy");
 
     create_unimplemented_device("qy7.dbsc", 0xfe800000, 0x10000);
