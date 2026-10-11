@@ -219,6 +219,21 @@ bool sdbus_receive_ready(SDBus *sd);
 bool sdbus_data_ready(SDBus *sd);
 bool sdbus_get_inserted(SDBus *sd);
 bool sdbus_get_readonly(SDBus *sd);
+
+/**
+ * sd_card_set_pairing: make the card come up locked with a known password
+ * @sd: card
+ * @pwd: lock password (copied; the caller wipes its own copy)
+ * @len: password length, must be 16
+ *
+ * The password register and the lock state of a real card are non-volatile:
+ * a card paired with a host unit is locked after every power cycle and the
+ * host unlocks it with CMD42.  With pairing set, a device reset (power
+ * cycle or card insertion) locks the card with @pwd, and CMD0 keeps the
+ * password and the lock state as they are.  Without it the card behaves
+ * as before.  The password is never logged or traced.
+ */
+void sd_card_set_pairing(SDState *sd, const uint8_t *pwd, size_t len);
 /**
  * sdbus_reparent_card: Reparent an SD card from one controller to another
  * @from: controller bus to remove card from

@@ -183,6 +183,9 @@ struct SDState {
     uint32_t erase_end;
     uint8_t pwd[16];
     uint32_t pwd_len;
+    /* Pairing with a host unit, see sd_card_set_pairing(); not migrated. */
+    bool paired;
+    uint8_t paired_pwd[16];
     uint8_t function_group[6];
     uint8_t current_cmd;
     const char *last_cmd_name;
@@ -911,12 +914,22 @@ static inline uint64_t sd_addr_to_wpnum(uint64_t addr)
     return addr >> (HWBLOCK_SHIFT + SECTOR_SHIFT + WPGROUP_SHIFT);
 }
 
-static void sd_reset(DeviceState *dev)
+/*
+ * @power_cycle: true for a device reset or a card insertion, false for CMD0.
+ * Only a paired card (sd_card_set_pairing) tells them apart: the password
+ * register and the lock state are non-volatile, so CMD0 leaves them alone
+ * while a power cycle locks the card again.
+ */
+static void sd_reset_card(SDState *sd, bool power_cycle)
 {
-    SDState *sd = SDMMC_COMMON(dev);
     SDCardClass *sc = SDMMC_COMMON_GET_CLASS(sd);
+    uint8_t kept_pwd[16];
+    uint32_t kept_pwd_len = sd->pwd_len;
+    bool kept_locked = sd->card_status & CARD_IS_LOCKED;
     uint64_t size;
     uint64_t sect;
+
+    memcpy(kept_pwd, sd->pwd, sizeof(kept_pwd));
 
     trace_sdcard_reset();
     if (sd->blk) {
@@ -956,6 +969,36 @@ static void sd_reset(DeviceState *dev)
     sd->dat_lines = 0xf;
     sd->cmd_line = true;
     sd->multi_blk_cnt = 0;
+
+    if (sd->paired) {
+        if (power_cycle) {
+            memcpy(sd->pwd, sd->paired_pwd, sizeof(sd->pwd));
+            sd->pwd_len = sizeof(sd->pwd);
+            sd->card_status |= CARD_IS_LOCKED;
+        } else {
+            memcpy(sd->pwd, kept_pwd, sizeof(sd->pwd));
+            sd->pwd_len = kept_pwd_len;
+            if (kept_locked) {
+                sd->card_status |= CARD_IS_LOCKED;
+            }
+        }
+    }
+    memset(kept_pwd, 0, sizeof(kept_pwd));
+}
+
+static void sd_reset(DeviceState *dev)
+{
+    sd_reset_card(SDMMC_COMMON(dev), true);
+}
+
+void sd_card_set_pairing(SDState *sd, const uint8_t *pwd, size_t len)
+{
+    if (len != sizeof(sd->paired_pwd)) {
+        return;
+    }
+    memcpy(sd->paired_pwd, pwd, len);
+    sd->paired = true;
+    sd_reset_card(sd, true);
 }
 
 static bool sd_get_inserted(SDState *sd)
@@ -1666,7 +1709,7 @@ static sd_rsp_type_t sd_cmd_GO_IDLE_STATE(SDState *sd, SDRequest req)
     }
     if (sd->state != sd_inactive_state) {
         sd->state = sd_idle_state;
-        sd_reset(DEVICE(sd));
+        sd_reset_card(sd, false);
     }
 
     return sd_is_spi(sd) ? sd_r1 : sd_r0;
