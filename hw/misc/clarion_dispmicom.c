@@ -157,17 +157,23 @@ static void disp_arm(ClarionDispMicomState *s, int64_t delay)
     timer_mod(s->tx, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + delay);
 }
 
-static void disp_queue(ClarionDispMicomState *s, const uint8_t *data,
+static void disp_trace(const char *direction, const uint8_t *data,
                        unsigned len)
 {
     unsigned i;
+    g_autoptr(GString) body = g_string_new(NULL);
 
-    qemu_log("clarion-dispmicom: trace guest-ms=%" PRId64 " dir=panel-tx body=",
-             qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL));
     for (i = 0; i < len; i++) {
-        qemu_log("%s%02x", i ? " " : "", data[i]);
+        g_string_append_printf(body, "%s%02x", i ? " " : "", data[i]);
     }
-    qemu_log("\n");
+    qemu_log("clarion-dispmicom: trace virtual-ms=%" PRId64
+             " dir=%s body=%s\n", qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL),
+             direction, body->str);
+}
+
+static void disp_queue(ClarionDispMicomState *s, const uint8_t *data,
+                       unsigned len)
+{
     g_queue_push_tail(s->frames, disp_build(data, len));
     if (!s->cur) {
         disp_arm(s, DISP_FILL_NS);
@@ -179,9 +185,6 @@ static void disp_queue_ack(ClarionDispMicomState *s, uint8_t code)
     GByteArray *f = g_byte_array_new();
     uint8_t b = DLE;
 
-    qemu_log("clarion-dispmicom: trace guest-ms=%" PRId64
-             " dir=panel-tx body=10 %02x\n",
-             qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), code);
 
     g_byte_array_append(f, &b, 1);
     g_byte_array_append(f, &code, 1);
@@ -211,6 +214,23 @@ static void disp_tx_expire(void *opaque)
     took = s->sink(s->sink_opaque, s->cur->data + s->cur_off,
                    s->cur->len - s->cur_off);
     if (took > 0) {
+        if (!s->cur_off) {
+            if (s->cur->len == 2) {
+                disp_trace("panel-tx", s->cur->data, 2);
+            } else {
+                uint8_t data[DISP_MAX_DATA];
+                unsigned len = 0;
+                unsigned i;
+
+                for (i = 2; i < s->cur->len - 3; i++) {
+                    data[len++] = s->cur->data[i];
+                    if (s->cur->data[i] == DLE) {
+                        i++;
+                    }
+                }
+                disp_trace("panel-tx", data, len);
+            }
+        }
         s->cur_off += took;
     }
     if (s->cur_off >= s->cur->len) {
@@ -242,14 +262,8 @@ static void disp_send_info(ClarionDispMicomState *s)
 static void disp_frame(ClarionDispMicomState *s)
 {
     uint8_t cmd;
-    unsigned i;
 
-    qemu_log("clarion-dispmicom: trace guest-ms=%" PRId64
-             " dir=guest-tx body=", qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL));
-    for (i = 0; i < s->body_len; i++) {
-        qemu_log("%s%02x", i ? " " : "", s->body[i]);
-    }
-    qemu_log("\n");
+    disp_trace("guest-tx", s->body, s->body_len);
 
     /* На кожен кадр — DLE ACK, як у живому лінку. */
     disp_queue_ack(s, ACK);
@@ -297,6 +311,9 @@ void clarion_dispmicom_rx_byte(DeviceState *dev, uint8_t b)
         } else if (b == DLE) {
             s->rx_state = RX_DLE;           /* 10 10 поза кадром — тримаємось */
         } else {
+            if (b == ACK || b == NAK) {
+                disp_trace("guest-tx", (const uint8_t[]){ DLE, b }, 2);
+            }
             /* DLE ACK / DLE NAK від гостя — підтвердження наших кадрів */
             s->rx_state = RX_IDLE;
         }
