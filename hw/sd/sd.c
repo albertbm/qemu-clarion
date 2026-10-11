@@ -2170,7 +2170,7 @@ static sd_rsp_type_t sd_cmd_ERASE(SDState *sd, SDRequest req)
 /* CMD42 */
 static sd_rsp_type_t sd_cmd_LOCK_UNLOCK(SDState *sd, SDRequest req)
 {
-    return sd_cmd_to_receivingdata(sd, req, 0, 0);
+    return sd_cmd_to_receivingdata(sd, req, 0, sd->blk_len);
 }
 
 /* CMD55 */
