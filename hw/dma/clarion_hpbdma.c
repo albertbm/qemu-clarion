@@ -217,8 +217,7 @@ static void hpb_update_irq(ClarionHpbDmaState *s)
     int ch, i;
 
     if (s->qy7_mode) {
-        /* QY7 exposes DTE1 where QY8 decodes channel 32 DTCR1. */
-        raised[0] = !!(s->dintsr[0] & s->qy7_dte[1] & BIT(3));
+        raised[0] = !!(s->dintsr[0] & s->qy7_dte[1]);
         for (i = 0; i < CLARION_HPBDMA_NUM_IRQ; i++) {
             qemu_set_irq(s->irq[i], raised[i]);
         }
@@ -685,6 +684,9 @@ void clarion_hpbdma_eod(DeviceState *dev, hwaddr periph_addr)
 static uint64_t hpb_chan_read(void *opaque, hwaddr addr, unsigned size)
 {
     ClarionHpbDmaState *s = opaque;
+    if (s->qy7_mode && addr == 0x80C) {
+        return s->dintsr[0];
+    }
     if (s->qy7_mode && addr == HPB_QY7_DTE0) {
         return s->qy7_dte[0];
     }
@@ -729,14 +731,13 @@ static void hpb_chan_write(void *opaque, hwaddr addr, uint64_t val,
 {
     ClarionHpbDmaState *s = opaque;
     if (s->qy7_mode && addr == HPB_QY7_DTE0) {
+        s->dintsr[0] &= ~(uint32_t)val;
+        hpb_update_irq(s);
         s->qy7_dte[0] = val;
         return;
     }
     if (s->qy7_mode && addr == HPB_QY7_DTE1) {
-        uint32_t old = s->qy7_dte[1];
-
         s->qy7_dte[1] = val;
-        s->dintsr[0] &= ~(old & ~(uint32_t)val);
         hpb_update_irq(s);
         return;
     }
