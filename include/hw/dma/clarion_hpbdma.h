@@ -26,8 +26,10 @@
 /* num_hw_channels = 39 (hpb_dmae_pdata у тому ж файлі) */
 #define CLARION_HPBDMA_NUM_CHAN     39
 
-/* IRQ-ліній рівно 5: DEFINE_RES_NAMED(gic_iid(0x7b), 5, ...) */
-#define CLARION_HPBDMA_NUM_IRQ      5
+/* QY8 exposes five legacy IRQs; QY7 routes one output per channel. */
+#define CLARION_HPBDMA_QY7_NUM_IRQ  32
+#define CLARION_HPBDMA_NUM_IRQ      CLARION_HPBDMA_QY7_NUM_IRQ
+#define CLARION_HPBDMA_QY8_NUM_IRQ  5
 #define CLARION_HPBDMA_IRQ_BASE_SPI 91      /* IRQ 123 - 32 */
 
 /*

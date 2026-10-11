@@ -217,9 +217,10 @@ static void hpb_update_irq(ClarionHpbDmaState *s)
     int ch, i;
 
     if (s->qy7_mode) {
-        raised[0] = !!(s->dintsr[0] & s->qy7_dte[1]);
-        for (i = 0; i < CLARION_HPBDMA_NUM_IRQ; i++) {
-            qemu_set_irq(s->irq[i], raised[i]);
+        uint32_t active = s->dintsr[0] & s->qy7_dte[1];
+
+        for (i = 0; i < CLARION_HPBDMA_QY7_NUM_IRQ; i++) {
+            qemu_set_irq(s->irq[i], !!(active & (1u << i)));
         }
         return;
     }
@@ -231,7 +232,7 @@ static void hpb_update_irq(ClarionHpbDmaState *s)
             raised[hpb_chan_irq_line(s, ch)] = true;
         }
     }
-    for (i = 0; i < CLARION_HPBDMA_NUM_IRQ; i++) {
+    for (i = 0; i < CLARION_HPBDMA_QY8_NUM_IRQ; i++) {
         qemu_set_irq(s->irq[i], raised[i]);
     }
 }

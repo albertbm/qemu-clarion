@@ -2256,7 +2256,7 @@ static void qy8_init(MachineState *machine)
     sysbus_realize_and_unref(SYS_BUS_DEVICE(s->dmac), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(s->dmac), 0, CLARION_HPBDMA_CHAN_BASE);
     sysbus_mmio_map(SYS_BUS_DEVICE(s->dmac), 1, CLARION_HPBDMA_COMM_BASE);
-    for (i = 0; i < CLARION_HPBDMA_NUM_IRQ; i++) {
+    for (i = 0; i < CLARION_HPBDMA_QY8_NUM_IRQ; i++) {
         sysbus_connect_irq(SYS_BUS_DEVICE(s->dmac), i,
                            qdev_get_gpio_in(s->gic,
                                             CLARION_HPBDMA_IRQ_BASE_SPI + i));

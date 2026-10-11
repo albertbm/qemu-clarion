@@ -221,8 +221,10 @@ static void qy7_init(MachineState *machine)
                              0, CLARION_HPBDMA_COMM_SIZE);
     memory_region_add_subregion(sysmem, A7ADDR(CLARION_HPBDMA_COMM_BASE),
                                 hpb_comm_alias);
-    sysbus_connect_irq(SYS_BUS_DEVICE(dmac), 0,
-                       clarion_qy7_int2_hpb_irq(int2));
+    for (int i = 0; i < CLARION_HPBDMA_QY7_NUM_IRQ; i++) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(dmac), i,
+                           clarion_qy7_int2_hpb_channel_irq(int2, i));
+    }
     tmu012_init(sysmem, 0xffd80000,
                 TMU012_FEAT_TOCR | TMU012_FEAT_3CHAN | TMU012_FEAT_EXTCLK,
                 QY7_TMU_CLOCK, clarion_qy7_int2_timer_irq(int2, 0),
