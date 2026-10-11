@@ -4,6 +4,9 @@
 /* Shared, QEMU-independent unit model to board mapping. */
 #define CLARION_PROD_MODEL_OFF 0x40
 #define CLARION_PROD_MODEL_LEN 8
+/* QY7221NL: 16-byte SD card lock password stored in PROD at +0x100. */
+#define CLARION_PROD_CARD_PWD_OFF 0x100
+#define CLARION_PROD_CARD_PWD_LEN 16
 
 static const unsigned long long clarion_prod_offsets[] = { 0x40000, 0xa000 };
 

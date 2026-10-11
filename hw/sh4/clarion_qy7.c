@@ -61,6 +61,7 @@
 typedef struct QY7MachineState {
     MachineState parent_obj;
     uint8_t dipsw;
+    bool paired_card;
 } QY7MachineState;
 
 typedef struct QY7DispSink {
@@ -91,6 +92,17 @@ static void qy7_machine_instance_init(Object *obj)
     QY7MachineState *s = (QY7MachineState *)obj;
 
     s->dipsw = 7;
+    s->paired_card = true;
+}
+
+static bool qy7_get_paired_card(Object *obj, Error **errp)
+{
+    return ((QY7MachineState *)obj)->paired_card;
+}
+
+static void qy7_set_paired_card(Object *obj, bool value, Error **errp)
+{
+    ((QY7MachineState *)obj)->paired_card = value;
 }
 
 typedef struct QY7ResetData {
@@ -174,6 +186,7 @@ static void qy7_init(MachineState *machine)
     DriveInfo *dinfo;
     char model[CLARION_PROD_MODEL_LEN + 1] = "";
     const ClarionBoardInfo *board;
+    hwaddr prod_off = 0;
     bool found = false;
 
     dinfo = drive_get(IF_PFLASH, 0, 0);
@@ -195,6 +208,7 @@ static void qy7_init(MachineState *machine)
             }
             model[sizeof(raw)] = '\0';
             found = true;
+            prod_off = off;
             break;
         }
     }
@@ -326,6 +340,28 @@ static void qy7_init(MachineState *machine)
                                    blk_by_legacy_dinfo(di), &error_fatal);
             qdev_realize_and_unref(card, qdev_get_child_bus(sdhi, "sd-bus"),
                                    &error_fatal);
+            if (qmachine->paired_card && dinfo) {
+                /*
+                 * The card is paired with this unit: it comes up locked
+                 * with the password kept in PROD.  The guest unlocks it with
+                 * CMD42 (SDHC.dll 0x03CA6BDC, password from KernelIoControl
+                 * 0x01013008).  The password stays in this buffer only.
+                 */
+                uint8_t pwd[CLARION_PROD_CARD_PWD_LEN];
+                bool blank = true;
+
+                if (blk_pread(blk_by_legacy_dinfo(dinfo),
+                              prod_off + CLARION_PROD_CARD_PWD_OFF,
+                              sizeof(pwd), pwd, 0) >= 0) {
+                    for (int i = 0; i < sizeof(pwd); i++) {
+                        blank &= pwd[i] == 0x00 || pwd[i] == 0xff;
+                    }
+                    if (!blank) {
+                        sd_card_set_pairing(SD_CARD(card), pwd, sizeof(pwd));
+                    }
+                }
+                memset(pwd, 0, sizeof(pwd));
+            }
         }
     }
     create_unimplemented_device("qy7.sdhi1", 0xffe4d000, 0x1000);
@@ -351,6 +387,11 @@ static void qy7_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_uint8_ptr(
         oc, "dipsw", offsetof(QY7MachineState, dipsw),
         OBJ_PROP_FLAG_READWRITE);
+    object_class_property_add_bool(oc, "paired-card", qy7_get_paired_card,
+                                   qy7_set_paired_card);
+    object_class_property_set_description(oc, "paired-card",
+        "The SD card is locked with the PROD card password at power-up, "
+        "like a card paired with this unit (default on)");
 }
 
 static const TypeInfo qy7_machine_typeinfo = {
