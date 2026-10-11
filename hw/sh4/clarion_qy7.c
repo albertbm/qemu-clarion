@@ -50,6 +50,9 @@
  * 0x1000 * n. The guest maps channels 1, 3, 6 and 7 at boot (VirtualCopy
  * from 0xffe41000, 0xffe43000, 0xffe46000, 0xffe47000).
  */
+#define QY7_SCIF0_BASE 0xffe40000
+/* Index past any -serial the command line can reasonably carry. */
+#define QY7_NO_CHARDEV 31
 #define QY7_SCIF1_BASE 0xffe41000
 #define QY7_SCIF3_BASE 0xffe43000
 #define QY7_SCIF7_BASE 0xffe47000
@@ -158,19 +161,27 @@ static void qy7_report_invalid_model(const char *model)
  * 0x1fe41010 (area 7). Besides the P4 address, each channel therefore
  * needs an alias at A7ADDR(base), as the timer has.
  */
-static ClarionScif *qy7_scif_with_alias(MemoryRegion *sysmem, hwaddr base,
-                                        const char *name, int index,
-                                        qemu_irq irq)
+static ClarionScif *qy7_scif_with_alias_serial(MemoryRegion *sysmem,
+                                               hwaddr base, const char *name,
+                                               int index, int serial_index,
+                                               qemu_irq irq)
 {
     ClarionScif *scif = g_new0(ClarionScif, 1);
     MemoryRegion *alias = g_new0(MemoryRegion, 1);
     g_autofree char *alias_name = g_strdup_printf("%s-a7", name);
 
-    clarion_scif_init(scif, sysmem, base, name, index, index, irq, NULL,
-                      false);
+    clarion_scif_init(scif, sysmem, base, name, index, serial_index, irq,
+                      NULL, false);
     memory_region_init_alias(alias, NULL, alias_name, &scif->mr, 0, 0x100);
     memory_region_add_subregion(sysmem, A7ADDR(base), alias);
     return scif;
+}
+
+static ClarionScif *qy7_scif_with_alias(MemoryRegion *sysmem, hwaddr base,
+                                        const char *name, int index,
+                                        qemu_irq irq)
+{
+    return qy7_scif_with_alias_serial(sysmem, base, name, index, index, irq);
 }
 
 static void qy7_init(MachineState *machine)
@@ -295,6 +306,13 @@ static void qy7_init(MachineState *machine)
     memory_region_add_subregion(sysmem, A7ADDR(QY7_2DG_BASE), g2d_alias);
     clarion_scif_init(g_new0(ClarionScif, 1), sysmem, QY7_SCIF_BASE, "qy7.scif",
                       0, 0, NULL, NULL, false);
+    /*
+     * SCIF0: CelaviDrv.dll opens "SCI0:" and serial_scif.dll then polls
+     * SCFSR.TEND at 0xffe40010.  The first -serial belongs to the block at
+     * 0xffe46000 above, so this one gets no host character device.
+     */
+    qy7_scif_with_alias_serial(sysmem, QY7_SCIF0_BASE, "qy7.scif0", 0,
+                               QY7_NO_CHARDEV, NULL);
     /*
      * SCIF1: the routine at serial_scif.dll+0x8c18 polls SCFSR.TEND
      * (bit 6, offset 0x10) of this channel.
