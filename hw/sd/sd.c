@@ -1520,7 +1520,8 @@ static void sd_lock_command(SDState *sd)
     }
 
     if (sd->blk_len < 2 + pwd_len ||
-                    pwd_len <= sd->pwd_len ||
+                    pwd_len < sd->pwd_len ||
+                    (set_pwd && pwd_len == sd->pwd_len) ||
                     pwd_len > sd->pwd_len + 16) {
         sd->card_status |= LOCK_UNLOCK_FAILED;
         return;
