@@ -340,7 +340,7 @@ static void qy7_init(MachineState *machine)
                                    blk_by_legacy_dinfo(di), &error_fatal);
             qdev_realize_and_unref(card, qdev_get_child_bus(sdhi, "sd-bus"),
                                    &error_fatal);
-            if (qmachine->paired_card && dinfo) {
+            if (qmachine->paired_card && dinfo && found) {
                 /*
                  * The card is paired with this unit: it comes up locked
                  * with the password kept in PROD.  The guest unlocks it with
