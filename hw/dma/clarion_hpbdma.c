@@ -305,8 +305,12 @@ static const hwaddr hpb_chan_module[CLARION_HPBDMA_NUM_CHAN] = {
  * Адреса модульного боку каналу. Для невідомого каналу повертає
  * HPB_NO_MODULE: прив'язки ми не знаємо, і вигадувати її не будемо.
  */
-static hwaddr hpb_module_addr(int ch)
+static hwaddr hpb_module_addr(ClarionHpbDmaState *s, int ch)
 {
+    /* The front SD driver uses channel 8 with source SD_BUF0. */
+    if (s->qy7_mode && ch == 8) {
+        return 0xffe4c030;
+    }
     return hpb_chan_module[ch];
 }
 
@@ -341,7 +345,7 @@ static void hpb_move_one(ClarionHpbDmaState *s, int ch)
 {
     ClarionHpbChan *c = &s->ch[ch];
     unsigned unit = hpb_unit(s, ch);
-    hwaddr mod = hpb_module_addr(ch);
+    hwaddr mod = hpb_module_addr(s, ch);
     hwaddr src = c->dsasr, dst = c->ddasr;
     uint8_t buf[4];
 
@@ -515,7 +519,7 @@ static void hpb_service_module(ClarionHpbDmaState *s, hwaddr addr)
         uint32_t dar0, n0;
 
         /* лише озброєний канал «модуль -> пам'ять», прив'язаний до addr */
-        if (!c->active || !c->left || hpb_module_addr(ch) != addr) {
+        if (!c->active || !c->left || hpb_module_addr(s, ch) != addr) {
             continue;
         }
         if (!(c->dcr & DCR_SMDL) || (c->dcr & DCR_DMDL)) {
@@ -588,7 +592,7 @@ static void hpb_chan_start(ClarionHpbDmaState *s, int ch, bool next)
          * решті (SCIF) канал лишається просто озброєним, і байти подасть
          * сама периферія через clarion_hpbdma_feed().
          */
-        hpb_service_module(s, hpb_module_addr(ch));
+        hpb_service_module(s, hpb_module_addr(s, ch));
         return;
     }
     if ((c->dcr & DCR_SMDL) && (c->dcr & DCR_DMDL)) {
@@ -625,7 +629,7 @@ bool clarion_hpbdma_feed(DeviceState *dev, hwaddr periph_addr, uint8_t val)
          * інакше ми б мовчки перестали обслуговувати SCIF-подібні випадки,
          * яких ще не розібрали.
          */
-        hwaddr mod = hpb_module_addr(ch);
+        hwaddr mod = hpb_module_addr(s, ch);
 
         if (!c->active || !c->left || !(c->dcr & DCR_SMDL)) {
             continue;
@@ -673,7 +677,7 @@ void clarion_hpbdma_eod(DeviceState *dev, hwaddr periph_addr)
 
     for (ch = 0; ch < CLARION_HPBDMA_NUM_CHAN; ch++) {
         ClarionHpbChan *c = &s->ch[ch];
-        hwaddr mod = hpb_module_addr(ch);
+        hwaddr mod = hpb_module_addr(s, ch);
 
         if (!c->active || !(c->dcr & DCR_SMDL)) {
             continue;

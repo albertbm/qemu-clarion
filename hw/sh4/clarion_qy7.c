@@ -307,6 +307,9 @@ static void qy7_init(MachineState *machine)
         DriveInfo *di = drive_get(IF_SD, 0, 0);
         MemoryRegion *alias = g_new0(MemoryRegion, 1);
 
+        object_property_set_link(OBJECT(sdhi), "dmac", OBJECT(dmac),
+                                 &error_fatal);
+        qdev_prop_set_uint64(sdhi, "dma-buf-addr", 0xffe4c030);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(sdhi), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(sdhi), 0, 0xffe4c000);
         sysbus_connect_irq(SYS_BUS_DEVICE(sdhi), 0,
