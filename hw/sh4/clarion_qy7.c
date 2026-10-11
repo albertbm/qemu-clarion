@@ -68,12 +68,20 @@ typedef struct QY7DispSink {
 static int qy7_dispmicom_sink(void *opaque, const uint8_t *buf, int len)
 {
     QY7DispSink *sink = opaque;
-    int n = MIN(clarion_scif_can_receive(sink->scif), len);
+    int done = 0;
 
-    if (n > 0) {
-        clarion_scif_receive(sink->scif, buf, n);
+    while (done < len) {
+        int room = clarion_scif_can_receive(sink->scif);
+        int n;
+
+        if (room <= 0) {
+            break;
+        }
+        n = MIN(room, len - done);
+        clarion_scif_receive(sink->scif, buf + done, n);
+        done += n;
     }
-    return n;
+    return done;
 }
 
 static void qy7_machine_instance_init(Object *obj)
