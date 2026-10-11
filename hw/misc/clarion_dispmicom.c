@@ -301,6 +301,14 @@ static void disp_frame(ClarionDispMicomState *s)
         disp_queue(s, (const uint8_t[]){ 0x42 }, 1);
         break;
 
+    case 0x43:
+        /*
+         * SH4 handler 0x03cf679e changes link state 1 to 2. It logs
+         * the previously saved panel identity, not a response payload.
+         */
+        disp_queue(s, (const uint8_t[]){ 0x43 }, 1);
+        break;
+
     default:
         /* Решта команд панелі не розібрана — лише квитанція, без вигадок. */
         break;
