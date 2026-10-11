@@ -284,6 +284,15 @@ static void disp_frame(ClarionDispMicomState *s)
         disp_queue(s, (const uint8_t[]){ CMD_READY }, 1);
         break;
 
+    case 0x71:
+        /*
+         * Keepalive completion: SH4 handler 0x03cf6874 and ARM handler
+         * 0xef718764 clear the outstanding flag and cancel timer 2.
+         * Neither handler reads a payload byte.
+         */
+        disp_queue(s, (const uint8_t[]){ 0x71 }, 1);
+        break;
+
     default:
         /* Решта команд панелі не розібрана — лише квитанція, без вигадок. */
         break;
