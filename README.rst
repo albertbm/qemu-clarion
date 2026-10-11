@@ -131,10 +131,10 @@ Limitations
   through a built-in software path (``render=cpu``, the default).
 * Not modelled on QY8: the vehicle CAN bus beyond the controller itself,
   USB, I2C devices other than the touch controller.
-* QY7221NL display output is incomplete: the guest does not consume the
-  Display Micom reply, DU scanout is black, and the 2DG model stops at
-  command ``0xa1002900``. SD card and watchdog reset are not modelled, so the
-  launcher still stops where it would ask for the map card.
+* QY7221NL has a display and front SD host with DMA. The guest reads the
+  card but stops at password authentication with an ordinary SD image;
+  card password metadata is not part of the raw sector image. Watchdog
+  reset is not modelled.
 
 Relation to QEMU
 ================
