@@ -45,6 +45,17 @@
 #define INT2_HPB_PRIO_BASE  0x8A64280C
 #define INT2_HPB_INDEX_BASE 0x4B
 #define INT2_DEFAULT_ISR    0x8800F654
+/*
+ * HPB-DMAC channels 0..11 use ISR table slots 75..86; channels 12..20 use
+ * slots 93..101, i.e. 6 slots further (slots 87..92 hold no channel ISR).
+ * The ISR of slot 93 + k clears and tests bit 12 + k of the DMAC status and
+ * enable registers (0xFFC0880C, 0xFFC08814), so the slot is the one of the
+ * channel whose status bit is raised.  Channels above 20 have no such ISR
+ * in the live table and keep the old (unverified) slot.
+ */
+#define INT2_HPB_SPLIT_CHANNEL 12
+#define INT2_HPB_LAST_CHANNEL  20
+#define INT2_HPB_SPLIT_GAP     6
 
 #define INT2_TMU_CHANNELS 3
 #define INT2_DISPLAY_SOURCES 1
@@ -54,6 +65,13 @@
 #define INT2_SOURCE_COUNT (INT2_TMU_CHANNELS + INT2_HPB_CHANNELS + \
                            INT2_DISPLAY_SOURCES + INT2_SDHI_SOURCES)
 #define INT2_UNK_SLOTS    (INT2_SIZE / 4)
+
+static int int2_hpb_slot(int channel)
+{
+    return INT2_HPB_INDEX_BASE + channel +
+           (channel >= INT2_HPB_SPLIT_CHANNEL &&
+            channel <= INT2_HPB_LAST_CHANNEL ? INT2_HPB_SPLIT_GAP : 0);
+}
 
 struct ClarionQy7Int2 {
     MemoryRegion iomem;
@@ -86,7 +104,7 @@ static void int2_update(ClarionQy7Int2 *s)
     for (int i = 0; i < INT2_HPB_CHANNELS; i++) {
         uint32_t isr = 0;
         uint8_t priority = 0;
-        int index = INT2_HPB_INDEX_BASE + i;
+        int index = int2_hpb_slot(i);
         int ret_isr = cpu_memory_rw_debug(s->cpu,
                                           INT2_HPB_TABLE_BASE + index * 4,
                                           (uint8_t *)&isr, sizeof(isr), false);
@@ -266,7 +284,7 @@ ClarionQy7Int2 *clarion_qy7_int2_init(MemoryRegion *sysmem, hwaddr base,
         if (i < INT2_TMU_CHANNELS) {
             s->src[i].vect = vect[i];
         } else {
-            int index = INT2_HPB_INDEX_BASE + i - INT2_TMU_CHANNELS;
+            int index = int2_hpb_slot(i - INT2_TMU_CHANNELS);
             s->src[i].vect = 0x200 + index * 0x20;
         }
     }
