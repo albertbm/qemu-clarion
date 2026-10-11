@@ -44,14 +44,15 @@
  *                               ставить 2 і кличе
  *                               CApi_ModuleInitializeComplete(129)
  *
- * ⚠ Межа чесності. Тут відтворено рівно те, що доведене кодом lcddrv.dll:
- * обрамлення, стафінг, BCC, квитанції і ці три коди команд. Обробник 0x40
- * НЕ читає з кадру жодного байта (див. @0xEF718674), тому кадр віддається
- * без корисного навантаження. Значення Version/UnitID/PartNum синтетичні:
- * гість їх тільки зберігає й друкує у лог (єдині читачі — @0xEF718694,
- * @0xEF7186A0, @0xEF7186AC..@0xEF7186D4), ніде не порівнює, тож будь-які
- * семантично коректні байти безпечні. Інші коди команд панелі свідомо НЕ
- * вигадуються: на них модель відповідає лише квитанцією.
+ * Framing, ACKs and startup replies follow the guest lcddrv code. Ready
+ * 0x40 reads no payload at ARM 0xef718674. Version/UnitID/PartNum are
+ * SYNTHETIC: the ARM guest stores and prints them at 0xef718694,
+ * 0xef7186a0 and 0xef7186ac..0xef7186d4 without comparing their values.
+ *
+ * Payload-free control completions are also supported: keepalive 0x71
+ * (SH4 0x03cf6874, ARM 0xef718764), settings ready 0x42 (SH4 0x03cf677c)
+ * and settings report completion 0x43 (SH4 0x03cf679e). Their receive
+ * handlers read no response payload. Unsupported commands receive ACK.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -76,6 +77,9 @@
 #define CMD_INFO_RSP        0x24    /* панель -> HU: версія/UnitID/PartNum */
 #define CMD_LINK_UP         0x25    /* HU -> панель: лінк піднято */
 #define CMD_READY           0x40    /* панель -> HU: готова; гість SET 129 */
+#define CMD_SETTINGS        0x42
+#define CMD_REPORT          0x43
+#define CMD_KEEPALIVE       0x71
 
 /*
  * Пауза між кадрами — така сама, як у моделі МК плати: приймач SCIF має
@@ -284,29 +288,29 @@ static void disp_frame(ClarionDispMicomState *s)
         disp_queue(s, (const uint8_t[]){ CMD_READY }, 1);
         break;
 
-    case 0x71:
+    case CMD_KEEPALIVE:
         /*
          * Keepalive completion: SH4 handler 0x03cf6874 and ARM handler
          * 0xef718764 clear the outstanding flag and cancel timer 2.
          * Neither handler reads a payload byte.
          */
-        disp_queue(s, (const uint8_t[]){ 0x71 }, 1);
+        disp_queue(s, (const uint8_t[]){ CMD_KEEPALIVE }, 1);
         break;
 
-    case 0x42:
+    case CMD_SETTINGS:
         /*
          * SH4 handler 0x03cf677c accepts ready 0x42 in link state 1,
          * reads no payload, and queues the 0x43 settings report.
          */
-        disp_queue(s, (const uint8_t[]){ 0x42 }, 1);
+        disp_queue(s, (const uint8_t[]){ CMD_SETTINGS }, 1);
         break;
 
-    case 0x43:
+    case CMD_REPORT:
         /*
          * SH4 handler 0x03cf679e changes link state 1 to 2. It logs
          * the previously saved panel identity, not a response payload.
          */
-        disp_queue(s, (const uint8_t[]){ 0x43 }, 1);
+        disp_queue(s, (const uint8_t[]){ CMD_REPORT }, 1);
         break;
 
     default:
