@@ -32,12 +32,14 @@
 #define QY7_FLASH_SIZE (8 * MiB)
 #define QY7_RAM_BASE 0x08000000
 /*
- * The kernel's memory table lists regions up to 0x90000000 (P1), i.e.
- * physical 0x08000000..0x10000000: main RAM, then the NK2 image, then a
- * 1 MiB block at 0x0e600000 and a 25 MiB block at 0x0e700000 that
- * KernelIoControl hands to the display drivers.
+ * The kernel's memory table (NOR 0x2acc90) is a list of (base, size)
+ * pairs in P1: main RAM, the NK2 image, a 1 MiB block at 0x8e600000 and
+ * a 25 MiB block at 0x8e700000 that KernelIoControl hands to the display
+ * drivers, and a second bank (0x90000000, 0x08000000). At run time the
+ * kernel builds a free-memory section for that bank with its page-use
+ * map at 0x90000000, so RAM covers physical 0x08000000..0x18000000.
  */
-#define QY7_RAM_SIZE (128 * MiB)
+#define QY7_RAM_SIZE (256 * MiB)
 /*
  * TMU input clock. The CE kernel selects the /16 prescaler (TCR0 = 0x21)
  * and counts 2625 ticks per millisecond, so the clock it was built for is
