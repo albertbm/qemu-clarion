@@ -1469,8 +1469,12 @@ static void sd_function_switch(SDState *sd, uint32_t arg)
     memset(&sd->data[14], 0, 3);
     for (i = 0; i < 6; i ++) {
         new_func = (arg >> (i * 4)) & 0x0f;
-        if (mode && new_func != 0x0f)
+        if (new_func == 0x0f) {
+            /* No-change requests report the currently selected function. */
+            new_func = sd->function_group[i];
+        } else if (mode) {
             sd->function_group[i] = new_func;
+        }
         sd->data[16 - (i >> 1)] |= new_func << ((i % 2) * 4);
     }
     memset(&sd->data[17], 0, 47);
