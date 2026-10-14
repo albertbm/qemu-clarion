@@ -77,6 +77,8 @@ typedef struct QY7MachineState {
     uint8_t dipsw;
     bool paired_card;
     bool micom_on;
+    bool micom_generic_reply;
+    uint8_t micom_generic_reply_subcode;
     uint32_t du_dotclk;
 } QY7MachineState;
 
@@ -129,6 +131,10 @@ static void qy7_machine_instance_init(Object *obj)
     s->dipsw = 7;
     s->paired_card = true;
     s->micom_on = true;
+    s->micom_generic_reply = false;
+    s->micom_generic_reply_subcode = 0;
+    object_property_add_uint8_ptr(obj, "micom-generic-reply-subcode",
+        &s->micom_generic_reply_subcode, OBJ_PROP_FLAG_READWRITE);
     /*
      * DU dot clock. 33333333 Hz is an assumed reference clock, not a
      * measured board value. Zero disables frame ticks.
@@ -158,6 +164,16 @@ static bool qy7_get_micom(Object *obj, Error **errp)
 static void qy7_set_micom(Object *obj, bool value, Error **errp)
 {
     ((QY7MachineState *)obj)->micom_on = value;
+}
+
+static bool qy7_get_micom_generic_reply(Object *obj, Error **errp)
+{
+    return ((QY7MachineState *)obj)->micom_generic_reply;
+}
+
+static void qy7_set_micom_generic_reply(Object *obj, bool value, Error **errp)
+{
+    ((QY7MachineState *)obj)->micom_generic_reply = value;
 }
 
 typedef struct QY7ResetData {
@@ -373,6 +389,10 @@ static void qy7_init(MachineState *machine)
     scif1->dma_eod = clarion_hpbdma_eod;
     if (qmachine->micom_on) {
         micom = qdev_new(TYPE_CLARION_MICOM);
+        qdev_prop_set_bit(micom, "generic-reply",
+                          qmachine->micom_generic_reply);
+        qdev_prop_set_uint8(micom, "generic-reply-subcode",
+                            qmachine->micom_generic_reply_subcode);
         qdev_realize_and_unref(micom, NULL, &error_fatal);
         scif1->micom = micom;
         scif1->micom_tx = clarion_micom_rx_byte;
@@ -484,6 +504,11 @@ static void qy7_machine_class_init(ObjectClass *oc, const void *data)
                                    qy7_set_micom);
     object_class_property_set_description(oc, "micom",
         "The companion micom connected to SCIF1 (default on)");
+    object_class_property_add_bool(oc, "micom-generic-reply",
+                                   qy7_get_micom_generic_reply,
+                                   qy7_set_micom_generic_reply);
+    object_class_property_set_description(oc, "micom-generic-reply",
+        "Reply to commands not modeled by the micom (default off)");
 }
 
 static const TypeInfo qy7_machine_typeinfo = {

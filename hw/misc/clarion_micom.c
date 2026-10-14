@@ -88,6 +88,8 @@ struct ClarionMicomState {
     uint8_t bcc;
 
     bool handshake_done;        /* бачили 08 0b від ядра */
+    bool generic_reply;
+    uint8_t generic_reply_subcode;
 };
 
 /* --- побудова кадру ---------------------------------------------------- */
@@ -241,8 +243,9 @@ static void micom_frame(ClarionMicomState *s)
     } else if (len == sizeof(cmd_60_3f) &&
                !memcmp(data, cmd_60_3f, sizeof(cmd_60_3f))) {
         micom_queue(s, rsp_10_3f, sizeof(rsp_10_3f));
-    } else {
-        const uint8_t recv[2] = { cmd, 0x00 };  /* квитанція на решту */
+    } else if (s->generic_reply) {
+        /* QY8 fallback; QY7 disables synthetic replies by default. */
+        const uint8_t recv[2] = { cmd, s->generic_reply_subcode };
 
         micom_queue(s, recv, sizeof(recv));
     }
@@ -344,6 +347,13 @@ static void clarion_micom_realize(DeviceState *dev, Error **errp)
     s->tx = timer_new_ns(QEMU_CLOCK_VIRTUAL, micom_tx_expire, s);
 }
 
+static const Property clarion_micom_props[] = {
+    DEFINE_PROP_BOOL("generic-reply", ClarionMicomState,
+                     generic_reply, true),
+    DEFINE_PROP_UINT8("generic-reply-subcode", ClarionMicomState,
+                      generic_reply_subcode, 0),
+};
+
 static void clarion_micom_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -351,6 +361,7 @@ static void clarion_micom_class_init(ObjectClass *klass, const void *data)
 
     dc->realize = clarion_micom_realize;
     dc->desc = "Clarion QY8XXX companion micom (SCIF4 link)";
+    device_class_set_props(dc, clarion_micom_props);
     rc->phases.hold = clarion_micom_reset_hold;
 }
 
