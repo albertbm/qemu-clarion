@@ -54,6 +54,7 @@
 #define M2DG_CALL 0x30
 #define M2DG_RET 0x38
 #define M2DG_LCOFS 0x40
+#define M2DG_RLCOFS 0x44
 #define M2DG_MOVE 0x48
 #define M2DG_POLY4C 0x80
 #define M2DG_POLY4T 0x82
@@ -117,6 +118,12 @@ typedef struct ListCtx {
     hwaddr dst_len;
     uint32_t dst_stride;
     uint32_t dst_h;
+    /*
+     * Accumulated destination offset set by 0x44 (x = bits 31..16, y = bits
+     * 15..0, signed).  INFERENCE: relative to the current origin; see the
+     * case below.  Reset for every list.
+     */
+    int ox, oy;
     /* Clip rectangle and clip path set by 0xe0 / 0xd0, one-shot. */
     bool rc_on;
     int rx0, ry0, rx1, ry1;
@@ -606,6 +613,15 @@ static int clarion_2dg_xy_y(uint32_t w)
 }
 
 /* Read n packed XY vertices at addr into vx/vy; false on a bad read. */
+static void clarion_2dg_shift_xy(const ListCtx *c, int *vx, int *vy,
+                                 unsigned n)
+{
+    for (unsigned i = 0; i < n; i++) {
+        vx[i] += c->ox;
+        vy[i] += c->oy;
+    }
+}
+
 static bool clarion_2dg_read_xy(hwaddr addr, unsigned n, int *vx, int *vy)
 {
     unsigned i;
@@ -761,6 +777,19 @@ static unsigned clarion_2dg_run(Clarion2DGState *s, hwaddr list,
             words = 2; /* offset observed as 0 only; not applied */
             c->skipped[op]++;
             break;
+        case M2DG_RLCOFS:
+            /*
+             * auirtdll.dll+0x616cc emits exactly two words: 0x44000000 and
+             * (x << 16) | (y & 0xffff).  AUI brackets one full-screen fill
+             * with (0, +480) and (0, -480) (list 0x0E75DC70), so the pair
+             * is read as a relative shift of the destination origin that is
+             * undone afterwards.  INFERENCE: nothing in the guest shows
+             * whether it also moves the clip; the clip stays untouched.
+             */
+            words = 2;
+            c->ox += clarion_2dg_xy_x(a1);
+            c->oy += clarion_2dg_xy_y(a1);
+            break;
         case M2DG_WPR:
             if (w & M2DG_F_WPR_IND) {
                 /* a1 = (count - 1) << 16 | reg; a2 = offset of the values. */
@@ -845,8 +874,8 @@ static unsigned clarion_2dg_run(Clarion2DGState *s, hwaddr list,
                 !clarion_2dg_rd32(pc + 24, &a6)) {
                 goto unknown;
             }
-            cx = clarion_2dg_xy_x(a6);
-            cy = clarion_2dg_xy_y(a6);
+            cx = clarion_2dg_xy_x(a6) + c->ox;
+            cy = clarion_2dg_xy_y(a6) + c->oy;
             words = 7;
             clarion_2dg_blit_mono(c, clarion_2dg_xy_x(a3),
                                  clarion_2dg_xy_y(a3), l + r + 1,
@@ -864,7 +893,7 @@ static unsigned clarion_2dg_run(Clarion2DGState *s, hwaddr list,
              * extents, a5 = centre XY. Centre-relative form is inferred:
              * it covers exactly the whole canvas in every captured fill.
              */
-            int cx = clarion_2dg_xy_x(a5), cy = clarion_2dg_xy_y(a5);
+            int cx = clarion_2dg_xy_x(a5) + c->ox, cy = clarion_2dg_xy_y(a5) + c->oy;
             int l = a3 >> 16, r = a3 & 0xffff, u = a4 >> 16, d = a4 & 0xffff;
             bool drawn = true;
             const uint32_t av[5] = { a1, a2, a3, a4, a5 };
@@ -903,6 +932,7 @@ static unsigned clarion_2dg_run(Clarion2DGState *s, hwaddr list,
                 if (!clarion_2dg_read_xy(pc + 8, 4, vx, vy)) {
                     goto unknown;
                 }
+                clarion_2dg_shift_xy(c, vx, vy, 4);
                 clarion_2dg_fill_poly(c, vx, vy, 4, a1 & 0xffff, NULL, 0, 0);
             } else {
                 /* a1 = texture offset from this header, a2 = (w << 16 | h). */
@@ -921,6 +951,7 @@ static unsigned clarion_2dg_run(Clarion2DGState *s, hwaddr list,
                         t16[i] = lduw_le_p(&t16[i]);
                     }
                     /* Tiling by absolute canvas coordinates: assumed. */
+                    clarion_2dg_shift_xy(c, vx, vy, 4);
                     clarion_2dg_fill_poly(c, vx, vy, 4, 0, t16, tw, th);
                 }
             }
@@ -938,6 +969,7 @@ static unsigned clarion_2dg_run(Clarion2DGState *s, hwaddr list,
                 words = 4;
                 if (n && n <= CLARION_2DG_MAX_PATH &&
                     clarion_2dg_read_xy(pc + (int32_t)a3, n, vx, vy)) {
+                    clarion_2dg_shift_xy(c, vx, vy, n);
                     clarion_2dg_polyline(c, vx, vy, n, a1 >> 16,
                                          MAX(1, (int)a2));
                     c->done[op]++;
@@ -952,6 +984,7 @@ static unsigned clarion_2dg_run(Clarion2DGState *s, hwaddr list,
                 if (n && n <= CLARION_2DG_MAX_PATH &&
                     clarion_2dg_read_xy(pc + 12, n, vx, vy)) {
                     /* a2 = width (0 draws one pixel; scale unestablished). */
+                    clarion_2dg_shift_xy(c, vx, vy, n);
                     clarion_2dg_polyline(c, vx, vy, n, a1 >> 16,
                                          MAX(1, (int)a2));
                     c->done[op]++;
@@ -970,6 +1003,7 @@ static unsigned clarion_2dg_run(Clarion2DGState *s, hwaddr list,
             if (n && n <= CLARION_2DG_MAX_PATH &&
                 clarion_2dg_read_xy(pc + 24, n, vx, vy)) {
                 /* The low colour half matches the paired B0 command. */
+                clarion_2dg_shift_xy(c, vx, vy, n);
                 clarion_2dg_polyline(c, vx, vy, n, a1 & 0xffff,
                                      MAX(1, (int)a5));
                 c->done[op]++;
