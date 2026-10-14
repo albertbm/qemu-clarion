@@ -213,6 +213,7 @@ static void micom_frame(ClarionMicomState *s)
     const uint8_t *data = s->body + 1;
     unsigned len = s->body_len ? s->body_len - 1 : 0;
     uint8_t cmd, sub, ack[2];
+    const char *action = "ack-only";
 
     if (s->body_len && s->body[0] != len) {
         qemu_log_mask(LOG_GUEST_ERROR, "clarion-micom: LEN %u не збігається з "
@@ -232,6 +233,7 @@ static void micom_frame(ClarionMicomState *s)
     if (cmd == 0x08 && sub == 0x00) {           /* скидання -> стан 2, 3 */
         const uint8_t alive[] = { 0x08, 0x01 };
 
+        action = "alive+command-set";
         s->handshake_done = false;
         micom_queue(s, alive, sizeof(alive));
         micom_send_cmd_set(s);
@@ -240,15 +242,24 @@ static void micom_frame(ClarionMicomState *s)
     } else if (len == sizeof(cmd_60_3a) &&
                !memcmp(data, cmd_60_3a, sizeof(cmd_60_3a))) {
         /* відповіді не потребує */
+        action = "ack-only-async";
     } else if (len == sizeof(cmd_60_3f) &&
                !memcmp(data, cmd_60_3f, sizeof(cmd_60_3f))) {
+        action = "reply-10-3f";
         micom_queue(s, rsp_10_3f, sizeof(rsp_10_3f));
     } else if (s->generic_reply) {
         /* QY8 fallback; QY7 disables synthetic replies by default. */
         const uint8_t recv[2] = { cmd, s->generic_reply_subcode };
 
+        action = "generic-reply";
         micom_queue(s, recv, sizeof(recv));
     }
+
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "clarion-micom: rx virtual-ms=%" PRId64
+                  " len=%u cmd=%02x sub=%02x action=%s\n",
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), len, cmd, sub,
+                  action);
 }
 
 /* --- розбір потоку від ядра -------------------------------------------- */
