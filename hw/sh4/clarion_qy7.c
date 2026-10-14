@@ -12,6 +12,7 @@
 #include "hw/misc/clarion_qy7_regs.h"
 #include "hw/misc/clarion_usbphy.h"
 #include "hw/misc/clarion_dispmicom.h"
+#include "hw/misc/clarion_micom.h"
 #include "hw/misc/clarion_boards.h"
 #include "hw/display/clarion_du.h"
 #include "hw/display/clarion_2dg.h"
@@ -75,6 +76,7 @@ typedef struct QY7MachineState {
     MachineState parent_obj;
     uint8_t dipsw;
     bool paired_card;
+    bool micom_on;
     uint32_t du_dotclk;
 } QY7MachineState;
 
@@ -101,12 +103,32 @@ static int qy7_dispmicom_sink(void *opaque, const uint8_t *buf, int len)
     return done;
 }
 
+static int qy7_micom_sink(void *opaque, const uint8_t *buf, int len)
+{
+    ClarionScif *scif = opaque;
+    int done = 0;
+
+    while (done < len) {
+        int room = clarion_scif_can_receive(scif);
+        int n;
+
+        if (room <= 0) {
+            break;
+        }
+        n = MIN(room, len - done);
+        clarion_scif_receive(scif, buf + done, n);
+        done += n;
+    }
+    return done;
+}
+
 static void qy7_machine_instance_init(Object *obj)
 {
     QY7MachineState *s = (QY7MachineState *)obj;
 
     s->dipsw = 7;
     s->paired_card = true;
+    s->micom_on = true;
     /*
      * DU dot clock. 33333333 Hz is an assumed reference clock, not a
      * measured board value. Zero disables frame ticks.
@@ -126,6 +148,16 @@ static bool qy7_get_paired_card(Object *obj, Error **errp)
 static void qy7_set_paired_card(Object *obj, bool value, Error **errp)
 {
     ((QY7MachineState *)obj)->paired_card = value;
+}
+
+static bool qy7_get_micom(Object *obj, Error **errp)
+{
+    return ((QY7MachineState *)obj)->micom_on;
+}
+
+static void qy7_set_micom(Object *obj, bool value, Error **errp)
+{
+    ((QY7MachineState *)obj)->micom_on = value;
 }
 
 typedef struct QY7ResetData {
@@ -205,7 +237,9 @@ static void qy7_init(MachineState *machine)
     QY7ResetData *reset;
     ClarionQy7Int2 *int2;
     DeviceState *dispmicom;
+    DeviceState *micom;
     DeviceState *dmac;
+    ClarionScif *scif1;
     ClarionScif *scif3;
     QY7DispSink *disp_sink;
     DeviceState *du;
@@ -332,7 +366,15 @@ static void qy7_init(MachineState *machine)
      * SCIF1: the routine at serial_scif.dll+0x8c18 polls SCFSR.TEND
      * (bit 6, offset 0x10) of this channel.
      */
-    qy7_scif_with_alias(sysmem, QY7_SCIF1_BASE, "qy7.scif1", 1, NULL);
+    scif1 = qy7_scif_with_alias(sysmem, QY7_SCIF1_BASE, "qy7.scif1", 1,
+                                NULL);
+    if (qmachine->micom_on) {
+        micom = qdev_new(TYPE_CLARION_MICOM);
+        qdev_realize_and_unref(micom, NULL, &error_fatal);
+        scif1->micom = micom;
+        scif1->micom_tx = clarion_micom_rx_byte;
+        clarion_micom_set_sink(micom, qy7_micom_sink, scif1);
+    }
     /* SCIF3: the same polling routine, SCFSR at VA 0x2b0010. */
     scif3 = qy7_scif_with_alias(sysmem, QY7_SCIF3_BASE, "qy7.scif3", 3, NULL);
     scif3->dmac = dmac;
@@ -435,6 +477,10 @@ static void qy7_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "paired-card",
         "The SD card is locked with the PROD card password at power-up, "
         "like a card paired with this unit (default on)");
+    object_class_property_add_bool(oc, "micom", qy7_get_micom,
+                                   qy7_set_micom);
+    object_class_property_set_description(oc, "micom",
+        "The companion micom connected to SCIF1 (default on)");
 }
 
 static const TypeInfo qy7_machine_typeinfo = {
