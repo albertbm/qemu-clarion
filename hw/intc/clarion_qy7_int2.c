@@ -67,6 +67,18 @@
                            INT2_DISPLAY_SOURCES + INT2_SDHI_SOURCES)
 #define INT2_UNK_SLOTS    (INT2_SIZE / 4)
 
+/*
+ * Read a byte or word of the guest P1 (0x8xxxxxxx) kernel tables through its
+ * physical alias.  cpu_memory_rw_debug() translates with the privilege of the
+ * interrupted CPU and fails in user mode, which gave priority 0 and no IMASK
+ * for the source (verified for the DU in T218).  Returns true on success.
+ */
+static bool int2_guest_read(uint32_t va, void *buf, int len)
+{
+    return address_space_read(&address_space_memory, va & 0x1fffffff,
+                              MEMTXATTRS_UNSPECIFIED, buf, len) == MEMTX_OK;
+}
+
 static int int2_hpb_slot(int channel)
 {
     return INT2_HPB_INDEX_BASE + channel +
@@ -108,19 +120,17 @@ static void int2_update(ClarionQy7Int2 *s)
         uint32_t isr = 0;
         uint8_t priority = 0;
         int index = int2_hpb_slot(i);
-        int ret_isr = cpu_memory_rw_debug(s->cpu,
-                                          INT2_HPB_TABLE_BASE + index * 4,
-                                          (uint8_t *)&isr, sizeof(isr), false);
-        int ret_prio = cpu_memory_rw_debug(s->cpu,
-                                           INT2_HPB_PRIO_BASE + index,
-                                           &priority, sizeof(priority), false);
+        bool ok = int2_guest_read(INT2_HPB_TABLE_BASE + index * 4,
+                                  &isr, sizeof(isr)) &&
+                  int2_guest_read(INT2_HPB_PRIO_BASE + index,
+                                  &priority, sizeof(priority));
         struct intc_source *source = &s->src[INT2_TMU_CHANNELS + i];
 
         source->vect = 0x200 + index * 0x20;
         source->priority = priority;
         source->pending = !(s->mask & BIT(INT2_HPB_GROUP_BIT)) &&
                           (s->hpb_pending & BIT(i)) &&
-                          !ret_isr && !ret_prio && isr &&
+                          ok && isr &&
                           isr != INT2_DEFAULT_ISR;
         pending += source->pending;
     }
@@ -129,11 +139,12 @@ static void int2_update(ClarionQy7Int2 *s)
         struct intc_source *source = &s->src[INT2_DISPLAY_INDEX];
 
         /* The installed completion ISR masks bit 12 and returns SYSINTR 34. */
-        cpu_memory_rw_debug(s->cpu, INT2_HPB_PRIO_BASE + 0x2c,
-                            &priority, sizeof(priority), false);
+        bool ok = int2_guest_read(INT2_HPB_PRIO_BASE + 0x2c,
+                                  &priority, sizeof(priority));
         source->vect = 0x780;
         source->priority = priority;
-        source->pending = s->g2d_pending && !(s->mask & BIT(12));
+        source->pending = ok && priority &&
+                          s->g2d_pending && !(s->mask & BIT(12));
         pending += source->pending;
     }
     {
@@ -145,13 +156,11 @@ static void int2_update(ClarionQy7Int2 *s)
          * the result does not depend on the interrupted CPU privilege.
          * The vertical blank ISR masks bit 0 and returns SYSINTR 33.
          */
-        MemTxResult result = address_space_read(&address_space_memory,
-                            (INT2_HPB_PRIO_BASE + 0x0f) & 0x1fffffff,
-                            MEMTXATTRS_UNSPECIFIED, &priority,
-                            sizeof(priority));
+        bool ok = int2_guest_read(INT2_HPB_PRIO_BASE + 0x0f,
+                                  &priority, sizeof(priority));
         source->vect = 0x3e0;
         source->priority = priority;
-        source->pending = result == MEMTX_OK && priority &&
+        source->pending = ok && priority &&
                           s->du_pending && !(s->mask & BIT(0));
         pending += source->pending;
     }
@@ -160,11 +169,11 @@ static void int2_update(ClarionQy7Int2 *s)
         struct intc_source *source = &s->src[INT2_SDHI_INDEX + i];
 
         /* Installed SD host ISRs share pending and mask bit 29. */
-        cpu_memory_rw_debug(s->cpu, INT2_HPB_PRIO_BASE + 0x47 + i,
-                            &priority, sizeof(priority), false);
+        bool ok = int2_guest_read(INT2_HPB_PRIO_BASE + 0x47 + i,
+                                  &priority, sizeof(priority));
         source->vect = 0xae0 + i * 0x20;
         source->priority = priority;
-        source->pending = (s->sdhi_pending & BIT(i)) &&
+        source->pending = ok && priority && (s->sdhi_pending & BIT(i)) &&
                           !(s->mask & BIT(29));
         pending += source->pending;
     }
