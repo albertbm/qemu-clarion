@@ -15,6 +15,7 @@
 #include "hw/sh4/sh_intc.h"
 #include "exec/cpu-interrupt.h"
 #include "system/reset.h"
+#include "system/address-spaces.h"
 #include "trace.h"
 
 #define INT2_SIZE 0x100
@@ -58,7 +59,7 @@
 #define INT2_HPB_SPLIT_GAP     6
 
 #define INT2_TMU_CHANNELS 3
-#define INT2_DISPLAY_SOURCES 1
+#define INT2_DISPLAY_SOURCES 2
 #define INT2_SDHI_SOURCES 2
 #define INT2_DISPLAY_INDEX (INT2_TMU_CHANNELS + INT2_HPB_CHANNELS)
 #define INT2_SDHI_INDEX (INT2_DISPLAY_INDEX + INT2_DISPLAY_SOURCES)
@@ -86,6 +87,8 @@ struct ClarionQy7Int2 {
     uint32_t hpb_pending;
     qemu_irq g2d_irq;
     bool g2d_pending;
+    qemu_irq du_irq;
+    bool du_pending;
     qemu_irq sdhi_irq[INT2_SDHI_SOURCES];
     uint32_t sdhi_pending;
     uint32_t unk[INT2_UNK_SLOTS];
@@ -133,6 +136,25 @@ static void int2_update(ClarionQy7Int2 *s)
         source->pending = s->g2d_pending && !(s->mask & BIT(12));
         pending += source->pending;
     }
+    {
+        uint8_t priority = 0;
+        struct intc_source *source = &s->src[INT2_DISPLAY_INDEX + 1];
+
+        /*
+         * Read the guest P1 priority table through its physical alias so
+         * the result does not depend on the interrupted CPU privilege.
+         * The vertical blank ISR masks bit 0 and returns SYSINTR 33.
+         */
+        MemTxResult result = address_space_read(&address_space_memory,
+                            (INT2_HPB_PRIO_BASE + 0x0f) & 0x1fffffff,
+                            MEMTXATTRS_UNSPECIFIED, &priority,
+                            sizeof(priority));
+        source->vect = 0x3e0;
+        source->priority = priority;
+        source->pending = result == MEMTX_OK && priority &&
+                          s->du_pending && !(s->mask & BIT(0));
+        pending += source->pending;
+    }
     for (int i = 0; i < INT2_SDHI_SOURCES; i++) {
         uint8_t priority = 0;
         struct intc_source *source = &s->src[INT2_SDHI_INDEX + i];
@@ -176,6 +198,15 @@ static void int2_g2d_set(void *opaque, int n, int level)
 
     (void)n;
     s->g2d_pending = !!level;
+    int2_update(s);
+}
+
+static void int2_du_set(void *opaque, int n, int level)
+{
+    ClarionQy7Int2 *s = opaque;
+
+    (void)n;
+    s->du_pending = !!level;
     int2_update(s);
 }
 
@@ -262,6 +293,7 @@ static void int2_reset(void *opaque)
     s->prio[0] = s->prio[1] = 0;
     s->hpb_pending = 0;
     s->g2d_pending = false;
+    s->du_pending = false;
     s->sdhi_pending = 0;
     memset(s->unk, 0, sizeof(s->unk));
     int2_update(s);
@@ -297,6 +329,7 @@ ClarionQy7Int2 *clarion_qy7_int2_init(MemoryRegion *sysmem, hwaddr base,
         s->hpb_irq[i] = qemu_allocate_irq(int2_hpb_set, s, i);
     }
     s->g2d_irq = qemu_allocate_irq(int2_g2d_set, s, 0);
+    s->du_irq = qemu_allocate_irq(int2_du_set, s, 0);
     for (int i = 0; i < INT2_SDHI_SOURCES; i++) {
         s->sdhi_irq[i] = qemu_allocate_irq(int2_sdhi_set, s, i);
     }
@@ -328,6 +361,11 @@ qemu_irq clarion_qy7_int2_hpb_channel_irq(ClarionQy7Int2 *s, int channel)
 qemu_irq clarion_qy7_int2_g2d_irq(ClarionQy7Int2 *s)
 {
     return s->g2d_irq;
+}
+
+qemu_irq clarion_qy7_int2_du_irq(ClarionQy7Int2 *s)
+{
+    return s->du_irq;
 }
 
 qemu_irq clarion_qy7_int2_sdhi_irq(ClarionQy7Int2 *s, int unit)

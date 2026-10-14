@@ -26,6 +26,7 @@ qemu_irq clarion_qy7_int2_hpb_irq(ClarionQy7Int2 *s);
 qemu_irq clarion_qy7_int2_hpb_channel_irq(ClarionQy7Int2 *s, int channel);
 
 qemu_irq clarion_qy7_int2_g2d_irq(ClarionQy7Int2 *s);
+qemu_irq clarion_qy7_int2_du_irq(ClarionQy7Int2 *s);
 
 qemu_irq clarion_qy7_int2_sdhi_irq(ClarionQy7Int2 *s, int unit);
 

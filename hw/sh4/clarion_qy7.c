@@ -75,6 +75,7 @@ typedef struct QY7MachineState {
     MachineState parent_obj;
     uint8_t dipsw;
     bool paired_card;
+    uint32_t du_dotclk;
 } QY7MachineState;
 
 typedef struct QY7DispSink {
@@ -106,6 +107,15 @@ static void qy7_machine_instance_init(Object *obj)
 
     s->dipsw = 7;
     s->paired_card = true;
+    /*
+     * DU dot clock. 33333333 Hz is an assumed reference clock, not a
+     * measured board value. Zero disables frame ticks.
+     */
+    s->du_dotclk = 33333333;
+    object_property_add_uint32_ptr(obj, "du-dotclk", &s->du_dotclk,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "du-dotclk",
+        "External DU pixel clock in Hz (0 disables vertical blank timing)");
 }
 
 static bool qy7_get_paired_card(Object *obj, Error **errp)
@@ -289,8 +299,11 @@ static void qy7_init(MachineState *machine)
 
     clarion_sh4_core_init(cpu, sysmem);
     du = qdev_new(TYPE_CLARION_DU);
+    qdev_prop_set_uint32(du, "dotclk", qmachine->du_dotclk);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(du), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(du), 0, QY7_DU_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(du), 0,
+                       clarion_qy7_int2_du_irq(int2));
     du_alias = g_new0(MemoryRegion, 1);
     memory_region_init_alias(du_alias, NULL, "qy7.du-a7",
                              sysbus_mmio_get_region(SYS_BUS_DEVICE(du), 0),
