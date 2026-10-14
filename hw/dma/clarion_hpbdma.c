@@ -357,6 +357,7 @@ static void hpb_move_one(ClarionHpbDmaState *s, int ch)
     hwaddr src = c->dsasr, dst = c->ddasr;
     bool sd_burst = s->qy7_mode && ch == 8 && (c->dcr & BIT(21)) &&
                     (c->dcr & DCR_SMDL) && !(c->dcr & DCR_DMDL);
+    bool qy7_scif1_tx = s->qy7_mode && ch == 10;
     unsigned bytes = sd_burst ? 16 : unit;
     uint8_t buf[16];
 
@@ -369,6 +370,10 @@ static void hpb_move_one(ClarionHpbDmaState *s, int ch)
         src = mod;
     }
     if ((c->dcr & DCR_DMDL) && mod != HPB_NO_MODULE) {
+        dst = mod;
+    }
+    /* QY7 channel 10 targets SCIF1 SCFTDR with DMDL clear. */
+    if (qy7_scif1_tx) {
         dst = mod;
     }
     if ((c->dcr & (DCR_SMDL | DCR_DMDL)) && mod == HPB_NO_MODULE) {
@@ -390,7 +395,7 @@ static void hpb_move_one(ClarionHpbDmaState *s, int ch)
     if (!(c->dcr & DCR_SMDL)) {
         c->dsasr += bytes;
     }
-    if (!(c->dcr & DCR_DMDL)) {
+    if (!(c->dcr & DCR_DMDL) && !qy7_scif1_tx) {
         c->ddasr += bytes;
     }
     c->left--;
