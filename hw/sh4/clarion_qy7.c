@@ -368,6 +368,9 @@ static void qy7_init(MachineState *machine)
      */
     scif1 = qy7_scif_with_alias(sysmem, QY7_SCIF1_BASE, "qy7.scif1", 1,
                                 NULL);
+    scif1->dmac = dmac;
+    scif1->dma_feed = clarion_hpbdma_feed;
+    scif1->dma_eod = clarion_hpbdma_eod;
     if (qmachine->micom_on) {
         micom = qdev_new(TYPE_CLARION_MICOM);
         qdev_realize_and_unref(micom, NULL, &error_fatal);

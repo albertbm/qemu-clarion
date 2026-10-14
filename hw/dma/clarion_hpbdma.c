@@ -307,6 +307,10 @@ static const hwaddr hpb_chan_module[CLARION_HPBDMA_NUM_CHAN] = {
  */
 static hwaddr hpb_module_addr(ClarionHpbDmaState *s, int ch)
 {
+    if (s->qy7_mode && ch == 1) {
+        /* QY7221NL serial_scif.dll configures SCI1 RX on channel 1. */
+        return 0xffe41014;
+    }
     /* The front SD driver uses channel 8 with source SD_BUF0. */
     if (s->qy7_mode && ch == 8) {
         return 0xffe4c030;
