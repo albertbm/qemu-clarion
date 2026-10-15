@@ -88,6 +88,7 @@ struct ClarionMicomState {
     uint8_t bcc;
 
     bool handshake_done;        /* бачили 08 0b від ядра */
+    bool cenet_audio_off;
     bool generic_reply;
     uint8_t generic_reply_subcode;
 };
@@ -208,6 +209,21 @@ static const uint8_t cmd_60_3a[] = { 0x60, 0x0d, 0x3a, 0, 0, 0, 0xe3 };
 static const uint8_t cmd_60_3f[] = { 0x60, 0x0d, 0x3f, 0, 0, 0, 0x01 };
 static const uint8_t rsp_10_3f[] = { 0x10, 0x3f, 0, 0, 0, 0 };
 
+/*
+ * QY7221NL: CeNet "audio mode off" notification, as read from anwdrv.dll
+ * (CModeMgr, QY7221NL image). Decoded message, DATA[0..]:
+ *   [0] = 0x40  CeNet notification family (handler vt+0x378 -> 0x37c)
+ *   [2] = 0x71  "system information" message class
+ *   [6] = 0x01  sub-type: audio mode off ("ANWDRV >> Audio Mode off.")
+ * The driver then reports LA=0xff, on/off=0, intr LA=0xff through
+ * IOCTL_CEN_GET_LATEST_SYS_MODE; without any such message the driver keeps
+ * the initial all-0xff buffer and SystemCC never starts the audio resource
+ * switch. SYNTHETIC: the real audio unit may report a different state.
+ */
+static const uint8_t cenet_audio_off[] = {
+    0x40, 0x00, 0x71, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00
+};
+
 static void micom_frame(ClarionMicomState *s)
 {
     const uint8_t *data = s->body + 1;
@@ -239,6 +255,10 @@ static void micom_frame(ClarionMicomState *s)
         micom_send_cmd_set(s);
     } else if (cmd == 0x08 && sub == 0x0b) {    /* набір прийнято */
         s->handshake_done = true;
+        if (s->cenet_audio_off) {
+            action = "ack-only+cenet-audio-off";
+            micom_queue(s, cenet_audio_off, sizeof(cenet_audio_off));
+        }
     } else if (len == sizeof(cmd_60_3a) &&
                !memcmp(data, cmd_60_3a, sizeof(cmd_60_3a))) {
         /* відповіді не потребує */
@@ -374,6 +394,8 @@ static const Property clarion_micom_props[] = {
                      generic_reply, true),
     DEFINE_PROP_UINT8("generic-reply-subcode", ClarionMicomState,
                       generic_reply_subcode, 0),
+    DEFINE_PROP_BOOL("cenet-audio-off", ClarionMicomState,
+                     cenet_audio_off, false),
 };
 
 static void clarion_micom_class_init(ObjectClass *klass, const void *data)

@@ -84,6 +84,7 @@ typedef struct QY7MachineState {
     bool bcm_on;
     bool micom_generic_reply;
     uint8_t micom_generic_reply_subcode;
+    bool micom_audio_off;
     uint32_t du_dotclk;
 } QY7MachineState;
 
@@ -144,6 +145,7 @@ static void qy7_machine_instance_init(Object *obj)
     s->bcm_on = true;
     s->micom_generic_reply = false;
     s->micom_generic_reply_subcode = 0;
+    s->micom_audio_off = true;
     object_property_add_uint8_ptr(obj, "micom-generic-reply-subcode",
         &s->micom_generic_reply_subcode, OBJ_PROP_FLAG_READWRITE);
     /*
@@ -195,6 +197,16 @@ static bool qy7_get_micom_generic_reply(Object *obj, Error **errp)
 static void qy7_set_micom_generic_reply(Object *obj, bool value, Error **errp)
 {
     ((QY7MachineState *)obj)->micom_generic_reply = value;
+}
+
+static bool qy7_get_micom_audio_off(Object *obj, Error **errp)
+{
+    return ((QY7MachineState *)obj)->micom_audio_off;
+}
+
+static void qy7_set_micom_audio_off(Object *obj, bool value, Error **errp)
+{
+    ((QY7MachineState *)obj)->micom_audio_off = value;
 }
 
 typedef struct QY7ResetData {
@@ -414,6 +426,8 @@ static void qy7_init(MachineState *machine)
                           qmachine->micom_generic_reply);
         qdev_prop_set_uint8(micom, "generic-reply-subcode",
                             qmachine->micom_generic_reply_subcode);
+        qdev_prop_set_bit(micom, "cenet-audio-off",
+                          qmachine->micom_audio_off);
         qdev_realize_and_unref(micom, NULL, &error_fatal);
         scif1->micom = micom;
         scif1->micom_tx = clarion_micom_rx_byte;
@@ -554,6 +568,13 @@ static void qy7_machine_class_init(ObjectClass *oc, const void *data)
                                    qy7_set_micom_generic_reply);
     object_class_property_set_description(oc, "micom-generic-reply",
         "Reply to commands not modeled by the micom (default off)");
+    object_class_property_add_bool(oc, "micom-audio-off",
+                                   qy7_get_micom_audio_off,
+                                   qy7_set_micom_audio_off);
+    object_class_property_set_description(oc, "micom-audio-off",
+        "The micom sends the CeNet 'audio mode off' notification after the "
+        "link handshake, so the CEN driver reports a defined audio mode "
+        "(synthetic, default on)");
 }
 
 static const TypeInfo qy7_machine_typeinfo = {
