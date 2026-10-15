@@ -523,6 +523,10 @@ static void clarion_2dg_blit_mask(ListCtx *c, int sx, int sy, int w, int h,
     uint8_t row[CLARION_2DG_MAX_DIM];
     int cx0, cy0, cx1, cy1, i, j;
 
+    /* SH direct-segment (P2) addresses name the low 29-bit physical bus. */
+    if ((src & 0xe0000000) == 0xa0000000) {
+        src &= 0x1fffffff;
+    }
     if (!clarion_2dg_dst_map(c) || !clarion_2dg_clip(c, &cx0, &cy0, &cx1, &cy1)
         || !s->lreg_set[M2DG_R_SRC / 4] || !sstride ||
         w <= 0 || h <= 0 || w > CLARION_2DG_MAX_DIM) {
