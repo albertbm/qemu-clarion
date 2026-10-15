@@ -16,6 +16,7 @@
 #include "hw/misc/clarion_dispmicom.h"
 #include "hw/misc/clarion_micom.h"
 #include "hw/misc/clarion_scpu.h"
+#include "hw/misc/clarion_bcm.h"
 #include "hw/misc/clarion_boards.h"
 #include "hw/display/clarion_du.h"
 #include "hw/display/clarion_2dg.h"
@@ -80,6 +81,7 @@ typedef struct QY7MachineState {
     uint8_t dipsw;
     bool paired_card;
     bool micom_on;
+    bool bcm_on;
     bool micom_generic_reply;
     uint8_t micom_generic_reply_subcode;
     uint32_t du_dotclk;
@@ -139,6 +141,7 @@ static void qy7_machine_instance_init(Object *obj)
     s->dipsw = 7;
     s->paired_card = true;
     s->micom_on = true;
+    s->bcm_on = true;
     s->micom_generic_reply = false;
     s->micom_generic_reply_subcode = 0;
     object_property_add_uint8_ptr(obj, "micom-generic-reply-subcode",
@@ -172,6 +175,16 @@ static bool qy7_get_micom(Object *obj, Error **errp)
 static void qy7_set_micom(Object *obj, bool value, Error **errp)
 {
     ((QY7MachineState *)obj)->micom_on = value;
+}
+
+static bool qy7_get_bcm(Object *obj, Error **errp)
+{
+    return ((QY7MachineState *)obj)->bcm_on;
+}
+
+static void qy7_set_bcm(Object *obj, bool value, Error **errp)
+{
+    ((QY7MachineState *)obj)->bcm_on = value;
 }
 
 static bool qy7_get_micom_generic_reply(Object *obj, Error **errp)
@@ -494,6 +507,12 @@ static void qy7_init(MachineState *machine)
         clarion_scpu_attach_uart(scpu, uart);
         qdev_realize_and_unref(scpu, NULL, &error_fatal);
         clarion_qy7_uart_set_tx(uart, qy7_uart_tx, scpu);
+        if (qmachine->bcm_on) {
+            DeviceState *bcm = qdev_new(TYPE_CLARION_BCM);
+
+            qdev_realize_and_unref(bcm, NULL, &error_fatal);
+            clarion_bcm_attach(bcm, scpu);
+        }
     }
     create_unimplemented_device("qy7.pfc", 0xfffc0000, 0x10000);
     create_unimplemented_device("qy7.intc", 0xffd00000, 0x1000);
@@ -526,6 +545,10 @@ static void qy7_machine_class_init(ObjectClass *oc, const void *data)
                                    qy7_set_micom);
     object_class_property_set_description(oc, "micom",
         "The companion micom connected to SCIF1 (default on)");
+    object_class_property_add_bool(oc, "bcm", qy7_get_bcm, qy7_set_bcm);
+    object_class_property_set_description(oc, "bcm",
+        "Synthetic body control module answering the antitheft CAN "
+        "exchange (default on)");
     object_class_property_add_bool(oc, "micom-generic-reply",
                                    qy7_get_micom_generic_reply,
                                    qy7_set_micom_generic_reply);

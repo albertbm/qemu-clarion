@@ -34,6 +34,7 @@ config CLARION_QY7
     select CLARION_SCIF
     select CLARION_QY7_UART
     select CLARION_SCPU
+    select CLARION_BCM
     select UNIMP
     select SH_TIMER
     select RENESAS_SDHI

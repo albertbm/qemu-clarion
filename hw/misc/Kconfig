@@ -274,6 +274,9 @@ config CLARION_DISPMICOM
 config CLARION_SCPU
     bool
 
+config CLARION_BCM
+    bool
+
 config CLARION_UBLOX
     bool
 
