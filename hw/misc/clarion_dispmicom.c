@@ -63,6 +63,7 @@
 #include "hw/misc/clarion_dispmicom.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
+#include "ui/input.h"
 
 #define DLE     0x10
 #define STX     0x02
@@ -80,6 +81,7 @@
 #define CMD_SETTINGS        0x42
 #define CMD_REPORT          0x43
 #define CMD_KEEPALIVE       0x71
+#define CMD_TOUCH           0x51
 
 /*
  * Пауза між кадрами — така сама, як у моделі МК плати: приймач SCIF має
@@ -126,6 +128,12 @@ struct ClarionDispMicomState {
     uint8_t bcc;
 
     bool linked;                /* бачили 0x25 від гостя */
+    bool touch_input;
+    QemuInputHandlerState *input_handler;
+    uint16_t touch_x;
+    uint16_t touch_y;
+    bool touch_down;
+    bool touch_dirty;
 };
 
 /* --- побудова кадру ---------------------------------------------------- */
@@ -319,6 +327,67 @@ static void disp_frame(ClarionDispMicomState *s)
     }
 }
 
+/* --- synthetic QY7 touch input ---------------------------------------- */
+
+static void disp_touch_event(DeviceState *dev, QemuConsole *src,
+                             QemuInputEvent *evt)
+{
+    ClarionDispMicomState *s = CLARION_DISPMICOM(dev);
+
+    (void)src;
+
+    switch (evt->type) {
+    case INPUT_EVENT_KIND_ABS:
+        if (evt->abs.axis == INPUT_AXIS_X) {
+            s->touch_x =
+                qemu_input_scale_axis(evt->abs.value, INPUT_EVENT_ABS_MIN,
+                                      INPUT_EVENT_ABS_MAX, 0, 4095);
+            s->touch_dirty = true;
+        } else if (evt->abs.axis == INPUT_AXIS_Y) {
+            s->touch_y =
+                qemu_input_scale_axis(evt->abs.value, INPUT_EVENT_ABS_MIN,
+                                      INPUT_EVENT_ABS_MAX, 0, 4095);
+            s->touch_dirty = true;
+        }
+        break;
+    case INPUT_EVENT_KIND_BTN:
+        if (evt->btn.button == INPUT_BUTTON_LEFT) {
+            s->touch_down = evt->btn.down;
+            s->touch_dirty = true;
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static void disp_touch_sync(DeviceState *dev)
+{
+    ClarionDispMicomState *s = CLARION_DISPMICOM(dev);
+    uint8_t data[] = {
+        CMD_TOUCH,         s->touch_x & 0xff, s->touch_x >> 8,
+        s->touch_y & 0xff, s->touch_y >> 8,   s->touch_down ? '1' : '0',
+    };
+
+    if (!s->touch_dirty) {
+        return;
+    }
+    s->touch_dirty = false;
+    qemu_log("clarion-dispmicom: synthetic-touch virtual-ms=%" PRId64
+             " raw=%u,%u down=%u\n",
+             qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), s->touch_x, s->touch_y,
+             s->touch_down);
+    disp_trace("synthetic-touch", data + 1, sizeof(data) - 1);
+    disp_queue(s, data, sizeof(data));
+}
+
+static const QemuInputHandler disp_touch_handler = {
+    .name = "qy7-touch",
+    .mask = INPUT_EVENT_MASK_ABS | INPUT_EVENT_MASK_BTN,
+    .event = disp_touch_event,
+    .sync = disp_touch_sync,
+};
+
 /* --- розбір потоку від гостя ------------------------------------------- */
 
 void clarion_dispmicom_rx_byte(DeviceState *dev, uint8_t b)
@@ -419,7 +488,16 @@ static void clarion_dispmicom_realize(DeviceState *dev, Error **errp)
 
     s->frames = g_queue_new();
     s->tx = timer_new_ns(QEMU_CLOCK_VIRTUAL, disp_tx_expire, s);
+    if (s->touch_input) {
+        s->input_handler =
+            qemu_input_handler_register(dev, &disp_touch_handler);
+        qemu_input_handler_activate(s->input_handler);
+    }
 }
+
+static const Property clarion_dispmicom_props[] = {
+    DEFINE_PROP_BOOL("touch-input", ClarionDispMicomState, touch_input, false),
+};
 
 static void clarion_dispmicom_class_init(ObjectClass *klass, const void *data)
 {
@@ -427,7 +505,8 @@ static void clarion_dispmicom_class_init(ObjectClass *klass, const void *data)
     ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     dc->realize = clarion_dispmicom_realize;
-    dc->desc = "Clarion QY8XXX display panel micom (SCIF1 link)";
+    dc->desc = "Clarion display panel micom (QY7 SCIF3 or QY8 SCIF1)";
+    device_class_set_props(dc, clarion_dispmicom_props);
     rc->phases.hold = clarion_dispmicom_reset_hold;
 }
 

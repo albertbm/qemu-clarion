@@ -439,6 +439,7 @@ static void qy7_init(MachineState *machine)
     scif3->dma_feed = clarion_hpbdma_feed;
     scif3->dma_eod = clarion_hpbdma_eod;
     dispmicom = qdev_new(TYPE_CLARION_DISPMICOM);
+    qdev_prop_set_bit(dispmicom, "touch-input", true);
     qdev_realize_and_unref(dispmicom, NULL, &error_fatal);
     disp_sink = g_new0(QY7DispSink, 1);
     disp_sink->scif = scif3;
