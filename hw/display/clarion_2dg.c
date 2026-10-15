@@ -138,6 +138,19 @@ typedef struct ListCtx {
     unsigned stopped_op;
 } ListCtx;
 
+/*
+ * SH direct-segment (P2, 0xA0000000..0xBFFFFFFF) addresses name the low
+ * 29-bit physical bus; the guest hands such pointers to the 2DG for
+ * uncached buffers. Other addresses are used as they are.
+ */
+static hwaddr clarion_2dg_direct_seg(hwaddr addr)
+{
+    if ((addr & 0xe0000000) == 0xa0000000) {
+        return addr & 0x1fffffff;
+    }
+    return addr;
+}
+
 static bool clarion_2dg_rd32(hwaddr addr, uint32_t *value)
 {
     uint32_t word;
@@ -164,7 +177,7 @@ static void clarion_2dg_dst_release(ListCtx *c)
 static bool clarion_2dg_dst_map(ListCtx *c)
 {
     Clarion2DGState *s = c->s;
-    hwaddr base = s->lreg[M2DG_R_DST / 4];
+    hwaddr base = clarion_2dg_direct_seg(s->lreg[M2DG_R_DST / 4]);
     uint32_t stride = s->lreg[M2DG_R_DST_STRIDE / 4];
     uint32_t height = (s->lreg[M2DG_R_SYSCLIP / 4] & 0xffff) + 1;
     hwaddr len, want;
@@ -411,6 +424,7 @@ static void clarion_2dg_blit(ListCtx *c, int sx, int sy, int w, int h, int dx,
     uint16_t row[CLARION_2DG_MAX_DIM];
     int cx0, cy0, cx1, cy1, i, j;
 
+    src = clarion_2dg_direct_seg(src);
     if (!clarion_2dg_dst_map(c) || !clarion_2dg_clip(c, &cx0, &cy0, &cx1, &cy1)
         || !s->lreg_set[M2DG_R_SRC / 4] || !sstride ||
         w <= 0 || h <= 0 || w > CLARION_2DG_MAX_DIM) {
@@ -455,10 +469,7 @@ static void clarion_2dg_blit_mono(ListCtx *c, int sx, int sy, int w, int h,
     uint16_t key = s->lreg[M2DG_R_STRANS / 4];
     int cx0, cy0, cx1, cy1;
 
-    /* SH direct-segment addresses name the low 29-bit physical bus. */
-    if ((src & 0xe0000000) == 0xa0000000) {
-        src &= 0x1fffffff;
-    }
+    src = clarion_2dg_direct_seg(src);
     if (!clarion_2dg_dst_map(c) ||
         !clarion_2dg_clip(c, &cx0, &cy0, &cx1, &cy1) ||
         !s->lreg_set[M2DG_R_SRC / 4] || !pitch || (pitch & 7) ||
@@ -523,10 +534,7 @@ static void clarion_2dg_blit_mask(ListCtx *c, int sx, int sy, int w, int h,
     uint8_t row[CLARION_2DG_MAX_DIM];
     int cx0, cy0, cx1, cy1, i, j;
 
-    /* SH direct-segment (P2) addresses name the low 29-bit physical bus. */
-    if ((src & 0xe0000000) == 0xa0000000) {
-        src &= 0x1fffffff;
-    }
+    src = clarion_2dg_direct_seg(src);
     if (!clarion_2dg_dst_map(c) || !clarion_2dg_clip(c, &cx0, &cy0, &cx1, &cy1)
         || !s->lreg_set[M2DG_R_SRC / 4] || !sstride ||
         w <= 0 || h <= 0 || w > CLARION_2DG_MAX_DIM) {
