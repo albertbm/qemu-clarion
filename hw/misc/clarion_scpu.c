@@ -184,8 +184,8 @@ static void scpu_tx_expire(void *opaque)
                     }
                 }
                 if (len >= 10 && data[0] == MSG_CAN_RX) {
-                    /* hide data bytes 1..4 of received frames */
-                    scpu_trace_hide("sub-tx", data, len, 6, 10);
+                    /* hide data bytes 1..5 (code and checksum) of received frames */
+                    scpu_trace_hide("sub-tx", data, len, 6, 11);
                 } else {
                     scpu_trace("sub-tx", data, len);
                 }
@@ -272,8 +272,8 @@ static void scpu_controller(ClarionScpuState *s)
 static void scpu_frame(ClarionScpuState *s)
 {
     if (s->body_len >= 10 && s->body[0] == MSG_CAN_TX && s->body[5] == 0x24) {
-        /* antitheft step 2: data bytes 1..4 are the vehicle code */
-        scpu_trace_hide("guest-tx", s->body, s->body_len, 6, 10);
+        /* antitheft step 2: data bytes 1..4 are the vehicle code, 5 its sum */
+        scpu_trace_hide("guest-tx", s->body, s->body_len, 6, 11);
     } else {
         scpu_trace("guest-tx", s->body, s->body_len);
     }

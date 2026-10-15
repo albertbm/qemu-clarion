@@ -40,7 +40,7 @@ void clarion_scpu_set_can_sink(DeviceState *scpu, ClarionScpuCanTxFn fn,
                                void *opaque);
 
 /*
- * Deliver one received CAN frame to the guest.  Data bytes 1..4 are masked
+ * Deliver one received CAN frame to the guest.  Data bytes 1..5 are masked
  * in the trace log (they may carry vehicle-specific values).
  */
 void clarion_scpu_can_rx(DeviceState *scpu, uint16_t id, const uint8_t *data,
