@@ -260,6 +260,17 @@ static void micom_frame(ClarionMicomState *s)
                   " len=%u cmd=%02x sub=%02x action=%s\n",
                   qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), len, cmd, sub,
                   action);
+    if (cmd != 0x08) {
+        /* Payload bytes of non-handshake frames (no secrets pass here). */
+        char hex[3 * 32 + 1];
+        unsigned i;
+
+        for (i = 0; i < len && i < 32; i++) {
+            snprintf(hex + 3 * i, 4, "%02x ", data[i]);
+        }
+        hex[3 * i] = 0;
+        qemu_log_mask(LOG_GUEST_ERROR, "clarion-micom: data %s\n", hex);
+    }
 }
 
 /* --- розбір потоку від ядра -------------------------------------------- */
