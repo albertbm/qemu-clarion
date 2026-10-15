@@ -43,6 +43,13 @@
 
 #define SCPU_MAX_DATA 160
 
+/* Message codes of the CAN.dll <-> sub-CPU protocol (CAN.dll+0x30DC). */
+#define MSG_HELLO       0x23    /* guest: who are you */
+#define MSG_VERSION     0x24    /* sub-CPU: version block */
+#define MSG_NOTICE_REG  0x41    /* register a receive ID, acked with 0x41 */
+#define MSG_CAN_TX      0x51    /* guest: send a frame, acked with 0x51 */
+#define MSG_CAN_RX      0x65    /* sub-CPU: received frame(s) for an ID */
+
 /* Pause between two frames and delay for refilling a busy UART FIFO. */
 #define SCPU_GAP_NS   (5 * 1000 * 1000)
 #define SCPU_FILL_NS  (1 * 1000 * 1000)
@@ -57,6 +64,8 @@ struct ClarionScpuState {
     DeviceState *uart;
     ClarionScpuBodyFn body_fn;
     void *body_opaque;
+    ClarionScpuCanTxFn can_fn;
+    void *can_opaque;
 
     QEMUTimer *tx;
     GQueue *frames;
@@ -69,15 +78,30 @@ struct ClarionScpuState {
     uint8_t bcc;
 };
 
-static void scpu_trace(const char *dir, const uint8_t *data, unsigned len)
+/*
+ * Bytes [hide_from, hide_to) of the trace are printed as "xx": the second
+ * step of the antitheft exchange carries a vehicle-specific code that must
+ * not end up in logs.
+ */
+static void scpu_trace_hide(const char *dir, const uint8_t *data, unsigned len,
+                            unsigned hide_from, unsigned hide_to)
 {
     g_autoptr(GString) body = g_string_new(NULL);
 
     for (unsigned i = 0; i < len; i++) {
-        g_string_append_printf(body, "%s%02x", i ? " " : "", data[i]);
+        if (i >= hide_from && i < hide_to) {
+            g_string_append_printf(body, "%sxx", i ? " " : "");
+        } else {
+            g_string_append_printf(body, "%s%02x", i ? " " : "", data[i]);
+        }
     }
     qemu_log("clarion-scpu: trace virtual-ms=%" PRId64 " dir=%s body=%s\n",
              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), dir, body->str);
+}
+
+static void scpu_trace(const char *dir, const uint8_t *data, unsigned len)
+{
+    scpu_trace_hide(dir, data, len, 0, 0);
 }
 
 static GByteArray *scpu_build(const uint8_t *data, unsigned len)
@@ -159,7 +183,12 @@ static void scpu_tx_expire(void *opaque)
                         i++;
                     }
                 }
-                scpu_trace("sub-tx", data, len);
+                if (len >= 10 && data[0] == MSG_CAN_RX) {
+                    /* hide data bytes 1..4 of received frames */
+                    scpu_trace_hide("sub-tx", data, len, 6, 10);
+                } else {
+                    scpu_trace("sub-tx", data, len);
+                }
             }
         }
         s->cur_off += took;
@@ -176,11 +205,84 @@ static void scpu_tx_expire(void *opaque)
     }
 }
 
+/* Synthetic version block: the guest only logs it. */
+static const uint8_t scpu_version[] = {
+    MSG_VERSION, 0x01, 0x20, 0x14, 0x01, 0x01,
+    'Q', 'E', 'M', 'U', 'S', 'C', 'P', 'U', '0', '0', '1', 0x00,
+};
+
+void clarion_scpu_can_rx(DeviceState *dev, uint16_t id, const uint8_t *data,
+                         unsigned len)
+{
+    uint8_t msg[5 + 8];
+
+    g_assert(len <= 8);
+    msg[0] = MSG_CAN_RX;
+    msg[1] = id >> 8;
+    msg[2] = id & 0xff;
+    msg[3] = 1;             /* one record */
+    msg[4] = len;
+    memcpy(msg + 5, data, len);
+    clarion_scpu_send(dev, msg, 5 + len);
+}
+
+void clarion_scpu_set_can_sink(DeviceState *dev, ClarionScpuCanTxFn fn,
+                               void *opaque)
+{
+    ClarionScpuState *s = CLARION_SCPU(dev);
+
+    s->can_fn = fn;
+    s->can_opaque = opaque;
+}
+
+static void scpu_controller(ClarionScpuState *s)
+{
+    const uint8_t *b = s->body;
+    unsigned len = s->body_len;
+
+    switch (b[0]) {
+    case MSG_HELLO:
+        clarion_scpu_send(DEVICE(s), scpu_version, sizeof(scpu_version));
+        break;
+    case MSG_NOTICE_REG:
+        if (len >= 7) {
+            /* echo the tag bytes, the receive ID moves to offset 6..7 */
+            uint8_t ack[8] = { MSG_NOTICE_REG, b[1], b[2], b[3], b[4], 0,
+                               b[5], b[6] };
+
+            clarion_scpu_send(DEVICE(s), ack, sizeof(ack));
+        }
+        break;
+    case MSG_CAN_TX:
+        if (len >= 5) {
+            uint8_t ack[3] = { MSG_CAN_TX, b[1], b[2] };
+            uint16_t id = (b[3] << 8) | b[4];
+
+            clarion_scpu_send(DEVICE(s), ack, sizeof(ack));
+            if (s->can_fn && len - 5 <= 8) {
+                s->can_fn(s->can_opaque, id, b + 5, len - 5);
+            }
+        }
+        break;
+    default:
+        break;
+    }
+}
+
 static void scpu_frame(ClarionScpuState *s)
 {
-    scpu_trace("guest-tx", s->body, s->body_len);
+    if (s->body_len >= 10 && s->body[0] == MSG_CAN_TX && s->body[5] == 0x24) {
+        /* antitheft step 2: data bytes 1..4 are the vehicle code */
+        scpu_trace_hide("guest-tx", s->body, s->body_len, 6, 10);
+    } else {
+        scpu_trace("guest-tx", s->body, s->body_len);
+    }
     scpu_queue_ack(s, ACK);
-    if (s->body_len && s->body_fn) {
+    if (!s->body_len) {
+        return;
+    }
+    scpu_controller(s);
+    if (s->body_fn) {
         s->body_fn(s->body_opaque, s->body, s->body_len);
     }
 }

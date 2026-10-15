@@ -27,6 +27,25 @@ typedef void (*ClarionScpuBodyFn)(void *opaque, const uint8_t *body,
 void clarion_scpu_set_body_sink(DeviceState *scpu, ClarionScpuBodyFn fn,
                                 void *opaque);
 
+/*
+ * CAN traffic the sub-CPU carries on behalf of CAN.dll.  A frame the guest
+ * asks to transmit (message 0x51) is passed to the bus sink after the
+ * controller has acknowledged it; a frame a bus node wants the guest to
+ * receive is injected with clarion_scpu_can_rx() (message 0x65).
+ */
+typedef void (*ClarionScpuCanTxFn)(void *opaque, uint16_t id,
+                                   const uint8_t *data, unsigned len);
+
+void clarion_scpu_set_can_sink(DeviceState *scpu, ClarionScpuCanTxFn fn,
+                               void *opaque);
+
+/*
+ * Deliver one received CAN frame to the guest.  Data bytes 1..4 are masked
+ * in the trace log (they may carry vehicle-specific values).
+ */
+void clarion_scpu_can_rx(DeviceState *scpu, uint16_t id, const uint8_t *data,
+                         unsigned len);
+
 /* Queue a framed reply (DLE STX .. DLE ETX BCC) built from a raw body. */
 void clarion_scpu_send(DeviceState *scpu, const uint8_t *data, unsigned len);
 
