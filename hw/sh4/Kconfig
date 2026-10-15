@@ -32,6 +32,8 @@ config CLARION_QY7
     select CLARION_USBPHY
     select PFLASH_CFI02
     select CLARION_SCIF
+    select CLARION_QY7_UART
+    select CLARION_SCPU
     select UNIMP
     select SH_TIMER
     select RENESAS_SDHI

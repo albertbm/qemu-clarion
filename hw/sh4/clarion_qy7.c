@@ -7,12 +7,15 @@
 #include "system/block-backend.h"
 #include "hw/block/flash.h"
 #include "hw/char/clarion_scif.h"
+#include "hw/char/clarion_qy7_uart.h"
+#include "qemu/log.h"
 #include "hw/dma/clarion_hpbdma.h"
 #include "hw/misc/unimp.h"
 #include "hw/misc/clarion_qy7_regs.h"
 #include "hw/misc/clarion_usbphy.h"
 #include "hw/misc/clarion_dispmicom.h"
 #include "hw/misc/clarion_micom.h"
+#include "hw/misc/clarion_scpu.h"
 #include "hw/misc/clarion_boards.h"
 #include "hw/display/clarion_du.h"
 #include "hw/display/clarion_2dg.h"
@@ -85,6 +88,11 @@ typedef struct QY7MachineState {
 typedef struct QY7DispSink {
     ClarionScif *scif;
 } QY7DispSink;
+
+static void qy7_uart_tx(void *opaque, uint8_t byte)
+{
+    clarion_scpu_rx_byte(opaque, byte);
+}
 
 static int qy7_dispmicom_sink(void *opaque, const uint8_t *buf, int len)
 {
@@ -473,6 +481,20 @@ static void qy7_init(MachineState *machine)
         }
     }
     create_unimplemented_device("qy7.sdhi1", 0xffe4d000, 0x1000);
+    {
+        /* Sub-CPU link UART on the external bus (area 6), SYSINTR 26. */
+        DeviceState *uart = qdev_new(TYPE_CLARION_QY7_UART);
+        DeviceState *scpu;
+
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(uart), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(uart), 0, CLARION_QY7_UART_BASE);
+        sysbus_connect_irq(SYS_BUS_DEVICE(uart), 0,
+                           clarion_qy7_int2_uart_irq(int2));
+        scpu = qdev_new(TYPE_CLARION_SCPU);
+        clarion_scpu_attach_uart(scpu, uart);
+        qdev_realize_and_unref(scpu, NULL, &error_fatal);
+        clarion_qy7_uart_set_tx(uart, qy7_uart_tx, scpu);
+    }
     create_unimplemented_device("qy7.pfc", 0xfffc0000, 0x10000);
     create_unimplemented_device("qy7.intc", 0xffd00000, 0x1000);
     create_unimplemented_device("qy7.intc-usermask", 0xffd30000, 0x1000);

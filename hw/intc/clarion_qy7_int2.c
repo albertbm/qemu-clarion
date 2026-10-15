@@ -63,8 +63,16 @@
 #define INT2_SDHI_SOURCES 2
 #define INT2_DISPLAY_INDEX (INT2_TMU_CHANNELS + INT2_HPB_CHANNELS)
 #define INT2_SDHI_INDEX (INT2_DISPLAY_INDEX + INT2_DISPLAY_SOURCES)
+#define INT2_UART_INDEX (INT2_SDHI_INDEX + INT2_SDHI_SOURCES)
 #define INT2_SOURCE_COUNT (INT2_TMU_CHANNELS + INT2_HPB_CHANNELS + \
-                           INT2_DISPLAY_SOURCES + INT2_SDHI_SOURCES)
+                           INT2_DISPLAY_SOURCES + INT2_SDHI_SOURCES + 1)
+/*
+ * Sub-CPU link UART (CAN.dll registers SYSINTR 26 for it).  The ISRs that
+ * return SYSINTR 26 sit in slots 63 (vector 0x9e0) and 65 (vector 0xa20);
+ * both mask INT2 group bit 18.  INFERENCE: the UART uses slot 63.
+ */
+#define INT2_UART_GROUP_BIT 18
+#define INT2_UART_SLOT      63
 #define INT2_UNK_SLOTS    (INT2_SIZE / 4)
 
 /*
@@ -103,6 +111,8 @@ struct ClarionQy7Int2 {
     bool du_pending;
     qemu_irq sdhi_irq[INT2_SDHI_SOURCES];
     uint32_t sdhi_pending;
+    qemu_irq uart_irq;
+    bool uart_pending;
     uint32_t unk[INT2_UNK_SLOTS];
 };
 
@@ -177,6 +187,18 @@ static void int2_update(ClarionQy7Int2 *s)
                           !(s->mask & BIT(29));
         pending += source->pending;
     }
+    {
+        uint8_t priority = 0;
+        struct intc_source *source = &s->src[INT2_UART_INDEX];
+        bool ok = int2_guest_read(INT2_HPB_PRIO_BASE + INT2_UART_SLOT,
+                                  &priority, sizeof(priority));
+
+        source->vect = 0x200 + INT2_UART_SLOT * 0x20;
+        source->priority = priority;
+        source->pending = ok && priority && s->uart_pending &&
+                          !(s->mask & BIT(INT2_UART_GROUP_BIT));
+        pending += source->pending;
+    }
     s->desc.pending = pending;
     if (pending) {
         cpu_interrupt(s->cpu, CPU_INTERRUPT_HARD);
@@ -227,6 +249,15 @@ static void int2_sdhi_set(void *opaque, int n, int level)
     int2_update(s);
 }
 
+static void int2_uart_set(void *opaque, int n, int level)
+{
+    ClarionQy7Int2 *s = opaque;
+
+    (void)n;
+    s->uart_pending = !!level;
+    int2_update(s);
+}
+
 static uint64_t int2_reg_read(ClarionQy7Int2 *s, hwaddr addr)
 {
     switch (addr) {
@@ -235,7 +266,8 @@ static uint64_t int2_reg_read(ClarionQy7Int2 *s, hwaddr addr)
     case INT2_PRIO1:
         return s->prio[1];
     case 0x3c:
-        return s->sdhi_pending ? BIT(29) : 0;
+        return (s->sdhi_pending ? BIT(29) : 0) |
+               (s->uart_pending ? BIT(INT2_UART_GROUP_BIT) : 0);
     case INT2_MASK_SET:
         return s->mask;
     default:
@@ -304,6 +336,7 @@ static void int2_reset(void *opaque)
     s->g2d_pending = false;
     s->du_pending = false;
     s->sdhi_pending = 0;
+    s->uart_pending = false;
     memset(s->unk, 0, sizeof(s->unk));
     int2_update(s);
 }
@@ -342,6 +375,7 @@ ClarionQy7Int2 *clarion_qy7_int2_init(MemoryRegion *sysmem, hwaddr base,
     for (int i = 0; i < INT2_SDHI_SOURCES; i++) {
         s->sdhi_irq[i] = qemu_allocate_irq(int2_sdhi_set, s, i);
     }
+    s->uart_irq = qemu_allocate_irq(int2_uart_set, s, 0);
     memory_region_init_io(&s->iomem, NULL, &int2_ops, s, "qy7.int2",
                           INT2_SIZE);
     memory_region_add_subregion(sysmem, base, &s->iomem);
@@ -381,4 +415,9 @@ qemu_irq clarion_qy7_int2_sdhi_irq(ClarionQy7Int2 *s, int unit)
 {
     g_assert(unit >= 0 && unit < INT2_SDHI_SOURCES);
     return s->sdhi_irq[unit];
+}
+
+qemu_irq clarion_qy7_int2_uart_irq(ClarionQy7Int2 *s)
+{
+    return s->uart_irq;
 }

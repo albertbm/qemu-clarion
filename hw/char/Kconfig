@@ -69,6 +69,9 @@ config TERMINAL3270
 config CLARION_SCIF
     bool
 
+config CLARION_QY7_UART
+    bool
+
 config SH_SCI
     bool
 

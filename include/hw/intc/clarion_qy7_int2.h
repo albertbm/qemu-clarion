@@ -30,4 +30,7 @@ qemu_irq clarion_qy7_int2_du_irq(ClarionQy7Int2 *s);
 
 qemu_irq clarion_qy7_int2_sdhi_irq(ClarionQy7Int2 *s, int unit);
 
+/* Sub-CPU link UART (group bit 18, SYSINTR 26). */
+qemu_irq clarion_qy7_int2_uart_irq(ClarionQy7Int2 *s);
+
 #endif
