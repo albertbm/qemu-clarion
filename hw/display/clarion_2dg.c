@@ -226,10 +226,10 @@ static bool clarion_2dg_clip(ListCtx *c, int *x0, int *y0, int *x1, int *y1)
         uint32_t mn = s->lreg[M2DG_R_CLIP_MIN / 4];
         uint32_t mx = s->lreg[M2DG_R_CLIP_MAX / 4];
 
-        *x0 = MAX(*x0, (int)(mn >> 16));
-        *y0 = MAX(*y0, (int)(mn & 0xffff));
-        *x1 = MIN(*x1, (int)(mx >> 16));
-        *y1 = MIN(*y1, (int)(mx & 0xffff));
+        *x0 = MAX(*x0, (int)(mn >> 16) + c->ox);
+        *y0 = MAX(*y0, (int)(mn & 0xffff) + c->oy);
+        *x1 = MIN(*x1, (int)(mx >> 16) + c->ox);
+        *y1 = MIN(*y1, (int)(mx & 0xffff) + c->oy);
     }
     return *x0 <= *x1 && *y0 <= *y1;
 }
@@ -795,12 +795,31 @@ static unsigned clarion_2dg_run(Clarion2DGState *s, hwaddr list,
              * (x << 16) | (y & 0xffff).  AUI brackets one full-screen fill
              * with (0, +480) and (0, -480) (list 0x0E75DC70), so the pair
              * is read as a relative shift of the destination origin that is
-             * undone afterwards.  INFERENCE: nothing in the guest shows
-             * whether it also moves the clip; the clip stays untouched.
+             * undone afterwards.  The clip follows the origin so the guest's
+             * +480 fill reaches rows 480..959 of the destination canvas.
              */
             words = 2;
-            c->ox += clarion_2dg_xy_x(a1);
-            c->oy += clarion_2dg_xy_y(a1);
+            {
+                int dx = clarion_2dg_xy_x(a1);
+                int dy = clarion_2dg_xy_y(a1);
+
+                c->ox += dx;
+                c->oy += dy;
+                if (c->rc_on) {
+                    c->rx0 += dx;
+                    c->ry0 += dy;
+                    c->rx1 += dx;
+                    c->ry1 += dy;
+                }
+                if (c->path_on) {
+                    unsigned i;
+
+                    for (i = 0; i < c->path_n; i++) {
+                        c->px[i] += dx;
+                        c->py[i] += dy;
+                    }
+                }
+            }
             break;
         case M2DG_WPR:
             if (w & M2DG_F_WPR_IND) {
@@ -862,10 +881,10 @@ static unsigned clarion_2dg_run(Clarion2DGState *s, hwaddr list,
         case M2DG_CLIPRECT:
             words = 3;
             c->rc_on = true;
-            c->rx0 = clarion_2dg_xy_x(a1);
-            c->ry0 = clarion_2dg_xy_y(a1);
-            c->rx1 = clarion_2dg_xy_x(a2);
-            c->ry1 = clarion_2dg_xy_y(a2);
+            c->rx0 = clarion_2dg_xy_x(a1) + c->ox;
+            c->ry0 = clarion_2dg_xy_y(a1) + c->oy;
+            c->rx1 = clarion_2dg_xy_x(a2) + c->ox;
+            c->ry1 = clarion_2dg_xy_y(a2) + c->oy;
             break;
         case M2DG_CLIPPATH:
             words = 4 + a1;
@@ -874,6 +893,9 @@ static unsigned clarion_2dg_run(Clarion2DGState *s, hwaddr list,
             }
             c->path_n = a1;
             c->path_on = clarion_2dg_read_xy(pc + 16, a1, c->px, c->py);
+            if (c->path_on) {
+                clarion_2dg_shift_xy(c, c->px, c->py, c->path_n);
+            }
             break;
         case M2DG_BITBLTM: {
             uint32_t a6 = 0;
