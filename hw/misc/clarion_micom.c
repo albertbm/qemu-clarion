@@ -89,6 +89,9 @@ struct ClarionMicomState {
 
     bool handshake_done;        /* бачили 08 0b від ядра */
     bool cenet_audio_off;
+    bool cenet_antitheft_release;
+    bool cenet_antitheft_release_sent;
+    unsigned handshake_count;
     bool generic_reply;
     uint8_t generic_reply_subcode;
 };
@@ -224,6 +227,30 @@ static const uint8_t cenet_audio_off[] = {
     0x40, 0x00, 0x71, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00
 };
 
+/*
+ * QY7 antitheft release (SYNTHETIC). Two CeNet frames, in this order; both
+ * are decoded by anwdrv.dll (the NOR build, runtime base 0x03E00000):
+ *
+ * 1. DATA[1] == 0 selects the Mode module. 0x03E1348C (DATA[0] == 0x40) calls
+ *    the Mode handler 0x03E134D4 which, for DATA[2] == 0x0D and DATA[6] in
+ *    {0x20, 0x21}, calls SetEvent() (vtbl+16 = 0x03E24C24) on the
+ *    ANT_RCV_SECURITY_RELEASE_OK handle (this+100) and then on
+ *    TMC_RCV_POWER_ON (this+104).
+ * 2. The Antitheft module (classifier 0x03E1FA74: DATA[1] == 0, DATA[0] ==
+ *    0x60, DATA[6] == 0x85) calls SetEvent() on the ANT_RCV_SECURITY_LOCK
+ *    handle (this+32) in 0x03E23768; DATA[8] is stored at this+56.
+ *
+ * Antitheft.exe only acts on the RELEASE_OK event after it has seen LOCK
+ * (0x18330 != 0 in its 0x14D64), so LOCK goes first. Which value of
+ * DATA[6] (0x20/0x21) and DATA[8] the real micom sends is UNKNOWN.
+ */
+static const uint8_t cenet_antitheft_lock[] = {
+    0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x85, 0x00, 0x00, 0x00
+};
+static const uint8_t cenet_antitheft_release[] = {
+    0x40, 0x00, 0x0d, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00
+};
+
 static void micom_frame(ClarionMicomState *s)
 {
     const uint8_t *data = s->body + 1;
@@ -255,9 +282,19 @@ static void micom_frame(ClarionMicomState *s)
         micom_send_cmd_set(s);
     } else if (cmd == 0x08 && sub == 0x0b) {    /* набір прийнято */
         s->handshake_done = true;
+        s->handshake_count++;
         if (s->cenet_audio_off) {
             action = "ack-only+cenet-audio-off";
             micom_queue(s, cenet_audio_off, sizeof(cenet_audio_off));
+        }
+        if (s->cenet_antitheft_release &&
+            !s->cenet_antitheft_release_sent && s->handshake_count > 1) {
+            action = "ack-only+cenet-antitheft-release";
+            micom_queue(s, cenet_antitheft_lock,
+                        sizeof(cenet_antitheft_lock));
+            micom_queue(s, cenet_antitheft_release,
+                        sizeof(cenet_antitheft_release));
+            s->cenet_antitheft_release_sent = true;
         }
     } else if (len == sizeof(cmd_60_3a) &&
                !memcmp(data, cmd_60_3a, sizeof(cmd_60_3a))) {
@@ -379,6 +416,8 @@ static void clarion_micom_reset_hold(Object *obj, ResetType type)
     s->body_len = 0;
     s->bcc = 0;
     s->handshake_done = false;
+    s->handshake_count = 0;
+    s->cenet_antitheft_release_sent = false;
 }
 
 static void clarion_micom_realize(DeviceState *dev, Error **errp)
@@ -396,6 +435,8 @@ static const Property clarion_micom_props[] = {
                       generic_reply_subcode, 0),
     DEFINE_PROP_BOOL("cenet-audio-off", ClarionMicomState,
                      cenet_audio_off, false),
+    DEFINE_PROP_BOOL("cenet-antitheft-release", ClarionMicomState,
+                     cenet_antitheft_release, false),
 };
 
 static void clarion_micom_class_init(ObjectClass *klass, const void *data)
