@@ -341,12 +341,12 @@ static void disp_touch_event(DeviceState *dev, QemuConsole *src,
         if (evt->abs.axis == INPUT_AXIS_X) {
             s->touch_x =
                 qemu_input_scale_axis(evt->abs.value, INPUT_EVENT_ABS_MIN,
-                                      INPUT_EVENT_ABS_MAX, 0, 4095);
+                                      INPUT_EVENT_ABS_MAX, 0, 800);
             s->touch_dirty = true;
         } else if (evt->abs.axis == INPUT_AXIS_Y) {
-            s->touch_y =
+            s->touch_y = 480 -
                 qemu_input_scale_axis(evt->abs.value, INPUT_EVENT_ABS_MIN,
-                                      INPUT_EVENT_ABS_MAX, 0, 4095);
+                                      INPUT_EVENT_ABS_MAX, 0, 479);
             s->touch_dirty = true;
         }
         break;
@@ -365,8 +365,8 @@ static void disp_touch_sync(DeviceState *dev)
 {
     ClarionDispMicomState *s = CLARION_DISPMICOM(dev);
     uint8_t data[] = {
-        CMD_TOUCH,         s->touch_x & 0xff, s->touch_x >> 8,
-        s->touch_y & 0xff, s->touch_y >> 8,   s->touch_down ? '1' : '0',
+        CMD_TOUCH,         s->touch_x >> 8, s->touch_x & 0xff,
+        s->touch_y >> 8, s->touch_y & 0xff,   s->touch_down ? '1' : '0',
     };
 
     if (!s->touch_dirty) {
