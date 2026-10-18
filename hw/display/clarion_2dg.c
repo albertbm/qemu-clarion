@@ -969,24 +969,43 @@ static unsigned clarion_2dg_run(Clarion2DGState *s, hwaddr list,
                 clarion_2dg_shift_xy(c, vx, vy, 4);
                 clarion_2dg_fill_poly(c, vx, vy, 4, a1 & 0xffff, NULL, 0, 0);
             } else {
-                /* a1 = texture offset from this header, a2 = (w << 16 | h). */
+                /* a1 = texture offset (zero uses SRC), a2 = (w << 16 | h). */
                 unsigned tw = a2 >> 16, th = a2 & 0xffff;
+                uint32_t stride = s->lreg[M2DG_R_SRC_STRIDE / 4];
+                hwaddr tex =
+                    a1 ? pc + (int32_t)a1
+                       : clarion_2dg_direct_seg(s->lreg[M2DG_R_SRC / 4]);
+                bool valid = true;
 
                 if (!tw || !th || tw > CLARION_2DG_MAX_TEX ||
                     th > CLARION_2DG_MAX_TEX ||
                     !clarion_2dg_read_xy(pc + 16, 4, vx, vy) ||
-                    address_space_read(&address_space_memory,
-                                       pc + (int32_t)a1,
-                                       MEMTXATTRS_UNSPECIFIED, t16,
-                                       tw * th * 2) != MEMTX_OK) {
+                    (a1 == 0 && (!s->lreg_set[M2DG_R_SRC / 4] || !stride ||
+                                 stride < tw))) {
                     drawn = false;
                 } else {
-                    for (i = 0; i < tw * th; i++) {
-                        t16[i] = lduw_le_p(&t16[i]);
+                    for (i = 0; i < th; i++) {
+                        uint16_t *row = &t16[i * tw];
+
+                        if (address_space_read(
+                                &address_space_memory,
+                                tex + (a1 ? i * tw * 2 : i * stride * 2),
+                                MEMTXATTRS_UNSPECIFIED, row,
+                                tw * 2) != MEMTX_OK) {
+                            valid = false;
+                            break;
+                        }
+                        for (unsigned x = 0; x < tw; x++) {
+                            row[x] = lduw_le_p(&row[x]);
+                        }
                     }
-                    /* Tiling by absolute canvas coordinates: assumed. */
-                    clarion_2dg_shift_xy(c, vx, vy, 4);
-                    clarion_2dg_fill_poly(c, vx, vy, 4, 0, t16, tw, th);
+                    if (!valid) {
+                        drawn = false;
+                    } else {
+                        /* Captured 0x3b60 uses opaque ARGB1555 texels. */
+                        clarion_2dg_shift_xy(c, vx, vy, 4);
+                        clarion_2dg_fill_poly(c, vx, vy, 4, 0, t16, tw, th);
+                    }
                 }
             }
             c->done[op] += drawn;
