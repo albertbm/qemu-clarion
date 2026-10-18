@@ -1699,13 +1699,19 @@ static void _decode_opc(DisasContext * ctx)
         gen_helper_fsrra_FT(FREG(B11_8), tcg_env, FREG(B11_8));
         break;
     case 0xf08d: /* fldi0 FRn - FPSCR: R[PR] */
+        /*
+         * PR=1 is reserved per the manual; silicon executes it as single
+         * precision. Shipped QY7221NL code (XGLDLL) depends on it.
+         */
         CHECK_FPU_ENABLED
-        CHECK_FPSCR_PR_0
         tcg_gen_movi_i32(FREG(B11_8), 0);
         return;
     case 0xf09d: /* fldi1 FRn - FPSCR: R[PR] */
+        /*
+         * PR=1 is reserved per the manual; silicon executes it as single
+         * precision. Shipped QY7221NL code (XGLDLL) depends on it.
+         */
         CHECK_FPU_ENABLED
-        CHECK_FPSCR_PR_0
         tcg_gen_movi_i32(FREG(B11_8), 0x3f800000);
         return;
     case 0xf0ad: /* fcnvsd FPUL,DRn */
