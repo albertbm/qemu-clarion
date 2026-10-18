@@ -433,7 +433,7 @@ static void qy7_init(MachineState *machine)
     memory_region_add_subregion(sysmem, A7ADDR(QY7_2DG_BASE), g2d_alias);
     /* SCIF6 carries the IPL console on the first -serial chardev. */
     qy7_scif_with_alias_serial(sysmem, QY7_SCIF_BASE, "qy7.scif", 6, 0,
-                               NULL);
+                               clarion_qy7_int2_hpb_channel_irq(int2, 7));
     /*
      * SCIF0: CelaviDrv.dll opens "SCI0:" and serial_scif.dll then polls
      * SCFSR.TEND at 0xffe40010.  The first -serial belongs to the block at
