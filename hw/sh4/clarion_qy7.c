@@ -147,7 +147,7 @@ static void qy7_machine_instance_init(Object *obj)
     s->micom_generic_reply = false;
     s->micom_generic_reply_subcode = 0;
     s->micom_audio_off = true;
-    s->micom_antitheft_release = false;
+    s->micom_antitheft_release = true;
     object_property_add_uint8_ptr(obj, "micom-generic-reply-subcode",
         &s->micom_generic_reply_subcode, OBJ_PROP_FLAG_READWRITE);
     /*
@@ -597,7 +597,7 @@ static void qy7_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "micom-antitheft-release",
         "After the second link handshake the micom sends two synthetic CeNet "
         "frames (antitheft LOCK, then Mode RELEASE_OK) that make anwdrv "
-        "signal the Antitheft events (default off)");
+        "signal the Antitheft events (default on)");
 }
 
 static const TypeInfo qy7_machine_typeinfo = {
