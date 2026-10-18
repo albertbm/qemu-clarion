@@ -182,6 +182,8 @@ struct ClarionDuState {
     qemu_irq irq;               /* GIC_SPI 31 */
     QEMUTimer *vbk;             /* кадровий такт */
     uint32_t dotclk;            /* точкова частота, Гц (властивість) */
+    uint32_t panel_width;
+    uint32_t panel_height;
 
     /* щоб не засмічувати лог однаковими скаргами */
     bool warned_chan1;
@@ -224,6 +226,12 @@ static bool du_geometry(ClarionDuState *s, int ch, int *w, int *h)
 
     if (cw <= 0 || chh <= 0 || cw > 4096 || chh > 4096) {
         return false;
+    }
+    if (s->panel_width) {
+        cw = MIN(cw, (int32_t)s->panel_width);
+    }
+    if (s->panel_height) {
+        chh = MIN(chh, (int32_t)s->panel_height);
     }
     *w = cw;
     *h = chh;
@@ -878,6 +886,8 @@ static const Property clarion_du_props[] = {
      * `-M clarion-qy8,du-spi=<номер>`.
      */
     DEFINE_PROP_UINT32("dotclk", ClarionDuState, dotclk, 0),
+    DEFINE_PROP_UINT32("panel-width", ClarionDuState, panel_width, 0),
+    DEFINE_PROP_UINT32("panel-height", ClarionDuState, panel_height, 0),
 };
 
 static void clarion_du_class_init(ObjectClass *klass, const void *data)

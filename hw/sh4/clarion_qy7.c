@@ -87,6 +87,8 @@ typedef struct QY7MachineState {
     bool micom_audio_off;
     bool micom_antitheft_release;
     uint32_t du_dotclk;
+    uint32_t du_panel_width;
+    uint32_t du_panel_height;
 } QY7MachineState;
 
 typedef struct QY7DispSink {
@@ -155,6 +157,18 @@ static void qy7_machine_instance_init(Object *obj)
      * measured board value. Zero disables frame ticks.
      */
     s->du_dotclk = 33333333;
+    s->du_panel_width = 800;
+    s->du_panel_height = 480;
+    object_property_add_uint32_ptr(obj, "du-panel-width",
+                                   &s->du_panel_width,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "du-panel-width",
+                                    "QY7 display panel width in pixels");
+    object_property_add_uint32_ptr(obj, "du-panel-height",
+                                   &s->du_panel_height,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "du-panel-height",
+                                    "QY7 display panel height in pixels");
     object_property_add_uint32_ptr(obj, "du-dotclk", &s->du_dotclk,
                                    OBJ_PROP_FLAG_READWRITE);
     object_property_set_description(obj, "du-dotclk",
@@ -396,6 +410,8 @@ static void qy7_init(MachineState *machine)
     clarion_sh4_core_init(cpu, sysmem);
     du = qdev_new(TYPE_CLARION_DU);
     qdev_prop_set_uint32(du, "dotclk", qmachine->du_dotclk);
+    qdev_prop_set_uint32(du, "panel-width", qmachine->du_panel_width);
+    qdev_prop_set_uint32(du, "panel-height", qmachine->du_panel_height);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(du), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(du), 0, QY7_DU_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(du), 0,
