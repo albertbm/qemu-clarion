@@ -22,14 +22,19 @@ waits for the guest's `DLE ACK` before completing the key event.
 
 | Host key | Panel control | Panel code | Evidence |
 |---|---|---:|---|
-| `M` | MAP/VOICE | `0x01` | Opens the map after the consent screen; down/up frames were ACKed. |
-| `S` | STATUS / settings | `0x02` | Opens the map settings list; down/up frames were ACKed. |
+| `M` | MAP/VOICE | `0x01` | Active KEPDRV tables map `01 -> 01 -> 0x22`; frame reaches `AuiKeyEvent`. |
+| `B` | Brightness/day-night control (inferred) | `0x21` | Active tables map `21 -> 02 -> 0xD9`; this panel code showed the `Lysstyrke` brightness overlay (observed with its previous host alias `S`). |
 
-The panel photo also shows MENU, TUNE/SEEK/CH, FM-AM, XM, CD-AUX, VOL+/VOL−,
-CAMERA, day/night, OPEN/TILT, power, and Zero Emission controls. Their QY7
-protocol codes have not yet been identified. The current host map deliberately
-contains only the two observed controls. Do not infer codes for other buttons
-from their labels.
+The active QY7 `kepdrv.dll` table observed after boot has two first-stage
+entries, `01 -> 01` and `21 -> 02`, and two second-stage entries,
+`01 -> 0x22` and `02 -> 0xD9`. Both codes reach `AuiKeyEvent`; the first
+translation is VK `0x22`, while the second is `0xD9`. The displayed brightness
+overlay associates code `0x21` with brightness/day-night control, but its
+physical button label remains an inference from the panel photo.
+
+The panel photo also shows MENU, STATUS, TUNE/SEEK/CH, FM-AM, XM, CD-AUX,
+VOL+/VOL−, CAMERA, OPEN/TILT, power, and Zero Emission. Their protocol codes
+have not been established. Do not infer codes for them from their labels.
 
 Send a key through QMP in headless mode:
 
@@ -53,6 +58,8 @@ body:
 ```json
 {"execute":"qom-set","arguments":{"path":"/machine/qy7-dispmicom","property":"key-raw","value":"34 81"}}
 {"execute":"qom-set","arguments":{"path":"/machine/qy7-dispmicom","property":"key-raw","value":"36 86 60 01 00"}}
+{"execute":"qom-set","arguments":{"path":"/machine/qy7-dispmicom","property":"key-raw","value":"36 83 3B FF 01"}}
+{"execute":"qom-set","arguments":{"path":"/machine/qy7-dispmicom","property":"key-raw","value":"36 86 6A 01 00"}}
 ```
 
 Spaces, commas, and colons may separate bytes. One to 64 bytes are accepted.
@@ -60,11 +67,17 @@ The diagnostic does not validate command semantics, so use it with a
 read-only guest run. It is enabled only on `clarion-qy7`; QY8 does not enable
 the key input or this property.
 
-Dynamic QY7 replay confirmed that the tested `0x34`, `0x37`, and `0x3f`
-frames reach the `lcddrv` key queue, signal `EVENT_LCD_KEY`, and enter
-KEPDRV's `InputLcdKey` handler. The `0x36 86 60 01 00` body was framed and
-ACKed, but did not increase the queue or `InputLcdKey` count, contrary to the
-static branch analysis at `lcddrv` VA `0x03CF6198`. In the tested headless
-state, KEPDRV's `AuiKeyEvent` took its `PostMessageW` path; its `keybd_event`
-call site was not reached. Tested `0x37` and `0x3f` values produced no
-persistent visible screen change, so their button meanings remain unknown.
+Dynamic QY7 replay confirmed that each tested subtype `36 86 60 xx yy`,
+`36 83 3B FF xx`, and `36 86 6A xx yy` reaches the `lcddrv` key queue,
+signals `EVENT_LCD_KEY`, and enters KEPDRV's `InputLcdKey` handler. KEPDRV
+routes these to distinct state structures, but their physical meanings
+(volume, tune/seek, or channel) are not established. A repeated key-down while
+held is suppressed by the model; key-up still emits its release frame.
+
+In the tested headless state, KEPDRV's `AuiKeyEvent` took its `PostMessageW`
+path; its `keybd_event` call site was not reached. Statically, a nonzero
+readiness flag at `ctx+0x64` selects `PostMessageW`; otherwise
+`IsAPIReady(SH_WMGR)` is checked, and when that is false `IsWindowReady`
+selects `keybd_event` for a ready window or `PostMessageW` otherwise. Tested
+`0x37` caused a black display in the observed state; its semantic meaning is
+unknown.

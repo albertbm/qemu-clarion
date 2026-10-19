@@ -148,6 +148,7 @@ struct ClarionDispMicomState {
     bool touch_dirty;
     bool key_input;
     QemuInputHandlerState *key_input_handler;
+    uint32_t key_down_mask;
 };
 
 static void disp_frame_free(DispFrame *frame)
@@ -494,7 +495,7 @@ typedef struct DispKeyMap {
 
 static const DispKeyMap disp_key_map[] = {
     { KEY_M, 1 },
-    { KEY_S, 2 },
+    { KEY_B, 0x21 },
 };
 
 static void disp_key_event(DeviceState *dev, QemuConsole *src,
@@ -510,6 +511,21 @@ static void disp_key_event(DeviceState *dev, QemuConsole *src,
     }
     for (i = 0; i < ARRAY_SIZE(disp_key_map); i++) {
         if (evt->key.key == disp_key_map[i].qemu_key) {
+            uint32_t bit = 1U << i;
+
+            if (evt->key.down) {
+                if (s->key_down_mask & bit) {
+                    qemu_log("clarion-dispmicom: panel-key repeat-suppressed "
+                             "code=%02x\n", disp_key_map[i].panel_code);
+                    return;
+                }
+                s->key_down_mask |= bit;
+            } else {
+                if (!(s->key_down_mask & bit)) {
+                    return;
+                }
+                s->key_down_mask &= ~bit;
+            }
             data[1] = disp_key_map[i].panel_code |
                       (evt->key.down ? 0x80 : 0x00);
             qemu_log("clarion-dispmicom: panel-key code=%02x down=%u\n",
@@ -666,6 +682,7 @@ static void clarion_dispmicom_reset_hold(Object *obj, ResetType type)
     s->body_len = 0;
     s->bcc = 0;
     s->linked = false;
+    s->key_down_mask = 0;
 }
 
 static void clarion_dispmicom_realize(DeviceState *dev, Error **errp)
