@@ -61,7 +61,9 @@
 /* Index past any -serial the command line can reasonably carry. */
 #define QY7_NO_CHARDEV 31
 #define QY7_SCIF1_BASE 0xffe41000
+#define QY7_SCIF2_BASE 0xffe42000
 #define QY7_SCIF3_BASE 0xffe43000
+#define QY7_SCIF5_BASE 0xffe45000
 #define QY7_SCIF7_BASE 0xffe47000
 /*
  * The ninth serial_scif.dll instance (registry key Drivers\BuiltIn\HSCIF,
@@ -433,7 +435,7 @@ static void qy7_init(MachineState *machine)
     memory_region_add_subregion(sysmem, A7ADDR(QY7_2DG_BASE), g2d_alias);
     /* SCIF6 carries the IPL console on the first -serial chardev. */
     qy7_scif_with_alias_serial(sysmem, QY7_SCIF_BASE, "qy7.scif", 6, 0,
-                               NULL);
+                               clarion_qy7_int2_scif_irq(int2, 6));
     /*
      * SCIF0: CelaviDrv.dll opens "SCI0:" and serial_scif.dll then polls
      * SCFSR.TEND at 0xffe40010.  The first -serial belongs to the block at
@@ -441,12 +443,16 @@ static void qy7_init(MachineState *machine)
      */
     qy7_scif_with_alias_serial(sysmem, QY7_SCIF0_BASE, "qy7.scif0", 0,
                                QY7_NO_CHARDEV, NULL);
+    qy7_scif_with_alias(sysmem, QY7_SCIF2_BASE, "qy7.scif2", 2,
+                        clarion_qy7_int2_scif_irq(int2, 2));
+    qy7_scif_with_alias(sysmem, QY7_SCIF5_BASE, "qy7.scif5", 5,
+                        clarion_qy7_int2_scif_irq(int2, 5));
     /*
      * SCIF1: the routine at serial_scif.dll+0x8c18 polls SCFSR.TEND
      * (bit 6, offset 0x10) of this channel.
      */
     scif1 = qy7_scif_with_alias(sysmem, QY7_SCIF1_BASE, "qy7.scif1", 1,
-                                NULL);
+                                clarion_qy7_int2_scif_irq(int2, 1));
     scif1->dmac = dmac;
     scif1->dma_feed = clarion_hpbdma_feed;
     scif1->dma_eod = clarion_hpbdma_eod;
@@ -466,7 +472,8 @@ static void qy7_init(MachineState *machine)
         clarion_micom_set_sink(micom, qy7_micom_sink, scif1);
     }
     /* SCIF3: the same polling routine, SCFSR at VA 0x2b0010. */
-    scif3 = qy7_scif_with_alias(sysmem, QY7_SCIF3_BASE, "qy7.scif3", 3, NULL);
+    scif3 = qy7_scif_with_alias(sysmem, QY7_SCIF3_BASE, "qy7.scif3", 3,
+                                clarion_qy7_int2_scif_irq(int2, 3));
     scif3->dmac = dmac;
     scif3->dma_feed = clarion_hpbdma_feed;
     scif3->dma_eod = clarion_hpbdma_eod;
@@ -479,7 +486,8 @@ static void qy7_init(MachineState *machine)
     scif3->dispmicom_tx = clarion_dispmicom_rx_byte;
     clarion_dispmicom_set_sink(dispmicom, qy7_dispmicom_sink, disp_sink);
     /* SCIF7: the same polling routine, SCFSR at VA 0x2f0010. */
-    qy7_scif_with_alias(sysmem, QY7_SCIF7_BASE, "qy7.scif7", 7, NULL);
+    qy7_scif_with_alias(sysmem, QY7_SCIF7_BASE, "qy7.scif7", 7,
+                        clarion_qy7_int2_scif_irq(int2, 7));
     /* HSCIF: the same polling routine, SCFSR at VA 0x00e40010 (area 7). */
     qy7_scif_with_alias(sysmem, QY7_HSCIF_BASE, "qy7.hscif", 8, NULL);
     clarion_usbphy_init(sysmem, QY7_USBPHY_BASE, 2, "qy7.usbphy");

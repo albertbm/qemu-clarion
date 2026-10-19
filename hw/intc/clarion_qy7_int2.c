@@ -64,8 +64,11 @@
 #define INT2_DISPLAY_INDEX (INT2_TMU_CHANNELS + INT2_HPB_CHANNELS)
 #define INT2_SDHI_INDEX (INT2_DISPLAY_INDEX + INT2_DISPLAY_SOURCES)
 #define INT2_UART_INDEX (INT2_SDHI_INDEX + INT2_SDHI_SOURCES)
+#define INT2_SCIF_CHANNELS 6
+#define INT2_SCIF_INDEX (INT2_UART_INDEX + 1)
 #define INT2_SOURCE_COUNT (INT2_TMU_CHANNELS + INT2_HPB_CHANNELS + \
-                           INT2_DISPLAY_SOURCES + INT2_SDHI_SOURCES + 1)
+                           INT2_DISPLAY_SOURCES + INT2_SDHI_SOURCES + \
+                           1 + INT2_SCIF_CHANNELS)
 /*
  * Sub-CPU link UART (CAN.dll registers SYSINTR 26 for it).  The ISRs that
  * return SYSINTR 26 sit in slots 63 (vector 0x9e0) and 65 (vector 0xa20);
@@ -73,6 +76,8 @@
  */
 #define INT2_UART_GROUP_BIT 18
 #define INT2_UART_SLOT      63
+#define INT2_SCIF_GROUP_BIT 14
+#define INT2_SCIF_CHANNEL_COUNT 8
 #define INT2_UNK_SLOTS    (INT2_SIZE / 4)
 
 /*
@@ -113,6 +118,8 @@ struct ClarionQy7Int2 {
     uint32_t sdhi_pending;
     qemu_irq uart_irq;
     bool uart_pending;
+    qemu_irq scif_irq[INT2_SCIF_CHANNEL_COUNT];
+    uint32_t scif_pending;
     uint32_t unk[INT2_UNK_SLOTS];
 };
 
@@ -199,6 +206,31 @@ static void int2_update(ClarionQy7Int2 *s)
                           !(s->mask & BIT(INT2_UART_GROUP_BIT));
         pending += source->pending;
     }
+    {
+        static const uint8_t channels[INT2_SCIF_CHANNELS] = {
+            1, 2, 3, 5, 6, 7,
+        };
+        static const uint16_t vectors[INT2_SCIF_CHANNELS] = {
+            0x8e0, 0x900, 0x920, 0x960, 0x980, 0x9a0,
+        };
+        static const uint8_t slots[INT2_SCIF_CHANNELS] = {
+            55, 56, 57, 59, 60, 61,
+        };
+
+        for (int i = 0; i < INT2_SCIF_CHANNELS; i++) {
+            uint8_t priority = 0;
+            struct intc_source *source = &s->src[INT2_SCIF_INDEX + i];
+            bool ok = int2_guest_read(INT2_HPB_PRIO_BASE + slots[i],
+                                      &priority, sizeof(priority));
+
+            source->vect = vectors[i];
+            source->priority = priority;
+            source->pending = ok && priority &&
+                              (s->scif_pending & BIT(channels[i])) &&
+                              !(s->mask & BIT(INT2_SCIF_GROUP_BIT));
+            pending += source->pending;
+        }
+    }
     s->desc.pending = pending;
     if (pending) {
         cpu_interrupt(s->cpu, CPU_INTERRUPT_HARD);
@@ -258,6 +290,14 @@ static void int2_uart_set(void *opaque, int n, int level)
     int2_update(s);
 }
 
+static void int2_scif_set(void *opaque, int n, int level)
+{
+    ClarionQy7Int2 *s = opaque;
+
+    s->scif_pending = deposit32(s->scif_pending, n, 1, !!level);
+    int2_update(s);
+}
+
 static uint64_t int2_reg_read(ClarionQy7Int2 *s, hwaddr addr)
 {
     switch (addr) {
@@ -266,7 +306,8 @@ static uint64_t int2_reg_read(ClarionQy7Int2 *s, hwaddr addr)
     case INT2_PRIO1:
         return s->prio[1];
     case 0x3c:
-        return (s->sdhi_pending ? BIT(29) : 0) |
+        return (s->scif_pending ? BIT(INT2_SCIF_GROUP_BIT) : 0) |
+               (s->sdhi_pending ? BIT(29) : 0) |
                (s->uart_pending ? BIT(INT2_UART_GROUP_BIT) : 0);
     case INT2_MASK_SET:
         return s->mask;
@@ -337,6 +378,7 @@ static void int2_reset(void *opaque)
     s->du_pending = false;
     s->sdhi_pending = 0;
     s->uart_pending = false;
+    s->scif_pending = 0;
     memset(s->unk, 0, sizeof(s->unk));
     int2_update(s);
 }
@@ -370,6 +412,9 @@ ClarionQy7Int2 *clarion_qy7_int2_init(MemoryRegion *sysmem, hwaddr base,
     for (int i = 0; i < INT2_HPB_CHANNELS; i++) {
         s->hpb_irq[i] = qemu_allocate_irq(int2_hpb_set, s, i);
     }
+    for (int i = 0; i < INT2_SCIF_CHANNEL_COUNT; i++) {
+        s->scif_irq[i] = qemu_allocate_irq(int2_scif_set, s, i);
+    }
     s->g2d_irq = qemu_allocate_irq(int2_g2d_set, s, 0);
     s->du_irq = qemu_allocate_irq(int2_du_set, s, 0);
     for (int i = 0; i < INT2_SDHI_SOURCES; i++) {
@@ -398,6 +443,12 @@ qemu_irq clarion_qy7_int2_hpb_channel_irq(ClarionQy7Int2 *s, int channel)
 {
     g_assert(channel >= 0 && channel < INT2_HPB_CHANNELS);
     return s->hpb_irq[channel];
+}
+
+qemu_irq clarion_qy7_int2_scif_irq(ClarionQy7Int2 *s, int channel)
+{
+    g_assert(channel >= 0 && channel < INT2_SCIF_CHANNEL_COUNT);
+    return s->scif_irq[channel];
 }
 
 
