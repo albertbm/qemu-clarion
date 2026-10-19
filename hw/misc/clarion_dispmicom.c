@@ -60,9 +60,11 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
+#include "qapi/error.h"
 #include "hw/misc/clarion_dispmicom.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
+#include "standard-headers/linux/input-event-codes.h"
 #include "ui/input.h"
 
 #define DLE     0x10
@@ -72,6 +74,13 @@
 #define NAK     0x15
 
 #define DISP_MAX_DATA       64
+#define DISP_ACK_TIMEOUT_NS (500 * 1000 * 1000)
+#define DISP_ACK_RETRIES    3
+
+typedef struct DispFrame {
+    GByteArray *bytes;
+    bool wait_ack;
+} DispFrame;
 
 /* Коди, розібрані в lcddrv.dll. */
 #define CMD_INFO_REQ        0x23    /* HU -> панель: запит інформації */
@@ -82,6 +91,7 @@
 #define CMD_REPORT          0x43
 #define CMD_KEEPALIVE       0x71
 #define CMD_TOUCH           0x51
+#define CMD_PANEL_KEY       0x34
 
 /*
  * Пауза між кадрами — така сама, як у моделі МК плати: приймач SCIF має
@@ -118,9 +128,11 @@ struct ClarionDispMicomState {
     void *sink_opaque;
 
     QEMUTimer *tx;
-    GQueue *frames;             /* черга GByteArray * — готові кадри */
-    GByteArray *cur;            /* кадр, який зараз віддаємо */
+    GQueue *frames;             /* queued panel frames */
+    DispFrame *cur;             /* frame currently being sent */
+    DispFrame *awaiting_ack;    /* sent key frame awaiting DLE ACK */
     unsigned cur_off;           /* скільки з нього вже прийнято */
+    unsigned ack_retries;
 
     DispRxState rx_state;
     uint8_t body[DISP_MAX_DATA];
@@ -134,7 +146,17 @@ struct ClarionDispMicomState {
     uint16_t touch_y;
     bool touch_down;
     bool touch_dirty;
+    bool key_input;
+    QemuInputHandlerState *key_input_handler;
 };
+
+static void disp_frame_free(DispFrame *frame)
+{
+    if (frame) {
+        g_byte_array_free(frame->bytes, TRUE);
+        g_free(frame);
+    }
+}
 
 /* --- побудова кадру ---------------------------------------------------- */
 
@@ -186,22 +208,38 @@ static void disp_trace(const char *direction, const uint8_t *data,
 static void disp_queue(ClarionDispMicomState *s, const uint8_t *data,
                        unsigned len)
 {
-    g_queue_push_tail(s->frames, disp_build(data, len));
-    if (!s->cur) {
+    DispFrame *frame = g_new0(DispFrame, 1);
+
+    frame->bytes = disp_build(data, len);
+    g_queue_push_tail(s->frames, frame);
+    if (!s->cur && !s->awaiting_ack) {
+        disp_arm(s, DISP_FILL_NS);
+    }
+}
+
+static void disp_queue_key(ClarionDispMicomState *s, const uint8_t *data,
+                           unsigned len)
+{
+    DispFrame *frame = g_new0(DispFrame, 1);
+
+    frame->bytes = disp_build(data, len);
+    frame->wait_ack = true;
+    g_queue_push_tail(s->frames, frame);
+    if (!s->cur && !s->awaiting_ack) {
         disp_arm(s, DISP_FILL_NS);
     }
 }
 
 static void disp_queue_ack(ClarionDispMicomState *s, uint8_t code)
 {
-    GByteArray *f = g_byte_array_new();
+    DispFrame *frame = g_new0(DispFrame, 1);
     uint8_t b = DLE;
 
-
-    g_byte_array_append(f, &b, 1);
-    g_byte_array_append(f, &code, 1);
-    g_queue_push_head(s->frames, f);        /* квитанція йде поперед черги */
-    if (!s->cur) {
+    frame->bytes = g_byte_array_new();
+    g_byte_array_append(frame->bytes, &b, 1);
+    g_byte_array_append(frame->bytes, &code, 1);
+    g_queue_push_head(s->frames, frame);
+    if (!s->cur && !s->awaiting_ack) {
         disp_arm(s, DISP_FILL_NS);
     }
 }
@@ -214,7 +252,27 @@ static void disp_tx_expire(void *opaque)
     int took;
 
     if (!s->cur) {
-        s->cur = g_queue_pop_head(s->frames);
+        if (s->awaiting_ack) {
+            if (s->ack_retries >= DISP_ACK_RETRIES) {
+                qemu_log("clarion-dispmicom: key-ack-timeout retries=%u\n",
+                         s->ack_retries);
+                disp_frame_free(s->awaiting_ack);
+                s->awaiting_ack = NULL;
+                s->ack_retries = 0;
+                if (!g_queue_is_empty(s->frames)) {
+                    disp_arm(s, DISP_GAP_NS);
+                }
+                return;
+            }
+            s->cur = s->awaiting_ack;
+            s->awaiting_ack = NULL;
+            s->cur_off = 0;
+            s->ack_retries++;
+            qemu_log("clarion-dispmicom: key-ack-retry attempt=%u\n",
+                     s->ack_retries);
+        } else {
+            s->cur = g_queue_pop_head(s->frames);
+        }
         s->cur_off = 0;
         if (!s->cur) {
             return;
@@ -223,20 +281,20 @@ static void disp_tx_expire(void *opaque)
     if (!s->sink) {
         return;
     }
-    took = s->sink(s->sink_opaque, s->cur->data + s->cur_off,
-                   s->cur->len - s->cur_off);
+    took = s->sink(s->sink_opaque, s->cur->bytes->data + s->cur_off,
+                   s->cur->bytes->len - s->cur_off);
     if (took > 0) {
         if (!s->cur_off) {
-            if (s->cur->len == 2) {
-                disp_trace("panel-tx", s->cur->data, 2);
+            if (s->cur->bytes->len == 2) {
+                disp_trace("panel-tx", s->cur->bytes->data, 2);
             } else {
                 uint8_t data[DISP_MAX_DATA];
                 unsigned len = 0;
                 unsigned i;
 
-                for (i = 2; i < s->cur->len - 3; i++) {
-                    data[len++] = s->cur->data[i];
-                    if (s->cur->data[i] == DLE) {
+                for (i = 2; i < s->cur->bytes->len - 3; i++) {
+                    data[len++] = s->cur->bytes->data[i];
+                    if (s->cur->bytes->data[i] == DLE) {
                         i++;
                     }
                 }
@@ -245,8 +303,15 @@ static void disp_tx_expire(void *opaque)
         }
         s->cur_off += took;
     }
-    if (s->cur_off >= s->cur->len) {
-        g_byte_array_free(s->cur, TRUE);
+    if (s->cur_off >= s->cur->bytes->len) {
+        if (s->cur->wait_ack) {
+            s->awaiting_ack = s->cur;
+            s->cur = NULL;
+            s->cur_off = 0;
+            disp_arm(s, DISP_ACK_TIMEOUT_NS);
+            return;
+        }
+        disp_frame_free(s->cur);
         s->cur = NULL;
         s->cur_off = 0;
         if (!g_queue_is_empty(s->frames)) {
@@ -254,6 +319,40 @@ static void disp_tx_expire(void *opaque)
         }
     } else {
         disp_arm(s, DISP_FILL_NS);          /* FIFO повний — доллємо згодом */
+    }
+}
+
+static void disp_guest_ack(ClarionDispMicomState *s, uint8_t code)
+{
+    if (!s->awaiting_ack) {
+        return;
+    }
+    timer_del(s->tx);
+    if (code == ACK) {
+        qemu_log("clarion-dispmicom: key-ack accepted retries=%u\n",
+                 s->ack_retries);
+        disp_frame_free(s->awaiting_ack);
+        s->awaiting_ack = NULL;
+        s->ack_retries = 0;
+        if (!g_queue_is_empty(s->frames)) {
+            disp_arm(s, DISP_GAP_NS);
+        }
+    } else {
+        qemu_log("clarion-dispmicom: key-nak retries=%u\n", s->ack_retries);
+        if (s->ack_retries >= DISP_ACK_RETRIES) {
+            disp_frame_free(s->awaiting_ack);
+            s->awaiting_ack = NULL;
+            s->ack_retries = 0;
+            if (!g_queue_is_empty(s->frames)) {
+                disp_arm(s, DISP_GAP_NS);
+            }
+        } else {
+            s->cur = s->awaiting_ack;
+            s->awaiting_ack = NULL;
+            s->cur_off = 0;
+            s->ack_retries++;
+            disp_arm(s, DISP_FILL_NS);
+        }
     }
 }
 
@@ -388,6 +487,45 @@ static const QemuInputHandler disp_touch_handler = {
     .sync = disp_touch_sync,
 };
 
+typedef struct DispKeyMap {
+    unsigned int qemu_key;
+    uint8_t panel_code;
+} DispKeyMap;
+
+static const DispKeyMap disp_key_map[] = {
+    { KEY_M, 1 },
+    { KEY_S, 2 },
+};
+
+static void disp_key_event(DeviceState *dev, QemuConsole *src,
+                           QemuInputEvent *evt)
+{
+    ClarionDispMicomState *s = CLARION_DISPMICOM(dev);
+    uint8_t data[2] = { CMD_PANEL_KEY, 0 };
+    unsigned int i;
+
+    (void)src;
+    if (evt->type != INPUT_EVENT_KIND_KEY) {
+        return;
+    }
+    for (i = 0; i < ARRAY_SIZE(disp_key_map); i++) {
+        if (evt->key.key == disp_key_map[i].qemu_key) {
+            data[1] = disp_key_map[i].panel_code |
+                      (evt->key.down ? 0x80 : 0x00);
+            qemu_log("clarion-dispmicom: panel-key code=%02x down=%u\n",
+                     disp_key_map[i].panel_code, evt->key.down);
+            disp_queue_key(s, data, sizeof(data));
+            return;
+        }
+    }
+}
+
+static const QemuInputHandler disp_key_handler = {
+    .name = "qy7-panel-keys",
+    .mask = INPUT_EVENT_MASK_KEY,
+    .event = disp_key_event,
+};
+
 /* --- розбір потоку від гостя ------------------------------------------- */
 
 void clarion_dispmicom_rx_byte(DeviceState *dev, uint8_t b)
@@ -411,6 +549,7 @@ void clarion_dispmicom_rx_byte(DeviceState *dev, uint8_t b)
         } else {
             if (b == ACK || b == NAK) {
                 disp_trace("guest-tx", (const uint8_t[]){ DLE, b }, 2);
+                disp_guest_ack(s, b);
             }
             /* DLE ACK / DLE NAK від гостя — підтвердження наших кадрів */
             s->rx_state = RX_IDLE;
@@ -453,6 +592,50 @@ void clarion_dispmicom_rx_byte(DeviceState *dev, uint8_t b)
     }
 }
 
+static void disp_set_key_raw(Object *obj, const char *value, Error **errp)
+{
+    ClarionDispMicomState *s = CLARION_DISPMICOM(obj);
+    uint8_t data[DISP_MAX_DATA];
+    const char *p = value;
+    unsigned len = 0;
+
+    if (!s->key_input) {
+        error_setg(errp, "raw panel keys are enabled only on QY7");
+        return;
+    }
+    while (*p) {
+        char *end;
+        unsigned long byte;
+
+        while (g_ascii_isspace(*p) || *p == ',' || *p == ':') {
+            p++;
+        }
+        if (!*p) {
+            break;
+        }
+        if (!g_ascii_isxdigit(*p) || len == DISP_MAX_DATA) {
+            error_setg(errp, "key-raw expects 1 to %u hex bytes",
+                       DISP_MAX_DATA);
+            return;
+        }
+        errno = 0;
+        byte = g_ascii_strtoull(p, &end, 16);
+        if (errno || end == p || byte > 0xff ||
+            (*end && !g_ascii_isspace(*end) && *end != ',' && *end != ':')) {
+            error_setg(errp, "invalid key-raw byte near '%s'", p);
+            return;
+        }
+        data[len++] = byte;
+        p = end;
+    }
+    if (!len) {
+        error_setg(errp, "key-raw requires at least a command byte");
+        return;
+    }
+    disp_trace("key-raw", data, len);
+    disp_queue_key(s, data, len);
+}
+
 void clarion_dispmicom_set_sink(DeviceState *dev, ClarionDispMicomSink fn,
                                 void *opaque)
 {
@@ -469,13 +652,16 @@ static void clarion_dispmicom_reset_hold(Object *obj, ResetType type)
     ClarionDispMicomState *s = CLARION_DISPMICOM(obj);
 
     while (!g_queue_is_empty(s->frames)) {
-        g_byte_array_free(g_queue_pop_head(s->frames), TRUE);
+        disp_frame_free(g_queue_pop_head(s->frames));
     }
     if (s->cur) {
-        g_byte_array_free(s->cur, TRUE);
+        disp_frame_free(s->cur);
         s->cur = NULL;
     }
+    disp_frame_free(s->awaiting_ack);
+    s->awaiting_ack = NULL;
     s->cur_off = 0;
+    s->ack_retries = 0;
     s->rx_state = RX_IDLE;
     s->body_len = 0;
     s->bcc = 0;
@@ -488,6 +674,13 @@ static void clarion_dispmicom_realize(DeviceState *dev, Error **errp)
 
     s->frames = g_queue_new();
     s->tx = timer_new_ns(QEMU_CLOCK_VIRTUAL, disp_tx_expire, s);
+    if (s->key_input) {
+        s->key_input_handler =
+            qemu_input_handler_register(dev, &disp_key_handler);
+        qemu_input_handler_activate(s->key_input_handler);
+        object_property_add_str(OBJECT(s), "key-raw", NULL,
+                                disp_set_key_raw);
+    }
     if (s->touch_input) {
         s->input_handler =
             qemu_input_handler_register(dev, &disp_touch_handler);
@@ -497,6 +690,7 @@ static void clarion_dispmicom_realize(DeviceState *dev, Error **errp)
 
 static const Property clarion_dispmicom_props[] = {
     DEFINE_PROP_BOOL("touch-input", ClarionDispMicomState, touch_input, false),
+    DEFINE_PROP_BOOL("key-input", ClarionDispMicomState, key_input, false),
 };
 
 static void clarion_dispmicom_class_init(ObjectClass *klass, const void *data)
