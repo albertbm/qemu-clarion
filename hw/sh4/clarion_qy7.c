@@ -286,14 +286,14 @@ static void qy7_report_invalid_model(const char *model)
 static ClarionScif *qy7_scif_with_alias_serial(MemoryRegion *sysmem,
                                                hwaddr base, const char *name,
                                                int index, int serial_index,
-                                               qemu_irq irq)
+                                               qemu_irq irq, bool txi)
 {
     ClarionScif *scif = g_new0(ClarionScif, 1);
     MemoryRegion *alias = g_new0(MemoryRegion, 1);
     g_autofree char *alias_name = g_strdup_printf("%s-a7", name);
 
     clarion_scif_init(scif, sysmem, base, name, index, serial_index, irq,
-                      NULL, false);
+                      NULL, txi);
     memory_region_init_alias(alias, NULL, alias_name, &scif->mr, 0, 0x100);
     memory_region_add_subregion(sysmem, A7ADDR(base), alias);
     return scif;
@@ -303,7 +303,8 @@ static ClarionScif *qy7_scif_with_alias(MemoryRegion *sysmem, hwaddr base,
                                         const char *name, int index,
                                         qemu_irq irq)
 {
-    return qy7_scif_with_alias_serial(sysmem, base, name, index, index, irq);
+    return qy7_scif_with_alias_serial(sysmem, base, name, index, index, irq,
+                                      false);
 }
 
 static void qy7_init(MachineState *machine)
@@ -435,14 +436,14 @@ static void qy7_init(MachineState *machine)
     memory_region_add_subregion(sysmem, A7ADDR(QY7_2DG_BASE), g2d_alias);
     /* SCIF6 carries the IPL console on the first -serial chardev. */
     qy7_scif_with_alias_serial(sysmem, QY7_SCIF_BASE, "qy7.scif", 6, 0,
-                               clarion_qy7_int2_scif_irq(int2, 6));
+                               clarion_qy7_int2_scif_irq(int2, 6), true);
     /*
      * SCIF0: CelaviDrv.dll opens "SCI0:" and serial_scif.dll then polls
      * SCFSR.TEND at 0xffe40010.  The first -serial belongs to the block at
      * 0xffe46000 above, so this one gets no host character device.
      */
     qy7_scif_with_alias_serial(sysmem, QY7_SCIF0_BASE, "qy7.scif0", 0,
-                               QY7_NO_CHARDEV, NULL);
+                               QY7_NO_CHARDEV, NULL, false);
     qy7_scif_with_alias(sysmem, QY7_SCIF2_BASE, "qy7.scif2", 2,
                         clarion_qy7_int2_scif_irq(int2, 2));
     qy7_scif_with_alias(sysmem, QY7_SCIF5_BASE, "qy7.scif5", 5,
