@@ -22,15 +22,17 @@ waits for the guest's `DLE ACK` before completing the key event.
 
 | Host key | Panel control | Panel code | Evidence |
 |---|---|---:|---|
-| `M` | MAP/VOICE | `0x01` | Active KEPDRV tables map `01 -> 01 -> 0x22`; frame reaches `AuiKeyEvent`. |
-| `B` | Brightness/day-night control (inferred) | `0x21` | Active tables map `21 -> 02 -> 0xD9`; this panel code showed the `Lysstyrke` brightness overlay (observed with its previous host alias `S`). |
+| `M` | MAP/VOICE | `0x01` | Active KEPDRV tables map `01 -> 01 -> 0x22`; frame reaches `AuiKeyEvent`. An early UI run showed the map after M. |
+| `B` | Brightness/day-night control (inferred) | `0x21` | Active tables map `21 -> 02 -> 0xD9`; an early UI run showed `Lysstyrke` for this code under the previous host alias `S`. |
 
 The active QY7 `kepdrv.dll` table observed after boot has two first-stage
 entries, `01 -> 01` and `21 -> 02`, and two second-stage entries,
 `01 -> 0x22` and `02 -> 0xD9`. Both codes reach `AuiKeyEvent`; the first
 translation is VK `0x22`, while the second is `0xD9`. The displayed brightness
-overlay associates code `0x21` with brightness/day-night control, but its
-physical button label remains an inference from the panel photo.
+overlay associated code `0x21` with brightness/day-night control in an early
+UI run. The final replay stayed in a blank post-consent transition, so those
+visible effects were not reproduced. The physical button label remains an
+inference from the panel photo.
 
 The panel photo also shows MENU, STATUS, TUNE/SEEK/CH, FM-AM, XM, CD-AUX,
 VOL+/VOL−, CAMERA, OPEN/TILT, power, and Zero Emission. Their protocol codes
@@ -81,3 +83,7 @@ readiness flag at `ctx+0x64` selects `PostMessageW`; otherwise
 selects `keybd_event` for a ready window or `PostMessageW` otherwise. Tested
 `0x37` caused a black display in the observed state; its semantic meaning is
 unknown.
+
+The `PostMessageW` branch targets the HWND stored in KEPDRV's context and
+posts `WM_KEYDOWN`/`WM_KEYUP` with the translated VK. The window's application
+identity was not recovered from the available runtime state.
