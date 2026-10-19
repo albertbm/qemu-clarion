@@ -509,6 +509,8 @@ static void qy7_init(MachineState *machine)
         object_property_set_link(OBJECT(sdhi), "dmac", OBJECT(dmac),
                                  &error_fatal);
         qdev_prop_set_uint64(sdhi, "dma-buf-addr", 0xffe4c030);
+        /* The firmware SD host driver uses a 42000 kHz input clock. */
+        qdev_prop_set_uint32(sdhi, "input-clock-hz", 42000000);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(sdhi), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(sdhi), 0, 0xffe4c000);
         sysbus_connect_irq(SYS_BUS_DEVICE(sdhi), 0,

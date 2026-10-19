@@ -57,6 +57,7 @@
 #include "qapi/error.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qemu/timer.h"
 #include "hw/core/irq.h"
 #include "hw/core/sysbus.h"
 #include "hw/sd/sd.h"
@@ -177,6 +178,13 @@ struct RenesasSDHIState {
     MemoryRegion iomem;
     qemu_irq irq;
 
+    QEMUTimer *wire_timer;
+    uint32_t input_clock_hz;
+    uint8_t wire_phase; /* 0: idle, 1: command, 2: read, 3: write, 4: stop */
+    uint64_t wire_cycles;
+    int64_t wire_started_ns;
+    int64_t wire_deadline_ns;
+
     uint8_t unit;               /* номер контролера, лише для трас */
 
     /*
@@ -214,7 +222,7 @@ struct RenesasSDHIState {
 
 static bool sdhi_idle(RenesasSDHIState *s)
 {
-    return !s->reading && !s->writing;
+    return !s->reading && !s->writing && !s->wire_phase;
 }
 
 static bool sdhi_card_present(RenesasSDHIState *s)
@@ -268,6 +276,8 @@ static void sdhi_update_irq(RenesasSDHIState *s)
 
 static void sdhi_abort_data(RenesasSDHIState *s)
 {
+    timer_del(s->wire_timer);
+    s->wire_phase = 0;
     s->reading = s->writing = false;
     s->pos = 0;
     s->blocks = 0;
@@ -293,6 +303,51 @@ static bool sdhi_cmd_has_response(unsigned idx)
     }
 }
 
+/*
+ * TMIO clock encoding: 0xff bypasses the divider, zero divides by two,
+ * and a one-hot value divides by four times that value. The board supplies
+ * the input clock; zero preserves the existing untimed controller.
+ */
+static unsigned sdhi_clock_divisor(RenesasSDHIState *s)
+{
+    unsigned div = s->clk_ctrl & 0xff;
+
+    return div == 0xff ? 1 : (div ? 4 * div : 2);
+}
+
+/*
+ * Start a bus phase. A chained phase continues the previous one on the
+ * bus (next block of a multi-block read, auto-stop after the last block):
+ * it starts when the previous phase was due, not when the guest got round
+ * to asking, so host timer latency does not accumulate across blocks.
+ */
+static void sdhi_wire_wait(RenesasSDHIState *s, uint8_t phase,
+                           uint64_t cycles, bool chain)
+{
+    uint64_t ns;
+
+    s->wire_phase = phase;
+    s->wire_cycles = cycles;
+    s->wire_started_ns = chain ? s->wire_deadline_ns :
+                         qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    timer_del(s->wire_timer);
+    if (!(s->clk_ctrl & CLK_SCLKEN)) {
+        return;
+    }
+    ns = DIV_ROUND_UP(cycles * sdhi_clock_divisor(s) * NANOSECONDS_PER_SECOND,
+                      s->input_clock_hz);
+    s->wire_deadline_ns = s->wire_started_ns + ns;
+    timer_mod(s->wire_timer, s->wire_deadline_ns);
+}
+
+static uint64_t sdhi_block_cycles(RenesasSDHIState *s)
+{
+    unsigned width = s->option & 0x8000 ? 1 : 4;
+
+    /* A start bit, 16 CRC bits and an end bit on each data line. */
+    return DIV_ROUND_UP((uint64_t)s->blen * 8, width) + 18;
+}
+
 static void sdhi_fill_block(RenesasSDHIState *s)
 {
     bool ready = sdbus_data_ready(&s->sdbus);
@@ -315,10 +370,12 @@ static void sdhi_fill_block(RenesasSDHIState *s)
         }
         if (file) {
             fprintf(file,
-                    "{\"unit\":%u,\"cmd\":%u,\"block\":%u,"
+                    "{\"now_ns\":%" PRId64 ",\"unit\":%u,"
+                    "\"cmd\":%u,\"block\":%u,"
                     "\"block_index\":%u,\"blocks\":%u,"
                     "\"bytes\":%u,\"ready\":%s,\"all_zero\":%s,"
                     "\"result\":\"%s\"}\n",
+                    qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
                     s->unit, s->cmd & CMD_IDX, s->read_sector,
                     s->read_index, s->read_total, s->blen,
                     ready ? "true" : "false",
@@ -350,8 +407,8 @@ static bool sdhi_dma_ready(void *opaque)
 {
     RenesasSDHIState *s = opaque;
 
-    return s->dmac && s->reading && (s->cc_ext_mode & CC_EXT_DMASDRW) &&
-           s->pos < s->blen;
+    return !s->wire_phase && s->dmac && s->reading &&
+           (s->cc_ext_mode & CC_EXT_DMASDRW) && s->pos < s->blen;
 }
 
 static void sdhi_start_data(RenesasSDHIState *s)
@@ -382,7 +439,12 @@ static void sdhi_start_data(RenesasSDHIState *s)
 
     if (s->cmd & CMD_READ) {
         s->reading = true;
-        sdhi_fill_block(s);
+        if (s->input_clock_hz) {
+            s->info2 &= ~INFO2_RXRDY;
+            sdhi_wire_wait(s, 2, sdhi_block_cycles(s), false);
+        } else {
+            sdhi_fill_block(s);
+        }
         /*
          * Блок уже в буфері, а канал DMAC на цій платі озброюють ПІСЛЯ
          * команди (траса: DCR/DSAR/DDAR/DTCR -> CMD17 -> DCMDR.DMEN).
@@ -399,7 +461,7 @@ static void sdhi_start_data(RenesasSDHIState *s)
     }
 }
 
-static void sdhi_send_command(RenesasSDHIState *s)
+static void sdhi_execute_command(RenesasSDHIState *s)
 {
     unsigned idx = s->cmd & CMD_IDX;
     SDRequest req;
@@ -480,6 +542,26 @@ static void sdhi_send_command(RenesasSDHIState *s)
     sdhi_update_irq(s);
 }
 
+static void sdhi_send_command(RenesasSDHIState *s)
+{
+    unsigned idx = s->cmd & CMD_IDX;
+    unsigned response_bits;
+
+    if (!s->input_clock_hz) {
+        sdhi_execute_command(s);
+        return;
+    }
+    if (!(s->soft_rst & SOFT_RST_RELEASE)) {
+        return;
+    }
+    sdhi_abort_data(s);
+    response_bits = (s->cmd & CMD_RSPTP) == CMD_RSPTP_NONE ||
+                    !sdhi_cmd_has_response(idx) ? 0 :
+                    (idx == 2 || idx == 9 || idx == 10 ? 136 : 48);
+    /* Command packet and response packet, excluding card-internal latency. */
+    sdhi_wire_wait(s, 1, 48 + response_bits, false);
+}
+
 /* --- порт даних ------------------------------------------------------- */
 
 static void sdhi_block_done(RenesasSDHIState *s)
@@ -487,7 +569,12 @@ static void sdhi_block_done(RenesasSDHIState *s)
     s->blocks--;
     if (s->blocks) {
         if (s->reading) {
-            sdhi_fill_block(s);
+            if (s->input_clock_hz) {
+                s->info2 &= ~INFO2_RXRDY;
+                sdhi_wire_wait(s, 2, sdhi_block_cycles(s), true);
+            } else {
+                sdhi_fill_block(s);
+            }
         } else {
             s->pos = 0;
         }
@@ -495,6 +582,10 @@ static void sdhi_block_done(RenesasSDHIState *s)
     }
     if ((s->cmd & CMD_MULTI) && (s->stop & STOP_SEC) &&
         !(s->cmd & CMD_NOAUTOSTOP)) {
+        if (s->input_clock_hz) {
+            sdhi_wire_wait(s, 4, 48 + 48, true);
+            return;
+        }
         SDRequest req = { .cmd = 12, .arg = 0 };
         uint8_t rsp[16];
 
@@ -509,7 +600,7 @@ static uint64_t sdhi_buf_read(RenesasSDHIState *s, unsigned size)
     uint64_t v = 0;
     unsigned i;
 
-    if (!s->reading) {
+    if (!s->reading || s->wire_phase) {
         s->info2 |= INFO2_ILL_ACCESS;
         sdhi_update_irq(s);
         return 0;
@@ -529,7 +620,7 @@ static void sdhi_buf_write(RenesasSDHIState *s, uint64_t val, unsigned size)
 {
     unsigned i;
 
-    if (!s->writing) {
+    if (!s->writing || s->wire_phase) {
         s->info2 |= INFO2_ILL_ACCESS;
         sdhi_update_irq(s);
         return;
@@ -537,10 +628,53 @@ static void sdhi_buf_write(RenesasSDHIState *s, uint64_t val, unsigned size)
     for (i = 0; i < size; i++) {
         s->buf[s->pos++] = (val >> (8 * i)) & 0xff;
         if (s->pos >= s->blen) {
-            sdbus_write_data(&s->sdbus, s->buf, s->blen);
-            sdhi_block_done(s);
+            if (s->input_clock_hz) {
+                s->info2 &= ~INFO2_TXRQ;
+                sdhi_wire_wait(s, 3, sdhi_block_cycles(s), false);
+            } else {
+                sdbus_write_data(&s->sdbus, s->buf, s->blen);
+                sdhi_block_done(s);
+            }
             break;
         }
+    }
+    sdhi_update_irq(s);
+}
+
+static void sdhi_wire_expired(void *opaque)
+{
+    RenesasSDHIState *s = opaque;
+    uint8_t phase = s->wire_phase;
+
+    s->wire_phase = 0;
+    switch (phase) {
+    case 1:
+        sdhi_execute_command(s);
+        break;
+    case 2:
+        sdhi_fill_block(s);
+        if (sdhi_dma_ready(s)) {
+            clarion_hpbdma_module_poke(s->dmac, s->dma_buf_addr);
+        }
+        break;
+    case 3:
+        sdbus_write_data(&s->sdbus, s->buf, s->blen);
+        sdhi_block_done(s);
+        if (s->writing) {
+            s->info2 |= INFO2_TXRQ;
+        }
+        break;
+    case 4: {
+        SDRequest req = { .cmd = 12, .arg = 0 };
+        uint8_t rsp[16];
+
+        sdbus_do_command(&s->sdbus, &req, rsp, sizeof(rsp));
+        sdhi_abort_data(s);
+        s->info1 |= INFO1_ACCEND;
+        break;
+    }
+    default:
+        g_assert_not_reached();
     }
     sdhi_update_irq(s);
 }
@@ -638,7 +772,25 @@ static void sdhi_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         s->info2_mask = val;
         sdhi_update_irq(s);
         break;
-    case SD_CLK_CTRL:       s->clk_ctrl = val;  break;
+    case SD_CLK_CTRL:
+        if (s->input_clock_hz && s->wire_phase) {
+            uint64_t elapsed = 0;
+            uint64_t cycles;
+
+            if (s->clk_ctrl & CLK_SCLKEN) {
+                elapsed = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
+                          s->wire_started_ns;
+            }
+            cycles = elapsed * s->input_clock_hz /
+                     ((uint64_t)sdhi_clock_divisor(s) *
+                      NANOSECONDS_PER_SECOND);
+            cycles = MIN(cycles, s->wire_cycles);
+            s->clk_ctrl = val;
+            sdhi_wire_wait(s, s->wire_phase, s->wire_cycles - cycles, false);
+        } else {
+            s->clk_ctrl = val;
+        }
+        break;
     case SD_SIZE:           s->size = val;      break;
     case SD_OPTION:         s->option = val;    break;
     case SDIO_MODE:         s->sdio_mode = val; break;
@@ -760,6 +912,7 @@ static void sdhi_init(Object *obj)
 {
     RenesasSDHIState *s = RENESAS_SDHI(obj);
 
+    s->wire_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, sdhi_wire_expired, s);
     qbus_init(&s->sdbus, sizeof(s->sdbus), TYPE_RENESAS_SDHI_BUS,
               DEVICE(s), "sd-bus");
     memory_region_init_io(&s->iomem, obj, &sdhi_ops, s,
@@ -770,9 +923,16 @@ static void sdhi_init(Object *obj)
     sysbus_init_irq(SYS_BUS_DEVICE(s), &s->irq);
 }
 
+static void sdhi_finalize(Object *obj)
+{
+    RenesasSDHIState *s = RENESAS_SDHI(obj);
+
+    timer_free(s->wire_timer);
+}
+
 static const VMStateDescription vmstate_renesas_sdhi = {
     .name = "renesas-sdhi",
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT16(cmd, RenesasSDHIState),
@@ -807,6 +967,11 @@ static const VMStateDescription vmstate_renesas_sdhi = {
         VMSTATE_UINT32_V(read_sector, RenesasSDHIState, 2),
         VMSTATE_UINT32_V(read_index, RenesasSDHIState, 2),
         VMSTATE_UINT32_V(read_total, RenesasSDHIState, 2),
+        VMSTATE_UINT8_V(wire_phase, RenesasSDHIState, 3),
+        VMSTATE_UINT64_V(wire_cycles, RenesasSDHIState, 3),
+        VMSTATE_INT64_V(wire_started_ns, RenesasSDHIState, 3),
+        VMSTATE_INT64_V(wire_deadline_ns, RenesasSDHIState, 3),
+        VMSTATE_TIMER_PTR_V(wire_timer, RenesasSDHIState, 3),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -831,6 +996,7 @@ static void sdhi_realize(DeviceState *dev, Error **errp)
 }
 
 static const Property sdhi_properties[] = {
+    DEFINE_PROP_UINT32("input-clock-hz", RenesasSDHIState, input_clock_hz, 0),
     DEFINE_PROP_UINT8("unit", RenesasSDHIState, unit, 0),
     /*
      * Контролер DMA плати і фізична адреса власного SD_BUF0. Обидві
@@ -868,6 +1034,7 @@ static const TypeInfo renesas_sdhi_types[] = {
         .parent         = TYPE_SYS_BUS_DEVICE,
         .instance_size  = sizeof(RenesasSDHIState),
         .instance_init  = sdhi_init,
+        .instance_finalize = sdhi_finalize,
         .class_init     = sdhi_class_init,
     },
     {
