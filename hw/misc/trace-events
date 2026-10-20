@@ -460,3 +460,7 @@ launch_update_write(void) ""
 vmlaunch_reset_enter(void) ""
 vm_launchupdate_finalize(void) ""
 restore_host_x86_igvm(void) ""
+
+# clarion_rcan.c
+clarion_rcan_read(uint64_t virtual_ms, uint64_t offset, uint64_t value) "virtual-ms=%" PRIu64 " offset: 0x%03" PRIx64 ", value: 0x%04" PRIx64
+clarion_rcan_write(uint64_t virtual_ms, uint64_t offset, uint64_t value) "virtual-ms=%" PRIu64 " offset: 0x%03" PRIx64 ", value: 0x%04" PRIx64

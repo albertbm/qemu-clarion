@@ -69,6 +69,24 @@ The diagnostic does not validate command semantics, so use it with a
 read-only guest run. It is enabled only on `clarion-qy7`; QY8 does not enable
 the key input or this property.
 
+The QY7 machine also exposes a write-only `can-raw` QOM property for
+diagnosing CAN receive frames. Its value is an 11-bit hexadecimal CAN ID, a
+colon, and one to eight hexadecimal data bytes. QEMU first offers the frame
+to configured RCAN receive mailboxes; if no mailbox accepts the ID, it wraps
+the bytes in the sub-CPU `0x65` receive message and queues it on the UART path.
+This does not model a CAN responder or confirm that a guest driver accepted
+the frame.
+
+For example, send a `PUSH_SW`-shaped body to the SCPU-only ID `0x0280`:
+
+```json
+{"execute":"qom-set","arguments":{"path":"/machine","property":"can-raw","value":"0280:40 0d 81"}}
+{"execute":"qom-set","arguments":{"path":"/machine","property":"can-raw","value":"0280:40 0d 01"}}
+```
+
+Spaces or commas may separate data bytes. Use it with a read-only guest run;
+the machine accepts the property only after its QY7 sub-CPU is initialized.
+
 Dynamic QY7 replay confirmed that each tested subtype `36 86 60 xx yy`,
 `36 83 3B FF xx`, and `36 86 6A xx yy` reaches the `lcddrv` key queue,
 signals `EVENT_LCD_KEY`, and enters KEPDRV's `InputLcdKey` handler. KEPDRV

@@ -16,6 +16,7 @@
 #include "hw/misc/clarion_dispmicom.h"
 #include "hw/misc/clarion_micom.h"
 #include "hw/misc/clarion_scpu.h"
+#include "hw/misc/clarion_rcan.h"
 #include "hw/misc/clarion_bcm.h"
 #include "hw/misc/clarion_boards.h"
 #include "hw/display/clarion_du.h"
@@ -88,6 +89,8 @@ typedef struct QY7MachineState {
     uint8_t micom_generic_reply_subcode;
     bool micom_audio_off;
     bool micom_antitheft_release;
+    DeviceState *scpu;
+    ClarionRcan *rcan;
     uint32_t du_dotclk;
     uint32_t du_panel_width;
     uint32_t du_panel_height;
@@ -205,6 +208,71 @@ static bool qy7_get_bcm(Object *obj, Error **errp)
 static void qy7_set_bcm(Object *obj, bool value, Error **errp)
 {
     ((QY7MachineState *)obj)->bcm_on = value;
+}
+
+static void qy7_set_can_raw(Object *obj, const char *value, Error **errp)
+{
+    QY7MachineState *s = (QY7MachineState *)obj;
+    const char *sep = strchr(value, ':');
+    uint8_t data[8];
+    unsigned len = 0;
+    char *id_text;
+    char *end;
+    unsigned long id;
+    const char *p;
+
+    if (!s->scpu) {
+        error_setg(errp, "can-raw is available after QY7 initialization");
+        return;
+    }
+    if (!sep || sep == value) {
+        error_setg(errp, "can-raw expects ID: byte [byte ...]");
+        return;
+    }
+    id_text = g_strndup(value, sep - value);
+    errno = 0;
+    id = g_ascii_strtoull(id_text, &end, 16);
+    if (errno || end == id_text || *end || id > 0x7ff) {
+        g_free(id_text);
+        error_setg(errp, "can-raw ID must be a 11-bit hexadecimal value");
+        return;
+    }
+    g_free(id_text);
+
+    p = sep + 1;
+    while (*p) {
+        unsigned long byte;
+
+        while (g_ascii_isspace(*p) || *p == ',') {
+            p++;
+        }
+        if (!*p) {
+            break;
+        }
+        if (len == sizeof(data) || !g_ascii_isxdigit(*p)) {
+            error_setg(errp, "can-raw expects 1 to 8 hexadecimal bytes");
+            return;
+        }
+        errno = 0;
+        byte = g_ascii_strtoull(p, &end, 16);
+        if (errno || end == p || byte > 0xff ||
+            (*end && !g_ascii_isspace(*end) && *end != ',')) {
+            error_setg(errp, "invalid can-raw byte near '%s'", p);
+            return;
+        }
+        data[len++] = byte;
+        p = end;
+    }
+    if (!len) {
+        error_setg(errp, "can-raw requires at least one data byte");
+        return;
+    }
+
+    qemu_log("clarion-qy7: can-raw inject id=%03lx len=%u\n", id, len);
+    if (clarion_rcan_inject(s->rcan, id, data, len)) {
+        return;
+    }
+    clarion_scpu_can_rx(s->scpu, id, data, len);
 }
 
 static bool qy7_get_micom_generic_reply(Object *obj, Error **errp)
@@ -405,6 +473,9 @@ static void qy7_init(MachineState *machine)
     memory_region_add_subregion(sysmem, QY7_RAM_BASE, ram);
     clarion_qy7_regs_init(sysmem, qmachine->dipsw);
 
+    qmachine->rcan = clarion_rcan_init(sysmem, 0x1ffd0000,
+                                       clarion_qy7_int2_rcan_irq(int2));
+
     pflash_cfi02_register(0, "qy7.flash", QY7_FLASH_SIZE,
                           dinfo ? blk_by_legacy_dinfo(dinfo) : NULL, 64 * KiB,
                           1, 2, 0x0001, 0x227e, 0x2220, 0x2200, 0x555, 0x2aa,
@@ -565,6 +636,7 @@ static void qy7_init(MachineState *machine)
         sysbus_connect_irq(SYS_BUS_DEVICE(uart), 0,
                            clarion_qy7_int2_uart_irq(int2));
         scpu = qdev_new(TYPE_CLARION_SCPU);
+        qmachine->scpu = scpu;
         clarion_scpu_attach_uart(scpu, uart);
         qdev_realize_and_unref(scpu, NULL, &error_fatal);
         clarion_qy7_uart_set_tx(uart, qy7_uart_tx, scpu);
@@ -610,6 +682,9 @@ static void qy7_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "bcm",
         "Synthetic body control module answering the antitheft CAN "
         "exchange (default on)");
+    object_class_property_add_str(oc, "can-raw", NULL, qy7_set_can_raw);
+    object_class_property_set_description(oc, "can-raw",
+        "Inject one raw CAN frame on QY7 as ID: hexadecimal data bytes");
     object_class_property_add_bool(oc, "micom-generic-reply",
                                    qy7_get_micom_generic_reply,
                                    qy7_set_micom_generic_reply);
