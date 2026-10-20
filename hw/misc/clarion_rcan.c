@@ -10,6 +10,7 @@
 #include "qemu/timer.h"
 #include "hw/misc/clarion_rcan.h"
 #include "system/reset.h"
+#include "target/sh4/cpu.h"
 #include "trace.h"
 
 #define RCAN_SIZE 0x1000
@@ -30,6 +31,8 @@
 #define RCAN_MAILBOX_BASE 0x100
 #define RCAN_MAILBOX_STRIDE 0x20
 #define RCAN_MAILBOX_COUNT 32
+#define RCAN_MAILBOX_END \
+    (RCAN_MAILBOX_BASE + RCAN_MAILBOX_STRIDE * RCAN_MAILBOX_COUNT)
 
 #define RCAN_MCR_RESET BIT(0)
 #define RCAN_MCR_HALT BIT(1)
@@ -74,17 +77,15 @@ static uint32_t rcan_txack(ClarionRcan *s)
 static uint16_t rcan_mailbox_id(ClarionRcan *s, hwaddr base)
 {
     uint16_t control0 = *rcan_reg(s, base);
-    uint16_t control1 = *rcan_reg(s, base + 2);
 
-    return ((control0 & 0x1f) << 6) | ((control1 >> 10) & 0x3f);
+    return (control0 >> 2) & 0x7ff;
 }
 
 static uint16_t rcan_mailbox_id_mask(ClarionRcan *s, hwaddr base)
 {
-    uint16_t mask0 = *rcan_reg(s, base + 4);
-    uint16_t mask1 = *rcan_reg(s, base + 6);
+    uint16_t mask = *rcan_reg(s, base + 4);
 
-    return ((mask0 & 0x1f) << 6) | ((mask1 >> 10) & 0x3f);
+    return (mask >> 2) & 0x7ff;
 }
 
 static unsigned rcan_mailbox_config(ClarionRcan *s, hwaddr base)
@@ -205,8 +206,10 @@ static uint64_t rcan_read(void *opaque, hwaddr addr, unsigned size)
         value = *rcan_reg(s, addr);
     } else if (size == 1) {
         uint16_t word = *rcan_reg(s, addr & ~1);
+        bool mailbox = addr >= RCAN_MAILBOX_BASE && addr < RCAN_MAILBOX_END;
+        bool high_byte = mailbox ? !(addr & 1) : (addr & 1);
 
-        value = (addr & 1) ? word >> 8 : word & 0xff;
+        value = high_byte ? word >> 8 : word & 0xff;
     } else {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "clarion-rcan: unsupported read +0x%03" HWADDR_PRIx
@@ -232,8 +235,10 @@ static void rcan_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
     }
     if (size == 1) {
         uint16_t *reg = rcan_reg(s, addr & ~1);
-        uint16_t byte_mask = (addr & 1) ? 0xff00 : 0x00ff;
-        uint16_t byte_value = (addr & 1) ? (value & 0xff) << 8 : value & 0xff;
+        bool mailbox = addr >= RCAN_MAILBOX_BASE && addr < RCAN_MAILBOX_END;
+        bool high_byte = mailbox ? !(addr & 1) : (addr & 1);
+        uint16_t byte_mask = high_byte ? 0xff00 : 0x00ff;
+        uint16_t byte_value = high_byte ? (value & 0xff) << 8 : value & 0xff;
 
         *reg = (*reg & ~byte_mask) | byte_value;
     } else if (size == 2 && !(addr & 1)) {
@@ -267,7 +272,8 @@ static void rcan_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
                       addr, size);
         return;
     }
-    trace_clarion_rcan_write(qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), addr,
+    trace_clarion_rcan_write(qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL),
+                             SUPERH_CPU(current_cpu)->env.pc, size, addr,
                              value);
 }
 
@@ -313,10 +319,10 @@ bool clarion_rcan_inject(ClarionRcan *s, uint16_t id, const uint8_t *data,
             continue;
         }
         for (unsigned j = 0; j < len; j += 2) {
-            uint16_t word = data[j];
+            uint16_t word = (uint16_t)data[j] << 8;
 
             if (j + 1 < len) {
-                word |= (uint16_t)data[j + 1] << 8;
+                word |= data[j + 1];
             }
             *rcan_reg(s, base + 0x08 + j) = word;
         }
@@ -324,17 +330,15 @@ bool clarion_rcan_inject(ClarionRcan *s, uint16_t id, const uint8_t *data,
             uint16_t *word = rcan_reg(s, base + 0x08 + (j & ~1u));
 
             if (j & 1) {
-                *word &= 0x00ff;
-            } else {
                 *word &= 0xff00;
+            } else {
+                *word &= 0x00ff;
             }
         }
         *rcan_reg(s, base) =
-            (*rcan_reg(s, base) & ~0x001f) | ((id >> 6) & 0x001f);
-        *rcan_reg(s, base + 2) =
-            (*rcan_reg(s, base + 2) & ~0xfc00) | ((id & 0x003f) << 10);
+            (*rcan_reg(s, base) & ~0x1ffc) | ((id & 0x7ff) << 2);
         *rcan_reg(s, base + 0x10) =
-            (*rcan_reg(s, base + 0x10) & ~0x000f) | (len & 0x000f);
+            (*rcan_reg(s, base + 0x10) & 0xff00) | (len & 0x000f);
         if (i < 16) {
             *rcan_reg(s, RCAN_RXPR0) |= bit;
         } else {
