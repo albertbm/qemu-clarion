@@ -90,7 +90,7 @@ static uint16_t rcan_mailbox_id_mask(ClarionRcan *s, hwaddr base)
 
 static unsigned rcan_mailbox_config(ClarionRcan *s, hwaddr base)
 {
-    return (*rcan_reg(s, base + 0x10) >> 6) & 7;
+    return (*rcan_reg(s, base + 0x10) >> 8) & 7;
 }
 
 static void rcan_update_rx_flag(ClarionRcan *s)
