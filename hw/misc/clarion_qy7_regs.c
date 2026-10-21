@@ -12,6 +12,7 @@
 typedef struct QY7BoardRegs {
     MemoryRegion iomem;
     uint8_t dipsw;
+    uint16_t status0_inputs;
 } QY7BoardRegs;
 
 static bool qy7_known(hwaddr addr)
@@ -63,7 +64,7 @@ static uint64_t qy7_regs_read(void *opaque, hwaddr addr, unsigned size)
         return 0;
     }
     if (addr == QY7_STATUS0 - QY7_REGS_BASE) {
-        value = 0x0001;
+        value = 0x0001 | s->status0_inputs;
     } else if (addr == QY7_STATUS1 - QY7_REGS_BASE) {
         value = 0x0010;
     } else if (addr == QY7_DIPSW - QY7_REGS_BASE) {
@@ -104,11 +105,13 @@ static const MemoryRegionOps qy7_regs_ops = {
     },
 };
 
-void clarion_qy7_regs_init(MemoryRegion *sysmem, uint8_t dipsw)
+void clarion_qy7_regs_init(MemoryRegion *sysmem, uint8_t dipsw,
+                           uint16_t status0_inputs)
 {
     QY7BoardRegs *s = g_new0(QY7BoardRegs, 1);
 
     s->dipsw = dipsw;
+    s->status0_inputs = status0_inputs;
     memory_region_init_io(&s->iomem, NULL, &qy7_regs_ops, s, "clarion-qy7-regs",
                           QY7_REGS_SIZE);
     memory_region_add_subregion(sysmem, QY7_REGS_BASE, &s->iomem);

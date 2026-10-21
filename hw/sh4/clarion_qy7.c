@@ -82,6 +82,7 @@
 typedef struct QY7MachineState {
     MachineState parent_obj;
     uint8_t dipsw;
+    uint16_t status0_inputs;
     bool paired_card;
     bool micom_on;
     bool bcm_on;
@@ -148,6 +149,8 @@ static void qy7_machine_instance_init(Object *obj)
     QY7MachineState *s = (QY7MachineState *)obj;
 
     s->dipsw = 7;
+    /* Assumed asserted PowerMonitor input levels (STATUS0 bits 7 and 9). */
+    s->status0_inputs = 0x0280;
     s->paired_card = true;
     s->micom_on = true;
     s->bcm_on = true;
@@ -471,7 +474,8 @@ static void qy7_init(MachineState *machine)
     qemu_register_reset(qy7_reset, reset);
     memory_region_init_ram(ram, NULL, "qy7.ram", QY7_RAM_SIZE, &error_fatal);
     memory_region_add_subregion(sysmem, QY7_RAM_BASE, ram);
-    clarion_qy7_regs_init(sysmem, qmachine->dipsw);
+    clarion_qy7_regs_init(sysmem, qmachine->dipsw,
+                          qmachine->status0_inputs);
 
     qmachine->rcan = clarion_rcan_init(sysmem, 0x1ffd0000,
                                        clarion_qy7_int2_rcan_irq(int2));
@@ -669,6 +673,12 @@ static void qy7_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_uint8_ptr(
         oc, "dipsw", offsetof(QY7MachineState, dipsw),
         OBJ_PROP_FLAG_READWRITE);
+    object_class_property_add_uint16_ptr(
+        oc, "status0-inputs", offsetof(QY7MachineState, status0_inputs),
+        OBJ_PROP_FLAG_READWRITE);
+    object_class_property_set_description(
+        oc, "status0-inputs",
+        "Assumed input level bitmap for board STATUS0 (default 0x0280)");
     object_class_property_add_bool(oc, "paired-card", qy7_get_paired_card,
                                    qy7_set_paired_card);
     object_class_property_set_description(oc, "paired-card",

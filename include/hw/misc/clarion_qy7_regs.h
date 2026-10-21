@@ -3,6 +3,7 @@
 
 #include "system/memory.h"
 
-void clarion_qy7_regs_init(MemoryRegion *sysmem, uint8_t dipsw);
+void clarion_qy7_regs_init(MemoryRegion *sysmem, uint8_t dipsw,
+                           uint16_t status0_inputs);
 
 #endif
