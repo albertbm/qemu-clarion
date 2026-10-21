@@ -32,8 +32,9 @@ No firmware is included. You supply dumps taken from your own unit.
      - SH-4A
      - ``clarion-qy7``
      - ``qemu-system-sh4``
-     - first-stage Windows CE 5.0 kernel and its drivers start; Display
-       Micom, DU and 2DG models are connected, but the display remains black
+     - boots to the user interface with the paired map card: consent
+       screen, touch input, map screen; MENU, MAP/VOICE, STATUS and ZERO
+       EMISSION keys arrive over the vehicle CAN bus
 
 Developed and tested on macOS (Apple Silicon). A Linux build should work
 the same way but is not covered here.
@@ -122,7 +123,9 @@ the machine the launcher selected. ``dipsw`` selects the boot mode on every
 machine (``dipsw=1`` adds a step-by-step boot log on QY8). The
 ``clarion-qy8`` properties, serial port layout, pointer input, diagnostics
 and the MIRROR renderer are described in
-`docs/clarion/clarion-qy8.md <docs/clarion/clarion-qy8.md>`_.
+`docs/clarion/clarion-qy8.md <docs/clarion/clarion-qy8.md>`_; the
+``clarion-qy7`` properties and its front-panel keys in
+`docs/clarion/clarion-qy7.md <docs/clarion/clarion-qy7.md>`_.
 
 Limitations
 ===========
@@ -131,15 +134,16 @@ Limitations
   through a built-in software path (``render=cpu``, the default).
 * Not modelled on QY8: the vehicle CAN bus beyond the controller itself,
   USB, I2C devices other than the touch controller.
-* QY7221NL has a display and front SD host with DMA. The guest reads the
-  card but stops at password authentication with an ordinary SD image;
-  card password metadata is not part of the raw sector image. Watchdog
+* QY7221NL locks the SD card with the password from the ``PROD`` block at
+  power-up (``paired-card=on``), as a card paired with the unit would be.
+  Audio is not modelled: the micom reports audio off, so the audio source
+  and volume keys have no visible effect and are not mapped yet. Watchdog
   reset is not modelled.
 
 Relation to QEMU
 ================
 
-The fork lives on the ``clarion_qy8`` branch and follows upstream QEMU; the
+The fork lives on the ``master`` branch and follows upstream QEMU; the
 Clarion code is in ``hw/arm/clarion_qy8.c``, ``hw/sh4/clarion_qy7.c``, the
 ``clarion_*`` devices under ``hw/``, and ``contrib/clarion/``. Everything
 else is unmodified QEMU: see https://www.qemu.org/ for its documentation

@@ -34,9 +34,11 @@ UI run. The final replay stayed in a blank post-consent transition, so those
 visible effects were not reproduced. The physical button label remains an
 inference from the panel photo.
 
-The panel photo also shows MENU, STATUS, TUNE/SEEK/CH, FM-AM, XM, CD-AUX,
-VOL+/VOL−, CAMERA, OPEN/TILT, power, and Zero Emission. Their protocol codes
-have not been established. Do not infer codes for them from their labels.
+MENU, MAP/VOICE, STATUS and Zero Emission also arrive over the vehicle CAN
+bus as MCAN `PUSH_SW` frames; see
+[Verified MCAN PUSH_SW routes](#verified-mcan-push_sw-routes). Codes for
+TUNE/SEEK/CH, FM-AM, XM, CD-AUX, VOL+/VOL−, CAMERA, OPEN/TILT and power have
+not been established. Do not infer codes for them from their labels.
 
 Send a key through QMP in headless mode:
 
@@ -116,7 +118,7 @@ retain their existing display-micom behavior.
 | Panel control | Hard key | VKey | Verified guest result | Route |
 |---|---:|---:|---|---|
 | MAP/VOICE | `0x0C` | `0x0D` | Returns from menu/language screens to map | MCAN `PUSH_SW` |
-| MENU | `0x44` | `0x1C` | Opens `MENY` from the map after readiness | MCAN `PUSH_SW` |
+| MENU | `0x44` | `0x1C` | Opens `MENY` from the map | MCAN `PUSH_SW` |
 | STATUS | `0x31` | `0x1A` | Opens `Status / Lyd av / Ingen rute` | MCAN `PUSH_SW` |
 | ZERO EMISSION | `0x4C` | `0x1F` | Opens the Zero Emission menu from the map | MCAN `PUSH_SW` |
 
