@@ -21,6 +21,7 @@
 #include "hw/core/irq.h"
 #include "hw/i2c/i2c.h"
 #include "hw/i2c/clarion_rcar_i2c.h"
+#include "hw/misc/clarion_dispmicom.h"
 #include "ui/input.h"
 #include "trace.h"
 
@@ -395,6 +396,11 @@ static void clarion_tma616_pointer_event(DeviceState *dev, QemuConsole *src,
     case INPUT_EVENT_KIND_BTN:
         if (evt->btn.button == INPUT_BUTTON_LEFT) {
             s->btn = evt->btn.down;
+        } else if (evt->btn.down &&
+                   (evt->btn.button == INPUT_BUTTON_WHEEL_UP ||
+                    evt->btn.button == INPUT_BUTTON_WHEEL_DOWN)) {
+            clarion_dispmicom_wheel(evt->btn.button == INPUT_BUTTON_WHEEL_UP ?
+                                    1 : -1);
         }
         break;
     default:

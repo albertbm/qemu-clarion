@@ -83,6 +83,7 @@
 /* kepdrv InputLcdKey (QY8605NB @0xEF880F1C): DATA[1] = матричний код, біт 7 = натиснуто */
 #define CMD_KEY             0x34
 #define KEY_PRESSED         0x80
+#define CMD_ROTARY          0x35
 
 /*
  * Пауза між кадрами — така сама, як у моделі МК плати: приймач SCIF має
@@ -347,13 +348,50 @@ static int disp_key_code(int qcode)
     }
 }
 
+/* kepdrv InputLcdRotaryKey (QY8605NB @0xEF87EEA0): DATA[1] = VOL, DATA[2] = TUNE */
+static void disp_rotary(ClarionDispMicomState *s, int vol, int tune)
+{
+    disp_queue(s, (const uint8_t[]){ CMD_ROTARY, (uint8_t)vol,
+                                     (uint8_t)tune }, 3);
+}
+
+/* the touch controllers own pointer buttons, so they pass the wheel here */
+static ClarionDispMicomState *disp_panel;
+
+void clarion_dispmicom_wheel(int detents)
+{
+    if (disp_panel && detents) {
+        disp_rotary(disp_panel, 0, detents);
+    }
+}
+
 /* host keyboard, separate from the qom-set path above but the same wire frame */
 static void disp_key_event(DeviceState *dev, QemuConsole *src,
                            QemuInputEvent *evt)
 {
     ClarionDispMicomState *s = CLARION_DISPMICOM(dev);
-    int code = disp_key_code(qemu_input_linux_to_qcode(evt->key.key));
+    int qcode = qemu_input_linux_to_qcode(evt->key.key);
+    int code;
 
+    switch (qcode) {
+    case Q_KEY_CODE_PGUP:
+    case Q_KEY_CODE_PGDN:
+        if (evt->key.down) {
+            disp_rotary(s, 0, qcode == Q_KEY_CODE_PGUP ? 1 : -1);
+        }
+        return;
+    case Q_KEY_CODE_EQUAL:
+    case Q_KEY_CODE_MINUS:
+        if (evt->key.down) {
+            disp_rotary(s, qcode == Q_KEY_CODE_EQUAL ? 1 : -1, 0);
+        }
+        return;
+    case Q_KEY_CODE_RET:
+    case Q_KEY_CODE_KP_ENTER:
+        qcode = Q_KEY_CODE_F9;      /* TUNE push */
+        break;
+    }
+    code = disp_key_code(qcode);
     if (code < 0) {
         return;
     }
@@ -465,6 +503,7 @@ static void clarion_dispmicom_realize(DeviceState *dev, Error **errp)
     s->tx = timer_new_ns(QEMU_CLOCK_VIRTUAL, disp_tx_expire, s);
     s->key_up = timer_new_ns(QEMU_CLOCK_VIRTUAL, disp_key_up, s);
     s->ih = qemu_input_handler_register(dev, &disp_key_handler);
+    disp_panel = s;
 }
 
 static void clarion_dispmicom_unrealize(DeviceState *dev)
@@ -472,6 +511,9 @@ static void clarion_dispmicom_unrealize(DeviceState *dev)
     ClarionDispMicomState *s = CLARION_DISPMICOM(dev);
 
     qemu_input_handler_unregister(s->ih);
+    if (disp_panel == s) {
+        disp_panel = NULL;
+    }
 }
 
 static void clarion_dispmicom_class_init(ObjectClass *klass, const void *data)
