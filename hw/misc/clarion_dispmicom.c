@@ -376,7 +376,8 @@ static ClarionDispMicomState *disp_panel;
 void clarion_dispmicom_wheel(int detents)
 {
     if (disp_panel && detents) {
-        disp_rotary(disp_panel, 0, detents);
+        /* wheel up moves the highlight up, same sense as PageUp */
+        disp_rotary(disp_panel, 0, -detents);
     }
 }
 
@@ -392,7 +393,8 @@ static void disp_key_event(DeviceState *dev, QemuConsole *src,
     case Q_KEY_CODE_PGUP:
     case Q_KEY_CODE_PGDN:
         if (evt->key.down) {
-            disp_rotary(s, 0, qcode == Q_KEY_CODE_PGUP ? 1 : -1);
+            /* PageUp moves the list highlight up, so it is one detent back */
+            disp_rotary(s, 0, qcode == Q_KEY_CODE_PGUP ? -1 : 1);
         }
         return;
     case Q_KEY_CODE_EQUAL:
@@ -404,6 +406,9 @@ static void disp_key_event(DeviceState *dev, QemuConsole *src,
     case Q_KEY_CODE_RET:
     case Q_KEY_CODE_KP_ENTER:
         qcode = Q_KEY_CODE_F9;      /* TUNE push */
+        break;
+    case Q_KEY_CODE_ESC:
+        qcode = Q_KEY_CODE_F2;      /* Back */
         break;
     }
     code = disp_key_code(s, qcode);
