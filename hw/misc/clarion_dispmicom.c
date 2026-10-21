@@ -59,6 +59,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
+#include "qapi/error.h"
 #include "hw/misc/clarion_dispmicom.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
@@ -76,6 +77,11 @@
 #define CMD_INFO_RSP        0x24    /* панель -> HU: версія/UnitID/PartNum */
 #define CMD_LINK_UP         0x25    /* HU -> панель: лінк піднято */
 #define CMD_READY           0x40    /* панель -> HU: готова; гість SET 129 */
+/* CLcdDrv_Send @0xEF71A7F4 ставить [+0x33d]; лише відповідь 0x71 його знімає */
+#define CMD_POLL            0x71
+/* kepdrv InputLcdKey (QY8605NB @0xEF880F1C): DATA[1] = матричний код, біт 7 = натиснуто */
+#define CMD_KEY             0x34
+#define KEY_PRESSED         0x80
 
 /*
  * Пауза між кадрами — така сама, як у моделі МК плати: приймач SCIF має
@@ -122,6 +128,9 @@ struct ClarionDispMicomState {
     uint8_t bcc;
 
     bool linked;                /* бачили 0x25 від гостя */
+
+    QEMUTimer *key_up;          /* відпускання клавіші, вставленої з монітора */
+    uint8_t key_held;
 };
 
 /* --- побудова кадру ---------------------------------------------------- */
@@ -250,6 +259,10 @@ static void disp_frame(ClarionDispMicomState *s)
         disp_queue(s, (const uint8_t[]){ CMD_READY }, 1);
         break;
 
+    case CMD_POLL:
+        disp_queue(s, (const uint8_t[]){ CMD_POLL }, 1);
+        break;
+
     default:
         /* Решта команд панелі не розібрана — лише квитанція, без вигадок. */
         break;
@@ -257,6 +270,62 @@ static void disp_frame(ClarionDispMicomState *s)
 }
 
 /* --- розбір потоку від гостя ------------------------------------------- */
+
+static void disp_key_up(void *opaque)
+{
+    ClarionDispMicomState *s = opaque;
+
+    disp_queue(s, (const uint8_t[]){ CMD_KEY, s->key_held }, 2);
+}
+
+/* qom-set key="CODE[,HOLD_MS]": натискання панельної клавіші за матричним кодом */
+static void disp_set_key(Object *obj, const char *value, Error **errp)
+{
+    ClarionDispMicomState *s = CLARION_DISPMICOM(obj);
+    unsigned long code, hold = 150;
+    char *end;
+
+    code = strtoul(value, &end, 16);
+    if (end != value && *end == ',') {
+        hold = strtoul(end + 1, &end, 10);
+    }
+    if (end == value || code > 0x7f || *end) {
+        error_setg(errp, "key: expected CODE[,HOLD_MS], CODE hex 00..7f");
+        return;
+    }
+    if (timer_pending(s->key_up)) {
+        timer_del(s->key_up);
+        disp_key_up(s);
+    }
+    s->key_held = code;
+    disp_queue(s, (const uint8_t[]){ CMD_KEY, code | KEY_PRESSED }, 2);
+    timer_mod(s->key_up, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              (int64_t)hold * 1000000);
+}
+
+/* qom-set frame="34 05": сирий кадр панелі для дослідів з іншими командами */
+static void disp_set_frame(Object *obj, const char *value, Error **errp)
+{
+    ClarionDispMicomState *s = CLARION_DISPMICOM(obj);
+    uint8_t data[DISP_MAX_DATA];
+    unsigned len = 0;
+    const char *p = value;
+    char *end;
+
+    while (*p) {
+        unsigned long v = strtoul(p, &end, 16);
+
+        if (end == p || v > 0xff || len == sizeof(data)) {
+            error_setg(errp, "frame: expected hex bytes");
+            return;
+        }
+        data[len++] = v;
+        p = end + strspn(end, " ,:");
+    }
+    if (len) {
+        disp_queue(s, data, len);
+    }
+}
 
 void clarion_dispmicom_rx_byte(DeviceState *dev, uint8_t b)
 {
@@ -345,6 +414,7 @@ static void clarion_dispmicom_reset_hold(Object *obj, ResetType type)
     s->body_len = 0;
     s->bcc = 0;
     s->linked = false;
+    timer_del(s->key_up);
 }
 
 static void clarion_dispmicom_realize(DeviceState *dev, Error **errp)
@@ -353,6 +423,7 @@ static void clarion_dispmicom_realize(DeviceState *dev, Error **errp)
 
     s->frames = g_queue_new();
     s->tx = timer_new_ns(QEMU_CLOCK_VIRTUAL, disp_tx_expire, s);
+    s->key_up = timer_new_ns(QEMU_CLOCK_VIRTUAL, disp_key_up, s);
 }
 
 static void clarion_dispmicom_class_init(ObjectClass *klass, const void *data)
@@ -363,6 +434,8 @@ static void clarion_dispmicom_class_init(ObjectClass *klass, const void *data)
     dc->realize = clarion_dispmicom_realize;
     dc->desc = "Clarion QY8XXX display panel micom (SCIF1 link)";
     rc->phases.hold = clarion_dispmicom_reset_hold;
+    object_class_property_add_str(klass, "key", NULL, disp_set_key);
+    object_class_property_add_str(klass, "frame", NULL, disp_set_frame);
 }
 
 static const TypeInfo clarion_dispmicom_types[] = {
