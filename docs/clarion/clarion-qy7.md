@@ -105,3 +105,21 @@ unknown.
 The `PostMessageW` branch targets the HWND stored in KEPDRV's context and
 posts `WM_KEYDOWN`/`WM_KEYUP` with the translated VK. The window's application
 identity was not recovered from the available runtime state.
+
+## Verified MCAN PUSH_SW routes
+
+These rows record guest-visible mappings from read-only QY7 captures. They do
+not claim that host keyboard aliases are wired to CAN input yet; current
+keyboard injection still binds only `M` and `B` through the display micom.
+
+| Panel control | Hard key | VKey | Verified guest result | Route |
+|---|---:|---:|---|---|
+| MAP/VOICE | `0x0C` | `0x0D` | Returns from menu/language screens to map | MCAN `PUSH_SW` |
+| MENU | `0x44` | `0x1C` | Opens `MENY` from the map after readiness | MCAN `PUSH_SW` |
+| STATUS | `0x31` | `0x1A` | Opens `Status / Lyd av / Ingen rute` | MCAN `PUSH_SW` |
+| ZERO EMISSION | `0x4C` | `0x1F` | Opens the Zero Emission menu from the map | MCAN `PUSH_SW` |
+
+Other tested codes remain unnamed unless a visible result matched a control
+on the panel photo. `0x12` and `0x47` remove a route overlay in the tested
+state, but that does not identify a physical control. The Clarif30 evidence
+records all tested VKeys and screenshots.
