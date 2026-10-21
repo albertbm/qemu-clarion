@@ -135,6 +135,8 @@ struct ClarionDispMicomState {
     uint8_t key_held;
 
     QemuInputHandlerState *ih;  /* host keyboard, parallel to the qom-set path */
+
+    bool panel_jp;              /* bezel code table: false = eu (0x10180201), true = jp (0x10180202) */
 };
 
 /* --- побудова кадру ---------------------------------------------------- */
@@ -331,19 +333,24 @@ static void disp_set_frame(Object *obj, const char *value, Error **errp)
     }
 }
 
-/* bezel codes per InputLcdKey (kepdrv, QY8605NB @0xEF880F1C); F5-F9 unproven */
-static int disp_key_code(int qcode)
+/*
+ * Bezel codes per InputLcdKey. Two panel tables measured off kepdrv.dll
+ * (REPORT-bezel-keys.md): jp is 0x10180202 (QY8605NB), eu is 0x10180201
+ * (QY8602NB, QY8600NE - EU and US share one table). Same function, same
+ * host F-key, different matrix code per table.
+ */
+static int disp_key_code(ClarionDispMicomState *s, int qcode)
 {
     switch (qcode) {
-    case Q_KEY_CODE_F1: return 0x01;    /* Menu */
-    case Q_KEY_CODE_F2: return 0x03;    /* Back */
-    case Q_KEY_CODE_F3: return 0x31;    /* Screen off, real unit wants a 2s hold */
-    case Q_KEY_CODE_F4: return 0x32;    /* Current position */
-    case Q_KEY_CODE_F5: return 0x13;    /* Camera? */
-    case Q_KEY_CODE_F6: return 0x30;    /* Audio-TV? may be swapped with F5 */
-    case Q_KEY_CODE_F7: return 0x00;    /* seek pair, A side, direction unproven */
-    case Q_KEY_CODE_F8: return 0x20;    /* seek pair, B side */
-    case Q_KEY_CODE_F9: return 0x10;    /* TUNE knob push */
+    case Q_KEY_CODE_F1: return s->panel_jp ? 0x01 : 0x13;    /* Menu */
+    case Q_KEY_CODE_F2: return s->panel_jp ? 0x03 : 0x30;    /* Back */
+    case Q_KEY_CODE_F3: return s->panel_jp ? 0x31 : 0x20;    /* Display off, hold */
+    case Q_KEY_CODE_F4: return s->panel_jp ? 0x32 : 0x00;    /* Map / current position */
+    case Q_KEY_CODE_F5: return s->panel_jp ? 0x13 : 0x01;    /* Camera */
+    case Q_KEY_CODE_F6: return s->panel_jp ? 0x30 : 0x03;    /* Audio */
+    case Q_KEY_CODE_F7: return s->panel_jp ? 0x00 : 0x31;    /* Seek back */
+    case Q_KEY_CODE_F8: return s->panel_jp ? 0x20 : 0x32;    /* Seek forward */
+    case Q_KEY_CODE_F9: return s->panel_jp ? 0x10 : 0x21;    /* TUNE knob push */
     default: return -1;
     }
 }
@@ -391,7 +398,7 @@ static void disp_key_event(DeviceState *dev, QemuConsole *src,
         qcode = Q_KEY_CODE_F9;      /* TUNE push */
         break;
     }
-    code = disp_key_code(qcode);
+    code = disp_key_code(s, qcode);
     if (code < 0) {
         return;
     }
@@ -516,6 +523,25 @@ static void clarion_dispmicom_unrealize(DeviceState *dev)
     }
 }
 
+/* qom-set/-global panel=jp|eu: which bezel code table disp_key_code uses */
+static char *disp_panel_get(Object *obj, Error **errp)
+{
+    return g_strdup(CLARION_DISPMICOM(obj)->panel_jp ? "jp" : "eu");
+}
+
+static void disp_panel_set(Object *obj, const char *value, Error **errp)
+{
+    ClarionDispMicomState *s = CLARION_DISPMICOM(obj);
+
+    if (!strcmp(value, "jp")) {
+        s->panel_jp = true;
+    } else if (!strcmp(value, "eu")) {
+        s->panel_jp = false;
+    } else {
+        error_setg(errp, "panel: expected jp or eu");
+    }
+}
+
 static void clarion_dispmicom_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -527,6 +553,8 @@ static void clarion_dispmicom_class_init(ObjectClass *klass, const void *data)
     rc->phases.hold = clarion_dispmicom_reset_hold;
     object_class_property_add_str(klass, "key", NULL, disp_set_key);
     object_class_property_add_str(klass, "frame", NULL, disp_set_frame);
+    object_class_property_add_str(klass, "panel", disp_panel_get,
+                                  disp_panel_set);
 }
 
 static const TypeInfo clarion_dispmicom_types[] = {
