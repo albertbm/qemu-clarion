@@ -355,11 +355,19 @@ static int disp_key_code(ClarionDispMicomState *s, int qcode)
     }
 }
 
-/* kepdrv InputLcdRotaryKey (QY8605NB @0xEF87EEA0): DATA[1] = VOL, DATA[2] = TUNE */
+/* sign and magnitude: 0x81 is one detent back, 0xff is 127 back */
+static uint8_t disp_detents(int n)
+{
+    return n < 0 ? 0x80 | MIN(-n, 0x7f) : MIN(n, 0x7f);
+}
+
+/* kepdrv swaps the two bytes by panel: jp sends 35 VOL TUNE, eu/us 35 TUNE VOL */
 static void disp_rotary(ClarionDispMicomState *s, int vol, int tune)
 {
-    disp_queue(s, (const uint8_t[]){ CMD_ROTARY, (uint8_t)vol,
-                                     (uint8_t)tune }, 3);
+    uint8_t v = disp_detents(vol), t = disp_detents(tune);
+    uint8_t a = s->panel_jp ? v : t, b = s->panel_jp ? t : v;
+
+    disp_queue(s, (const uint8_t[]){ CMD_ROTARY, a, b }, 3);
 }
 
 /* the touch controllers own pointer buttons, so they pass the wheel here */
