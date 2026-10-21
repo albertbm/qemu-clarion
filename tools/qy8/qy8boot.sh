@@ -36,7 +36,7 @@ T=$HERE
 
 CARD=$1; shift || { sed -n '2,12p' "$0"; exit 1; }
 NAND=$B/nand_qy8202na_14300241_00000338_PATCHED-130.bin
-BOARD=; MODEL=; UPDATE=; SHOT=; VERBOSE=; SHOWKEYS=; KEEP=
+BOARD=; BOARD_EXPLICIT=; MODEL=; UPDATE=; SHOT=; VERBOSE=; SHOWKEYS=; KEEP=
 W=~/work-qy8
 SOCK=/tmp/qy8.qmp                # QEMU caps a unix path at 104 bytes, so keep it in /tmp
 LIMIT=240
@@ -45,7 +45,7 @@ while getopts 'n:m:b:w:s:t:upgvk' o; do
   case $o in
     n) NAND=$OPTARG ;;
     m) MODEL=$OPTARG ;;
-    b) BOARD=$OPTARG ;;
+    b) BOARD=$OPTARG; BOARD_EXPLICIT=1 ;;
     w) W=$OPTARG ;;
     s) SOCK=$OPTARG ;;
     t) LIMIT=$OPTARG ;;
@@ -137,7 +137,10 @@ elif cnav != nav:
     print(f'warning: card app {cnav} vs NAND app {nav}: expect Version Error / disc licence refusal')
 EOF
 )
-[ -n "$BOARD" ] || BOARD=$(echo "$IDENT" | sed -n '1p')
+# -m is a guess from the unit family (ze0/me0/ze1); the NAND's own PROD block
+# names the exact model, so trust that over the guess unless -b forced one.
+# -m ze1 alone can't tell a EUR QY8602NB from a USA QY8600NE apart.
+[ -n "$BOARD_EXPLICIT" ] || BOARD=$(echo "$IDENT" | sed -n '1p')
 SUMMARY=$(echo "$IDENT" | sed -n '2p')
 echo "$SUMMARY"
 [ -z "$VERBOSE" ] || echo "$IDENT" | tail -n +3
