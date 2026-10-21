@@ -136,7 +136,7 @@ struct ClarionDispMicomState {
 
     QemuInputHandlerState *ih;  /* host keyboard, parallel to the qom-set path */
 
-    bool panel_jp;              /* bezel code table: false = eu (0x10180201), true = jp (0x10180202) */
+    bool panel_jpn;              /* bezel code table: false = eur (0x10180201), true = jpn (0x10180202) */
 };
 
 /* --- побудова кадру ---------------------------------------------------- */
@@ -335,22 +335,22 @@ static void disp_set_frame(Object *obj, const char *value, Error **errp)
 
 /*
  * Bezel codes per InputLcdKey. Two panel tables measured off kepdrv.dll
- * (REPORT-bezel-keys.md): jp is 0x10180202 (QY8605NB), eu is 0x10180201
- * (QY8602NB, QY8600NE - EU and US share one table). Same function, same
+ * (REPORT-bezel-keys.md): jpn is 0x10180202 (QY8605NB), eur is 0x10180201
+ * (QY8602NB, QY8600NE - eur covers both markets). Same function, same
  * host F-key, different matrix code per table.
  */
 static int disp_key_code(ClarionDispMicomState *s, int qcode)
 {
     switch (qcode) {
-    case Q_KEY_CODE_F1: return s->panel_jp ? 0x01 : 0x13;    /* Menu */
-    case Q_KEY_CODE_F2: return s->panel_jp ? 0x03 : 0x30;    /* Back */
-    case Q_KEY_CODE_F3: return s->panel_jp ? 0x31 : 0x20;    /* Display off, hold */
-    case Q_KEY_CODE_F4: return s->panel_jp ? 0x32 : 0x00;    /* Map / current position */
-    case Q_KEY_CODE_F5: return s->panel_jp ? 0x13 : 0x01;    /* Camera */
-    case Q_KEY_CODE_F6: return s->panel_jp ? 0x30 : 0x03;    /* Audio */
-    case Q_KEY_CODE_F7: return s->panel_jp ? 0x00 : 0x31;    /* Seek back */
-    case Q_KEY_CODE_F8: return s->panel_jp ? 0x20 : 0x32;    /* Seek forward */
-    case Q_KEY_CODE_F9: return s->panel_jp ? 0x10 : 0x21;    /* TUNE knob push */
+    case Q_KEY_CODE_F1: return s->panel_jpn ? 0x01 : 0x13;    /* Menu */
+    case Q_KEY_CODE_F2: return s->panel_jpn ? 0x03 : 0x30;    /* Back */
+    case Q_KEY_CODE_F3: return s->panel_jpn ? 0x31 : 0x20;    /* Display off, hold */
+    case Q_KEY_CODE_F4: return s->panel_jpn ? 0x32 : 0x00;    /* Map / current position */
+    case Q_KEY_CODE_F5: return s->panel_jpn ? 0x13 : 0x01;    /* Camera */
+    case Q_KEY_CODE_F6: return s->panel_jpn ? 0x30 : 0x03;    /* Audio */
+    case Q_KEY_CODE_F7: return s->panel_jpn ? 0x00 : 0x31;    /* Seek back */
+    case Q_KEY_CODE_F8: return s->panel_jpn ? 0x20 : 0x32;    /* Seek forward */
+    case Q_KEY_CODE_F9: return s->panel_jpn ? 0x10 : 0x21;    /* TUNE knob push */
     default: return -1;
     }
 }
@@ -361,11 +361,11 @@ static uint8_t disp_detents(int n)
     return n < 0 ? 0x80 | MIN(-n, 0x7f) : MIN(n, 0x7f);
 }
 
-/* kepdrv swaps the two bytes by panel: jp sends 35 VOL TUNE, eu/us 35 TUNE VOL */
+/* kepdrv swaps the two bytes by panel: jpn sends 35 VOL TUNE, eur 35 TUNE VOL */
 static void disp_rotary(ClarionDispMicomState *s, int vol, int tune)
 {
     uint8_t v = disp_detents(vol), t = disp_detents(tune);
-    uint8_t a = s->panel_jp ? v : t, b = s->panel_jp ? t : v;
+    uint8_t a = s->panel_jpn ? v : t, b = s->panel_jpn ? t : v;
 
     disp_queue(s, (const uint8_t[]){ CMD_ROTARY, a, b }, 3);
 }
@@ -536,22 +536,22 @@ static void clarion_dispmicom_unrealize(DeviceState *dev)
     }
 }
 
-/* qom-set/-global panel=jp|eu: which bezel code table disp_key_code uses */
+/* qom-set/-global panel=jpn|eur: which bezel code table disp_key_code uses */
 static char *disp_panel_get(Object *obj, Error **errp)
 {
-    return g_strdup(CLARION_DISPMICOM(obj)->panel_jp ? "jp" : "eu");
+    return g_strdup(CLARION_DISPMICOM(obj)->panel_jpn ? "jpn" : "eur");
 }
 
 static void disp_panel_set(Object *obj, const char *value, Error **errp)
 {
     ClarionDispMicomState *s = CLARION_DISPMICOM(obj);
 
-    if (!strcmp(value, "jp")) {
-        s->panel_jp = true;
-    } else if (!strcmp(value, "eu")) {
-        s->panel_jp = false;
+    if (!strcmp(value, "jpn")) {
+        s->panel_jpn = true;
+    } else if (!strcmp(value, "eur")) {
+        s->panel_jpn = false;
     } else {
-        error_setg(errp, "panel: expected jp or eu");
+        error_setg(errp, "panel: expected jpn or eur");
     }
 }
 
