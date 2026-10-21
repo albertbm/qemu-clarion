@@ -2289,6 +2289,9 @@ static void qy8_init(MachineState *machine)
      */
     if (s->dispmicom_on) {
         s->dispmicom = qdev_new(TYPE_CLARION_DISPMICOM);
+        /* сталий шлях /machine/panel-micom для вставки клавіш через qom-set */
+        object_property_add_child(OBJECT(s), "panel-micom",
+                                  OBJECT(s->dispmicom));
         qdev_realize_and_unref(s->dispmicom, NULL, &error_fatal);
     }
 

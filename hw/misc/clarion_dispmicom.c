@@ -59,9 +59,11 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
+#include "qapi/error.h"
 #include "hw/misc/clarion_dispmicom.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
+#include "ui/input.h"
 
 #define DLE     0x10
 #define STX     0x02
@@ -76,6 +78,12 @@
 #define CMD_INFO_RSP        0x24    /* панель -> HU: версія/UnitID/PartNum */
 #define CMD_LINK_UP         0x25    /* HU -> панель: лінк піднято */
 #define CMD_READY           0x40    /* панель -> HU: готова; гість SET 129 */
+/* CLcdDrv_Send @0xEF71A7F4 ставить [+0x33d]; лише відповідь 0x71 його знімає */
+#define CMD_POLL            0x71
+/* kepdrv InputLcdKey (QY8605NB @0xEF880F1C): DATA[1] = матричний код, біт 7 = натиснуто */
+#define CMD_KEY             0x34
+#define KEY_PRESSED         0x80
+#define CMD_ROTARY          0x35
 
 /*
  * Пауза між кадрами — така сама, як у моделі МК плати: приймач SCIF має
@@ -122,6 +130,13 @@ struct ClarionDispMicomState {
     uint8_t bcc;
 
     bool linked;                /* бачили 0x25 від гостя */
+
+    QEMUTimer *key_up;          /* відпускання клавіші, вставленої з монітора */
+    uint8_t key_held;
+
+    QemuInputHandlerState *ih;  /* клавіатура хоста, поряд із qom-set */
+
+    bool panel_jpn;             /* таблиця кодів: false = row (0x10180201), true = jpn (0x10180202) */
 };
 
 /* --- побудова кадру ---------------------------------------------------- */
@@ -250,6 +265,10 @@ static void disp_frame(ClarionDispMicomState *s)
         disp_queue(s, (const uint8_t[]){ CMD_READY }, 1);
         break;
 
+    case CMD_POLL:
+        disp_queue(s, (const uint8_t[]){ CMD_POLL }, 1);
+        break;
+
     default:
         /* Решта команд панелі не розібрана — лише квитанція, без вигадок. */
         break;
@@ -257,6 +276,149 @@ static void disp_frame(ClarionDispMicomState *s)
 }
 
 /* --- розбір потоку від гостя ------------------------------------------- */
+
+static void disp_key_up(void *opaque)
+{
+    ClarionDispMicomState *s = opaque;
+
+    disp_queue(s, (const uint8_t[]){ CMD_KEY, s->key_held }, 2);
+}
+
+/* qom-set key="CODE[,HOLD_MS]": натискання панельної клавіші за матричним кодом */
+static void disp_set_key(Object *obj, const char *value, Error **errp)
+{
+    ClarionDispMicomState *s = CLARION_DISPMICOM(obj);
+    unsigned long code, hold = 150;
+    char *end;
+
+    code = strtoul(value, &end, 16);
+    if (end != value && *end == ',') {
+        hold = strtoul(end + 1, &end, 10);
+    }
+    if (end == value || code > 0x7f || *end) {
+        error_setg(errp, "key: expected CODE[,HOLD_MS], CODE hex 00..7f");
+        return;
+    }
+    if (timer_pending(s->key_up)) {
+        timer_del(s->key_up);
+        disp_key_up(s);
+    }
+    s->key_held = code;
+    disp_queue(s, (const uint8_t[]){ CMD_KEY, code | KEY_PRESSED }, 2);
+    timer_mod(s->key_up, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              (int64_t)hold * 1000000);
+}
+
+/* qom-set frame="34 05": сирий кадр панелі для дослідів з іншими командами */
+static void disp_set_frame(Object *obj, const char *value, Error **errp)
+{
+    ClarionDispMicomState *s = CLARION_DISPMICOM(obj);
+    uint8_t data[DISP_MAX_DATA];
+    unsigned len = 0;
+    const char *p = value;
+    char *end;
+
+    while (*p) {
+        unsigned long v = strtoul(p, &end, 16);
+
+        if (end == p || v > 0xff || len == sizeof(data)) {
+            error_setg(errp, "frame: expected hex bytes");
+            return;
+        }
+        data[len++] = v;
+        p = end + strspn(end, " ,:");
+    }
+    if (len) {
+        disp_queue(s, data, len);
+    }
+}
+
+/* коди клавіш з таблиць InputLcdKey у kepdrv.dll */
+static int disp_key_code(ClarionDispMicomState *s, int qcode)
+{
+    switch (qcode) {
+    case Q_KEY_CODE_F1: return s->panel_jpn ? 0x01 : 0x13;    /* Меню */
+    case Q_KEY_CODE_F2: return s->panel_jpn ? 0x03 : 0x30;    /* Назад */
+    case Q_KEY_CODE_F3: return s->panel_jpn ? 0x31 : 0x20;    /* Вимкнення екрана, утримувати */
+    case Q_KEY_CODE_F4: return s->panel_jpn ? 0x32 : 0x00;    /* Мапа / поточне місце */
+    case Q_KEY_CODE_F5: return s->panel_jpn ? 0x13 : 0x01;    /* Камера */
+    case Q_KEY_CODE_F6: return s->panel_jpn ? 0x30 : 0x03;    /* Аудіо */
+    case Q_KEY_CODE_F7: return s->panel_jpn ? 0x00 : 0x31;    /* Пошук назад */
+    case Q_KEY_CODE_F8: return s->panel_jpn ? 0x20 : 0x32;    /* Пошук уперед */
+    case Q_KEY_CODE_F9: return s->panel_jpn ? 0x10 : 0x21;    /* Натискання TUNE */
+    default: return -1;
+    }
+}
+
+/* знак і модуль: 0x81 — крок назад, 0xff — 127 назад */
+static uint8_t disp_detents(int n)
+{
+    return n < 0 ? 0x80 | MIN(-n, 0x7f) : MIN(n, 0x7f);
+}
+
+/* kepdrv міняє байти за панеллю: jpn шле 35 VOL TUNE, row 35 TUNE VOL */
+static void disp_rotary(ClarionDispMicomState *s, int vol, int tune)
+{
+    uint8_t v = disp_detents(vol), t = disp_detents(tune);
+    uint8_t a = s->panel_jpn ? v : t, b = s->panel_jpn ? t : v;
+
+    disp_queue(s, (const uint8_t[]){ CMD_ROTARY, a, b }, 3);
+}
+
+/* кнопки вказівника тримає сенсор, тож колесо приходить сюди */
+static ClarionDispMicomState *disp_panel;
+
+void clarion_dispmicom_wheel(int detents)
+{
+    if (disp_panel && detents) {
+        /* колесо вгору веде виділення вгору, як PageUp */
+        disp_rotary(disp_panel, 0, -detents);
+    }
+}
+
+/* клавіатура хоста: окремо від qom-set, той самий кадр */
+static void disp_key_event(DeviceState *dev, QemuConsole *src,
+                           QemuInputEvent *evt)
+{
+    ClarionDispMicomState *s = CLARION_DISPMICOM(dev);
+    int qcode = qemu_input_linux_to_qcode(evt->key.key);
+    int code;
+
+    switch (qcode) {
+    case Q_KEY_CODE_PGUP:
+    case Q_KEY_CODE_PGDN:
+        if (evt->key.down) {
+            /* PageUp веде виділення вгору, тобто крок назад */
+            disp_rotary(s, 0, qcode == Q_KEY_CODE_PGUP ? -1 : 1);
+        }
+        return;
+    case Q_KEY_CODE_EQUAL:
+    case Q_KEY_CODE_MINUS:
+        if (evt->key.down) {
+            disp_rotary(s, qcode == Q_KEY_CODE_EQUAL ? 1 : -1, 0);
+        }
+        return;
+    case Q_KEY_CODE_RET:
+    case Q_KEY_CODE_KP_ENTER:
+        qcode = Q_KEY_CODE_F9;      /* Натискання TUNE */
+        break;
+    case Q_KEY_CODE_ESC:
+        qcode = Q_KEY_CODE_F2;      /* Назад */
+        break;
+    }
+    code = disp_key_code(s, qcode);
+    if (code < 0) {
+        return;
+    }
+    disp_queue(s, (const uint8_t[]){ CMD_KEY,
+               code | (evt->key.down ? KEY_PRESSED : 0) }, 2);
+}
+
+static const QemuInputHandler disp_key_handler = {
+    .name  = "Clarion QY8 panel keys",
+    .mask  = INPUT_EVENT_MASK_KEY,
+    .event = disp_key_event,
+};
 
 void clarion_dispmicom_rx_byte(DeviceState *dev, uint8_t b)
 {
@@ -345,6 +507,7 @@ static void clarion_dispmicom_reset_hold(Object *obj, ResetType type)
     s->body_len = 0;
     s->bcc = 0;
     s->linked = false;
+    timer_del(s->key_up);
 }
 
 static void clarion_dispmicom_realize(DeviceState *dev, Error **errp)
@@ -353,6 +516,38 @@ static void clarion_dispmicom_realize(DeviceState *dev, Error **errp)
 
     s->frames = g_queue_new();
     s->tx = timer_new_ns(QEMU_CLOCK_VIRTUAL, disp_tx_expire, s);
+    s->key_up = timer_new_ns(QEMU_CLOCK_VIRTUAL, disp_key_up, s);
+    s->ih = qemu_input_handler_register(dev, &disp_key_handler);
+    disp_panel = s;
+}
+
+static void clarion_dispmicom_unrealize(DeviceState *dev)
+{
+    ClarionDispMicomState *s = CLARION_DISPMICOM(dev);
+
+    qemu_input_handler_unregister(s->ih);
+    if (disp_panel == s) {
+        disp_panel = NULL;
+    }
+}
+
+/* panel=jpn|row: яку таблицю кодів бере disp_key_code */
+static char *disp_panel_get(Object *obj, Error **errp)
+{
+    return g_strdup(CLARION_DISPMICOM(obj)->panel_jpn ? "jpn" : "row");
+}
+
+static void disp_panel_set(Object *obj, const char *value, Error **errp)
+{
+    ClarionDispMicomState *s = CLARION_DISPMICOM(obj);
+
+    if (!strcmp(value, "jpn")) {
+        s->panel_jpn = true;
+    } else if (!strcmp(value, "row")) {
+        s->panel_jpn = false;
+    } else {
+        error_setg(errp, "panel: expected jpn or row");
+    }
 }
 
 static void clarion_dispmicom_class_init(ObjectClass *klass, const void *data)
@@ -361,8 +556,13 @@ static void clarion_dispmicom_class_init(ObjectClass *klass, const void *data)
     ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     dc->realize = clarion_dispmicom_realize;
+    dc->unrealize = clarion_dispmicom_unrealize;
     dc->desc = "Clarion QY8XXX display panel micom (SCIF1 link)";
     rc->phases.hold = clarion_dispmicom_reset_hold;
+    object_class_property_add_str(klass, "key", NULL, disp_set_key);
+    object_class_property_add_str(klass, "frame", NULL, disp_set_frame);
+    object_class_property_add_str(klass, "panel", disp_panel_get,
+                                  disp_panel_set);
 }
 
 static const TypeInfo clarion_dispmicom_types[] = {

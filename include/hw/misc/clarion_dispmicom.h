@@ -28,4 +28,7 @@ void clarion_dispmicom_set_sink(DeviceState *dev, ClarionDispMicomSink fn,
 /* Байт від гостя (запис у SCFTDR того SCIF, до якого під'єднано панель). */
 void clarion_dispmicom_rx_byte(DeviceState *dev, uint8_t b);
 
+/* Колесо хоста в кроки TUNE; додатне — за годинниковою. Без панелі нічого. */
+void clarion_dispmicom_wheel(int detents);
+
 #endif
