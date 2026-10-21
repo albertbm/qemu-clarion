@@ -63,6 +63,7 @@
 #include "hw/misc/clarion_dispmicom.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
+#include "ui/input.h"
 
 #define DLE     0x10
 #define STX     0x02
@@ -131,6 +132,8 @@ struct ClarionDispMicomState {
 
     QEMUTimer *key_up;          /* відпускання клавіші, вставленої з монітора */
     uint8_t key_held;
+
+    QemuInputHandlerState *ih;  /* host keyboard, parallel to the qom-set path */
 };
 
 /* --- побудова кадру ---------------------------------------------------- */
@@ -327,6 +330,43 @@ static void disp_set_frame(Object *obj, const char *value, Error **errp)
     }
 }
 
+/* bezel codes per InputLcdKey (kepdrv, QY8605NB @0xEF880F1C); F5-F9 unproven */
+static int disp_key_code(int qcode)
+{
+    switch (qcode) {
+    case Q_KEY_CODE_F1: return 0x01;    /* Menu */
+    case Q_KEY_CODE_F2: return 0x03;    /* Back */
+    case Q_KEY_CODE_F3: return 0x31;    /* Screen off, real unit wants a 2s hold */
+    case Q_KEY_CODE_F4: return 0x32;    /* Current position */
+    case Q_KEY_CODE_F5: return 0x13;    /* Camera? */
+    case Q_KEY_CODE_F6: return 0x30;    /* Audio-TV? may be swapped with F5 */
+    case Q_KEY_CODE_F7: return 0x00;    /* seek pair, A side, direction unproven */
+    case Q_KEY_CODE_F8: return 0x20;    /* seek pair, B side */
+    case Q_KEY_CODE_F9: return 0x10;    /* TUNE knob push */
+    default: return -1;
+    }
+}
+
+/* host keyboard, separate from the qom-set path above but the same wire frame */
+static void disp_key_event(DeviceState *dev, QemuConsole *src,
+                           QemuInputEvent *evt)
+{
+    ClarionDispMicomState *s = CLARION_DISPMICOM(dev);
+    int code = disp_key_code(qemu_input_linux_to_qcode(evt->key.key));
+
+    if (code < 0) {
+        return;
+    }
+    disp_queue(s, (const uint8_t[]){ CMD_KEY,
+               code | (evt->key.down ? KEY_PRESSED : 0) }, 2);
+}
+
+static const QemuInputHandler disp_key_handler = {
+    .name  = "Clarion QY8 panel keys",
+    .mask  = INPUT_EVENT_MASK_KEY,
+    .event = disp_key_event,
+};
+
 void clarion_dispmicom_rx_byte(DeviceState *dev, uint8_t b)
 {
     ClarionDispMicomState *s = CLARION_DISPMICOM(dev);
@@ -424,6 +464,14 @@ static void clarion_dispmicom_realize(DeviceState *dev, Error **errp)
     s->frames = g_queue_new();
     s->tx = timer_new_ns(QEMU_CLOCK_VIRTUAL, disp_tx_expire, s);
     s->key_up = timer_new_ns(QEMU_CLOCK_VIRTUAL, disp_key_up, s);
+    s->ih = qemu_input_handler_register(dev, &disp_key_handler);
+}
+
+static void clarion_dispmicom_unrealize(DeviceState *dev)
+{
+    ClarionDispMicomState *s = CLARION_DISPMICOM(dev);
+
+    qemu_input_handler_unregister(s->ih);
 }
 
 static void clarion_dispmicom_class_init(ObjectClass *klass, const void *data)
@@ -432,6 +480,7 @@ static void clarion_dispmicom_class_init(ObjectClass *klass, const void *data)
     ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     dc->realize = clarion_dispmicom_realize;
+    dc->unrealize = clarion_dispmicom_unrealize;
     dc->desc = "Clarion QY8XXX display panel micom (SCIF1 link)";
     rc->phases.hold = clarion_dispmicom_reset_hold;
     object_class_property_add_str(klass, "key", NULL, disp_set_key);
