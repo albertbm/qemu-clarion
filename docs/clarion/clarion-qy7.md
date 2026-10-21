@@ -109,8 +109,9 @@ identity was not recovered from the available runtime state.
 ## Verified MCAN PUSH_SW routes
 
 These rows record guest-visible mappings from read-only QY7 captures. They do
-not claim that host keyboard aliases are wired to CAN input yet; current
-keyboard injection still binds only `M` and `B` through the display micom.
+not claim physical names for rows without a visible result. QY7 host keyboard
+aliases send only the four proven controls through MCAN `PUSH_SW`; `M` and `B`
+retain their existing display-micom behavior.
 
 | Panel control | Hard key | VKey | Verified guest result | Route |
 |---|---:|---:|---|---|
@@ -118,6 +119,18 @@ keyboard injection still binds only `M` and `B` through the display micom.
 | MENU | `0x44` | `0x1C` | Opens `MENY` from the map after readiness | MCAN `PUSH_SW` |
 | STATUS | `0x31` | `0x1A` | Opens `Status / Lyd av / Ingen rute` | MCAN `PUSH_SW` |
 | ZERO EMISSION | `0x4C` | `0x1F` | Opens the Zero Emission menu from the map | MCAN `PUSH_SW` |
+
+| Host key | Hard key | Panel control |
+|---|---:|---|
+| `N` | `0x44` | MENU |
+| `P` | `0x0C` | MAP/VOICE |
+| `T` | `0x31` | STATUS |
+| `Z` | `0x4C` | ZERO EMISSION |
+
+The MCAN keyboard input property is enabled only on QY7. Its first host key
+starts the observed F-frame refresh and sends the observed `E0`/type-2 setup
+before the press/release pair. Later pairs advance the three-bit message number
+so both frames pass the session duplicate filter.
 
 Other tested codes remain unnamed unless a visible result matched a control
 on the panel photo. `0x12` and `0x47` remove a route overlay in the tested

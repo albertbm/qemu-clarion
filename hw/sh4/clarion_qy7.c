@@ -9,6 +9,7 @@
 #include "hw/char/clarion_scif.h"
 #include "hw/char/clarion_qy7_uart.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
 #include "hw/dma/clarion_hpbdma.h"
 #include "hw/misc/unimp.h"
 #include "hw/misc/clarion_qy7_regs.h"
@@ -92,6 +93,12 @@ typedef struct QY7MachineState {
     bool micom_audio_off;
     bool micom_antitheft_release;
     DeviceState *scpu;
+    QEMUTimer *mcan_refresh;
+    QEMUTimer *mcan_key_timer;
+    bool mcan_keyboard_started;
+    uint8_t mcan_sequence;
+    uint8_t mcan_key_code;
+    unsigned mcan_key_stage;
     ClarionRcan *rcan;
     uint32_t du_dotclk;
     uint32_t du_panel_width;
@@ -101,6 +108,9 @@ typedef struct QY7MachineState {
 typedef struct QY7DispSink {
     ClarionScif *scif;
 } QY7DispSink;
+
+static void qy7_mcan_refresh(void *opaque);
+static void qy7_mcan_key_timer(void *opaque);
 
 static void qy7_uart_tx(void *opaque, uint8_t byte)
 {
@@ -160,6 +170,8 @@ static void qy7_machine_instance_init(Object *obj)
     s->micom_generic_reply_subcode = 0;
     s->micom_audio_off = true;
     s->micom_antitheft_release = true;
+    s->mcan_refresh = timer_new_ns(QEMU_CLOCK_VIRTUAL, qy7_mcan_refresh, s);
+    s->mcan_key_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, qy7_mcan_key_timer, s);
     object_property_add_uint8_ptr(obj, "micom-generic-reply-subcode",
         &s->micom_generic_reply_subcode, OBJ_PROP_FLAG_READWRITE);
     /*
@@ -213,6 +225,106 @@ static bool qy7_get_bcm(Object *obj, Error **errp)
 static void qy7_set_bcm(Object *obj, bool value, Error **errp)
 {
     ((QY7MachineState *)obj)->bcm_on = value;
+}
+
+static void qy7_inject_can(QY7MachineState *s, uint16_t id, const uint8_t *data,
+                           unsigned len)
+{
+    if (!clarion_rcan_inject(s->rcan, id, data, len)) {
+        clarion_scpu_can_rx(s->scpu, id, data, len);
+    }
+}
+
+static void qy7_mcan_refresh(void *opaque)
+{
+    QY7MachineState *s = opaque;
+    static const uint8_t frame[8] = { 0xf0, 0x00, 0x00, 0x01 };
+
+    if (!s->mcan_keyboard_started) {
+        return;
+    }
+    qy7_inject_can(s, 0x681, frame, sizeof(frame));
+    timer_mod(s->mcan_refresh,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 140 * 1000 * 1000);
+}
+
+static uint8_t qy7_mcan_next_sequence(QY7MachineState *s)
+{
+    s->mcan_sequence = (s->mcan_sequence + 0x10) & 0x70;
+    if (!s->mcan_sequence) {
+        s->mcan_sequence = 0x10;
+    }
+    return s->mcan_sequence;
+}
+
+static void qy7_mcan_key_timer(void *opaque)
+{
+    QY7MachineState *s = opaque;
+    static const uint8_t ack[8] = { 0xe0 };
+    static const uint8_t state[8] = { 0x03, 0x40, 0x00, 0x2c };
+    uint8_t frame[8] = { 0x04, 0, 0x40, 0x0d };
+
+    if (s->mcan_key_stage == 3) {
+        qy7_inject_can(s, 0x681, ack, sizeof(ack));
+        s->mcan_key_stage = 4;
+        timer_mod(s->mcan_key_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 20 * 1000 * 1000);
+        return;
+    }
+    if (s->mcan_key_stage == 4) {
+        qy7_inject_can(s, 0x681, state, sizeof(state));
+        s->mcan_key_stage = 1;
+        timer_mod(s->mcan_key_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1600 * 1000 * 1000);
+        return;
+    }
+    if (s->mcan_key_stage == 1) {
+        frame[1] = qy7_mcan_next_sequence(s);
+        frame[4] = s->mcan_key_code | 0x80;
+        qy7_inject_can(s, 0x681, frame, sizeof(frame));
+        s->mcan_key_stage = 2;
+        timer_mod(s->mcan_key_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 150 * 1000 * 1000);
+        return;
+    }
+    if (s->mcan_key_stage == 2) {
+        frame[1] = qy7_mcan_next_sequence(s);
+        frame[4] = s->mcan_key_code;
+        qy7_inject_can(s, 0x681, frame, sizeof(frame));
+        s->mcan_key_stage = 0;
+        qemu_log("clarion-qy7: MCAN panel key pair code=%02x\n",
+                 s->mcan_key_code);
+    }
+}
+
+static void qy7_mcan_key(void *opaque, uint8_t code, bool down)
+{
+    QY7MachineState *s = opaque;
+    static const uint8_t start[8] = { 0xf0, 0x00, 0x00, 0x01 };
+    int64_t delay_ms;
+
+    if (!down) {
+        return;
+    }
+    if (s->mcan_key_stage) {
+        qemu_log("clarion-qy7: MCAN panel key busy; ignored code=%02x\n", code);
+        return;
+    }
+    if (!s->mcan_keyboard_started) {
+        s->mcan_keyboard_started = true;
+        s->mcan_sequence = 0x40;
+        qy7_inject_can(s, 0x681, start, sizeof(start));
+        timer_mod(s->mcan_refresh,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 140 * 1000 * 1000);
+        delay_ms = 40;
+        s->mcan_key_stage = 3;
+    } else {
+        delay_ms = 200;
+        s->mcan_key_stage = 1;
+    }
+    s->mcan_key_code = code;
+    timer_mod(s->mcan_key_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + delay_ms * 1000 * 1000);
 }
 
 static void qy7_set_can_raw(Object *obj, const char *value, Error **errp)
@@ -570,6 +682,7 @@ static void qy7_init(MachineState *machine)
     dispmicom = qdev_new(TYPE_CLARION_DISPMICOM);
     qdev_prop_set_bit(dispmicom, "touch-input", true);
     qdev_prop_set_bit(dispmicom, "key-input", true);
+    qdev_prop_set_bit(dispmicom, "can-key-input", true);
     object_property_add_child(qdev_get_machine(), "qy7-dispmicom",
                               OBJECT(dispmicom));
     qdev_realize_and_unref(dispmicom, NULL, &error_fatal);
@@ -578,6 +691,7 @@ static void qy7_init(MachineState *machine)
     scif3->dispmicom = dispmicom;
     scif3->dispmicom_tx = clarion_dispmicom_rx_byte;
     clarion_dispmicom_set_sink(dispmicom, qy7_dispmicom_sink, disp_sink);
+    clarion_dispmicom_set_can_key_sink(dispmicom, qy7_mcan_key, qmachine);
     /* SCIF7: the same polling routine, SCFSR at VA 0x2f0010. */
     qy7_scif_with_alias(sysmem, QY7_SCIF7_BASE, "qy7.scif7", 7,
                         clarion_qy7_int2_scif_irq(int2, 7));

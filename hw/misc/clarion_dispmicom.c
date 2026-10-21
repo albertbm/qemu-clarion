@@ -147,8 +147,11 @@ struct ClarionDispMicomState {
     bool touch_down;
     bool touch_dirty;
     bool key_input;
+    bool can_key_input;
     QemuInputHandlerState *key_input_handler;
     uint32_t key_down_mask;
+    ClarionDispMicomCanKey can_key;
+    void *can_key_opaque;
 };
 
 static void disp_frame_free(DispFrame *frame)
@@ -491,11 +494,12 @@ static const QemuInputHandler disp_touch_handler = {
 typedef struct DispKeyMap {
     unsigned int qemu_key;
     uint8_t panel_code;
+    bool mcan;
 } DispKeyMap;
 
 static const DispKeyMap disp_key_map[] = {
-    { KEY_M, 1 },
-    { KEY_B, 0x21 },
+    { KEY_M, 1, false },   { KEY_B, 0x21, false }, { KEY_N, 0x44, true },
+    { KEY_P, 0x0c, true }, { KEY_T, 0x31, true },  { KEY_Z, 0x4c, true },
 };
 
 static void disp_key_event(DeviceState *dev, QemuConsole *src,
@@ -510,13 +514,19 @@ static void disp_key_event(DeviceState *dev, QemuConsole *src,
         return;
     }
     for (i = 0; i < ARRAY_SIZE(disp_key_map); i++) {
+        uint32_t bit;
+
         if (evt->key.key == disp_key_map[i].qemu_key) {
-            uint32_t bit = 1U << i;
+            if (disp_key_map[i].mcan && !s->can_key_input) {
+                return;
+            }
+            bit = 1U << i;
 
             if (evt->key.down) {
                 if (s->key_down_mask & bit) {
                     qemu_log("clarion-dispmicom: panel-key repeat-suppressed "
-                             "code=%02x\n", disp_key_map[i].panel_code);
+                             "code=%02x\n",
+                             disp_key_map[i].panel_code);
                     return;
                 }
                 s->key_down_mask |= bit;
@@ -526,8 +536,15 @@ static void disp_key_event(DeviceState *dev, QemuConsole *src,
                 }
                 s->key_down_mask &= ~bit;
             }
-            data[1] = disp_key_map[i].panel_code |
-                      (evt->key.down ? 0x80 : 0x00);
+            if (disp_key_map[i].mcan) {
+                if (s->can_key) {
+                    s->can_key(s->can_key_opaque, disp_key_map[i].panel_code,
+                               evt->key.down);
+                }
+                return;
+            }
+            data[1] =
+                disp_key_map[i].panel_code | (evt->key.down ? 0x80 : 0x00);
             qemu_log("clarion-dispmicom: panel-key code=%02x down=%u\n",
                      disp_key_map[i].panel_code, evt->key.down);
             disp_queue_key(s, data, sizeof(data));
@@ -661,6 +678,15 @@ void clarion_dispmicom_set_sink(DeviceState *dev, ClarionDispMicomSink fn,
     s->sink_opaque = opaque;
 }
 
+void clarion_dispmicom_set_can_key_sink(DeviceState *dev,
+                                        ClarionDispMicomCanKey fn, void *opaque)
+{
+    ClarionDispMicomState *s = CLARION_DISPMICOM(dev);
+
+    s->can_key = fn;
+    s->can_key_opaque = opaque;
+}
+
 /* --- QOM --------------------------------------------------------------- */
 
 static void clarion_dispmicom_reset_hold(Object *obj, ResetType type)
@@ -708,6 +734,8 @@ static void clarion_dispmicom_realize(DeviceState *dev, Error **errp)
 static const Property clarion_dispmicom_props[] = {
     DEFINE_PROP_BOOL("touch-input", ClarionDispMicomState, touch_input, false),
     DEFINE_PROP_BOOL("key-input", ClarionDispMicomState, key_input, false),
+    DEFINE_PROP_BOOL("can-key-input", ClarionDispMicomState, can_key_input,
+                     false),
 };
 
 static void clarion_dispmicom_class_init(ObjectClass *klass, const void *data)

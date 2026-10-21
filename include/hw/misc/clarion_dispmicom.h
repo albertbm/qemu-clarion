@@ -21,9 +21,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(ClarionDispMicomState, CLARION_DISPMICOM)
  * досилає, коли драйвер вичитає попереднє.
  */
 typedef int (*ClarionDispMicomSink)(void *opaque, const uint8_t *buf, int len);
+typedef void (*ClarionDispMicomCanKey)(void *opaque, uint8_t code, bool down);
 
 void clarion_dispmicom_set_sink(DeviceState *dev, ClarionDispMicomSink fn,
                                 void *opaque);
+void clarion_dispmicom_set_can_key_sink(DeviceState *dev,
+                                        ClarionDispMicomCanKey fn,
+                                        void *opaque);
 
 /* Байт від гостя (запис у SCFTDR того SCIF, до якого під'єднано панель). */
 void clarion_dispmicom_rx_byte(DeviceState *dev, uint8_t b);
