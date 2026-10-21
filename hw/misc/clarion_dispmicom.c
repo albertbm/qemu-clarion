@@ -136,7 +136,7 @@ struct ClarionDispMicomState {
 
     QemuInputHandlerState *ih;  /* host keyboard, parallel to the qom-set path */
 
-    bool panel_jpn;              /* bezel code table: false = eur (0x10180201), true = jpn (0x10180202) */
+    bool panel_jpn;              /* bezel code table: false = row (0x10180201), true = jpn (0x10180202) */
 };
 
 /* --- побудова кадру ---------------------------------------------------- */
@@ -335,9 +335,9 @@ static void disp_set_frame(Object *obj, const char *value, Error **errp)
 
 /*
  * Bezel codes per InputLcdKey. Two panel tables measured off kepdrv.dll
- * (REPORT-bezel-keys.md): jpn is 0x10180202 (QY8605NB), eur is 0x10180201
- * (QY8602NB, QY8600NE - eur covers both markets). Same function, same
- * host F-key, different matrix code per table.
+ * (REPORT-bezel-keys.md): jpn is 0x10180202 (QY8605NB), row is 0x10180201
+ * (QY8602NB, QY8600NE, and UK by the owner's research). Same function,
+ * same host F-key, different matrix code per table.
  */
 static int disp_key_code(ClarionDispMicomState *s, int qcode)
 {
@@ -361,7 +361,7 @@ static uint8_t disp_detents(int n)
     return n < 0 ? 0x80 | MIN(-n, 0x7f) : MIN(n, 0x7f);
 }
 
-/* kepdrv swaps the two bytes by panel: jpn sends 35 VOL TUNE, eur 35 TUNE VOL */
+/* kepdrv swaps the two bytes by panel: jpn sends 35 VOL TUNE, row 35 TUNE VOL */
 static void disp_rotary(ClarionDispMicomState *s, int vol, int tune)
 {
     uint8_t v = disp_detents(vol), t = disp_detents(tune);
@@ -536,10 +536,10 @@ static void clarion_dispmicom_unrealize(DeviceState *dev)
     }
 }
 
-/* qom-set/-global panel=jpn|eur: which bezel code table disp_key_code uses */
+/* qom-set/-global panel=jpn|row: which bezel code table disp_key_code uses */
 static char *disp_panel_get(Object *obj, Error **errp)
 {
-    return g_strdup(CLARION_DISPMICOM(obj)->panel_jpn ? "jpn" : "eur");
+    return g_strdup(CLARION_DISPMICOM(obj)->panel_jpn ? "jpn" : "row");
 }
 
 static void disp_panel_set(Object *obj, const char *value, Error **errp)
@@ -548,10 +548,10 @@ static void disp_panel_set(Object *obj, const char *value, Error **errp)
 
     if (!strcmp(value, "jpn")) {
         s->panel_jpn = true;
-    } else if (!strcmp(value, "eur")) {
+    } else if (!strcmp(value, "row")) {
         s->panel_jpn = false;
     } else {
-        error_setg(errp, "panel: expected jpn or eur");
+        error_setg(errp, "panel: expected jpn or row");
     }
 }
 
