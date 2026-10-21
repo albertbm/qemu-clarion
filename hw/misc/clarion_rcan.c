@@ -241,6 +241,10 @@ static void rcan_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
         uint16_t byte_value = high_byte ? (value & 0xff) << 8 : value & 0xff;
 
         *reg = (*reg & ~byte_mask) | byte_value;
+    } else if (size == 4 && addr == RCAN_TXPR1) {
+        *rcan_reg(s, RCAN_TXPR1) |= value;
+        *rcan_reg(s, RCAN_TXPR0) |= value >> 16;
+        rcan_start_transmit(s, value);
     } else if (size == 2 && !(addr & 1)) {
         if (addr == RCAN_MCR) {
             rcan_write_mcr(s, value);
@@ -281,8 +285,10 @@ static const MemoryRegionOps rcan_ops = {
     .read = rcan_read,
     .write = rcan_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 4,
     .valid.min_access_size = 1,
-    .valid.max_access_size = 2,
+    .valid.max_access_size = 4,
 };
 
 static void rcan_reset(void *opaque)
