@@ -69,7 +69,10 @@
 #define INT2_SCIF_INDEX (INT2_RCAN_INDEX + 1)
 #define INT2_SOURCE_COUNT (INT2_TMU_CHANNELS + INT2_HPB_CHANNELS + \
                            INT2_DISPLAY_SOURCES + INT2_SDHI_SOURCES + \
-                           2 + INT2_SCIF_CHANNELS)
+                           2 + INT2_SCIF_CHANNELS + 1)
+#define INT2_EXTIRQ_INDEX (INT2_SOURCE_COUNT - 1)
+#define INT2_EXTIRQ_GROUP_BIT 18
+#define INT2_EXTIRQ_PRIORITY 11
 /*
  * Sub-CPU link UART (CAN.dll registers SYSINTR 26 for it).  The ISRs that
  * return SYSINTR 26 sit in slots 63 (vector 0x9e0) and 65 (vector 0xa20);
@@ -123,6 +126,8 @@ struct ClarionQy7Int2 {
     bool uart_pending;
     qemu_irq rcan_irq;
     bool rcan_pending;
+    qemu_irq extirq;
+    bool extirq_pending;
     qemu_irq scif_irq[INT2_SCIF_CHANNEL_COUNT];
     uint32_t scif_pending;
     uint32_t unk[INT2_UNK_SLOTS];
@@ -248,6 +253,15 @@ static void int2_update(ClarionQy7Int2 *s)
             pending += source->pending;
         }
     }
+    {
+        struct intc_source *source = &s->src[INT2_EXTIRQ_INDEX];
+
+        source->vect = 0x240;
+        source->priority = INT2_EXTIRQ_PRIORITY;
+        source->pending = s->extirq_pending &&
+                          !(s->mask & BIT(INT2_EXTIRQ_GROUP_BIT));
+        pending += source->pending;
+    }
     s->desc.pending = pending;
     if (pending) {
         cpu_interrupt(s->cpu, CPU_INTERRUPT_HARD);
@@ -313,6 +327,15 @@ static void int2_rcan_set(void *opaque, int n, int level)
 
     (void)n;
     s->rcan_pending = !!level;
+    int2_update(s);
+}
+
+static void int2_extirq_set(void *opaque, int n, int level)
+{
+    ClarionQy7Int2 *s = opaque;
+
+    (void)n;
+    s->extirq_pending = !!level;
     int2_update(s);
 }
 
@@ -406,6 +429,7 @@ static void int2_reset(void *opaque)
     s->sdhi_pending = 0;
     s->uart_pending = false;
     s->rcan_pending = false;
+    s->extirq_pending = false;
     s->scif_pending = 0;
     memset(s->unk, 0, sizeof(s->unk));
     int2_update(s);
@@ -453,6 +477,7 @@ ClarionQy7Int2 *clarion_qy7_int2_init(MemoryRegion *sysmem, hwaddr base,
     }
     s->uart_irq = qemu_allocate_irq(int2_uart_set, s, 0);
     s->rcan_irq = qemu_allocate_irq(int2_rcan_set, s, 0);
+    s->extirq = qemu_allocate_irq(int2_extirq_set, s, 0);
     memory_region_init_io(&s->iomem, NULL, &int2_ops, s, "qy7.int2",
                           INT2_SIZE);
     memory_region_add_subregion(sysmem, base, &s->iomem);
@@ -508,4 +533,9 @@ qemu_irq clarion_qy7_int2_uart_irq(ClarionQy7Int2 *s)
 qemu_irq clarion_qy7_int2_rcan_irq(ClarionQy7Int2 *s)
 {
     return s->rcan_irq;
+}
+
+qemu_irq clarion_qy7_int2_extirq(ClarionQy7Int2 *s)
+{
+    return s->extirq;
 }

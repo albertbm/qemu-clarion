@@ -36,5 +36,6 @@ qemu_irq clarion_qy7_int2_uart_irq(ClarionQy7Int2 *s);
 
 /* RCAN input: INTEVT 0x880, priority-table slot 52, INT2 group bit 17. */
 qemu_irq clarion_qy7_int2_rcan_irq(ClarionQy7Int2 *s);
+qemu_irq clarion_qy7_int2_extirq(ClarionQy7Int2 *s);
 
 #endif

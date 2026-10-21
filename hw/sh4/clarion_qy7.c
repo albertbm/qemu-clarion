@@ -83,6 +83,7 @@ typedef struct QY7MachineState {
     MachineState parent_obj;
     uint8_t dipsw;
     uint16_t status0_inputs;
+    bool extint_model;
     bool paired_card;
     bool micom_on;
     bool bcm_on;
@@ -151,6 +152,7 @@ static void qy7_machine_instance_init(Object *obj)
     s->dipsw = 7;
     /* Assumed asserted PowerMonitor input levels (STATUS0 bits 7 and 9). */
     s->status0_inputs = 0x0280;
+    s->extint_model = true;
     s->paired_card = true;
     s->micom_on = true;
     s->bcm_on = true;
@@ -281,6 +283,16 @@ static void qy7_set_can_raw(Object *obj, const char *value, Error **errp)
 static bool qy7_get_micom_generic_reply(Object *obj, Error **errp)
 {
     return ((QY7MachineState *)obj)->micom_generic_reply;
+}
+
+static bool qy7_get_extint_model(Object *obj, Error **errp)
+{
+    return ((QY7MachineState *)obj)->extint_model;
+}
+
+static void qy7_set_extint_model(Object *obj, bool value, Error **errp)
+{
+    ((QY7MachineState *)obj)->extint_model = value;
 }
 
 static void qy7_set_micom_generic_reply(Object *obj, bool value, Error **errp)
@@ -475,7 +487,9 @@ static void qy7_init(MachineState *machine)
     memory_region_init_ram(ram, NULL, "qy7.ram", QY7_RAM_SIZE, &error_fatal);
     memory_region_add_subregion(sysmem, QY7_RAM_BASE, ram);
     clarion_qy7_regs_init(sysmem, qmachine->dipsw,
-                          qmachine->status0_inputs);
+                          qmachine->status0_inputs,
+                          qmachine->extint_model,
+                          clarion_qy7_int2_extirq(int2));
 
     qmachine->rcan = clarion_rcan_init(sysmem, 0x1ffd0000,
                                        clarion_qy7_int2_rcan_irq(int2));
@@ -676,6 +690,11 @@ static void qy7_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_uint16_ptr(
         oc, "status0-inputs", offsetof(QY7MachineState, status0_inputs),
         OBJ_PROP_FLAG_READWRITE);
+    object_class_property_add_bool(oc, "extint-model",
+                                   qy7_get_extint_model,
+                                   qy7_set_extint_model);
+    object_class_property_set_description(oc, "extint-model",
+        "Enable the QY7 external interrupt controller model (default on)");
     object_class_property_set_description(
         oc, "status0-inputs",
         "Assumed input level bitmap for board STATUS0 (default 0x0280)");
