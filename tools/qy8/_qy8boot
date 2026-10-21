@@ -1,0 +1,38 @@
+#compdef qy8boot
+
+_qy8boot() {
+  local -a lines units variants
+  lines=(${(f)"$(qy8boot --list 2>/dev/null)"})
+  units=(${lines%% *})
+
+  if (( CURRENT == 2 )); then
+    _describe 'unit' units
+    return
+  fi
+
+  if (( CURRENT == 3 )); then
+    local unit=${words[2]} line
+    for line in $lines; do
+      if [[ ${line%% *} == $unit ]]; then
+        variants=(${(s: :)${line#* }})
+        _describe 'variant' variants
+        return
+      fi
+    done
+  fi
+
+  _arguments \
+    '-n[nand image]:nand file:_files' \
+    '-m[model]:model:(ze0 me0 ze1)' \
+    '-b[board]:board:' \
+    '-w[work dir]:dir:_files -/' \
+    '-s[qmp socket]:socket:_files' \
+    '-t[timeout secs]:secs:' \
+    '-u[keep update flag]' \
+    '-p[screendump and quit]' \
+    '-g[open window]' \
+    '--dry[print the command instead of running it]' \
+    '*:card image:_files'
+}
+
+_qy8boot "$@"

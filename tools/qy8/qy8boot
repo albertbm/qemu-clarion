@@ -1,0 +1,90 @@
+#!/bin/bash
+# Short front end for qy8boot.sh: unit/variant presets instead of a long flag line.
+#
+#   qy8boot UNIT [VARIANT] [extra qy8boot.sh flags...]
+#   qy8boot --list
+#
+# Defaults: -g -w /Volumes/ABM/work/<unit>[-<variant>] -s /tmp/<unit>.qmp -t 3600,
+# plus the unit's card and NAND. Extra flags pass through to qy8boot.sh and override
+# the defaults (later wins); a bare path among them overrides the card. --dry prints
+# the qy8boot.sh command instead of running it. Quiet by default (summary line, work
+# dir, final state); pass -v through to show everything, as before.
+#
+# Unit presets (card/NAND paths) are not in this repo. They live in
+# ~/.config/qy8boot/units, same five-field format as units.example beside this script.
+set -e
+
+HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+ENGINE="$HERE/qy8boot.sh"
+CONF=~/.config/qy8boot/units
+
+[ -f "$CONF" ] || {
+  echo "no $CONF - copy $HERE/units.example there and fill in your card/NAND paths" >&2
+  exit 1
+}
+PRESETS=$'\n'"$(grep -v '^[[:space:]]*#' "$CONF")"
+
+list_units() {
+  local last=
+  while read -r unit variant _card _nand _extra; do
+    [ -z "$unit" ] && continue
+    if [ "$unit" != "$last" ]; then
+      [ -n "$last" ] && echo
+      printf '%s' "$unit"
+      last=$unit
+    fi
+    printf ' %s' "$variant"
+  done <<< "$PRESETS"
+  echo
+}
+
+[ $# -eq 0 ] && { list_units; exit 0; }
+case $1 in
+  --list) list_units; exit 0 ;;
+  -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
+esac
+
+UNIT=$1; shift
+grep -q "^$UNIT " <<< "$PRESETS" || { echo "unknown unit $UNIT (qy8boot --list)" >&2; exit 1; }
+
+DEFAULT_VARIANT=$(awk -v u="$UNIT" '$1==u{print $2; exit}' <<< "$PRESETS")
+VARIANT=$DEFAULT_VARIANT
+EXPLICIT_VARIANT=
+if [ -n "$1" ] && [[ $1 != -* ]] && grep -q "^$UNIT $1 " <<< "$PRESETS"; then
+  VARIANT=$1; EXPLICIT_VARIANT=1; shift
+fi
+
+read -r _u _v CARD NAND EXTRA <<< "$(awk -v u="$UNIT" -v v="$VARIANT" '$1==u && $2==v' <<< "$PRESETS")"
+[ "$EXTRA" = "-" ] && EXTRA=
+
+# pull --dry out of the pass-through args before anything else sees them
+ARGS=(); DRY=
+for a in "$@"; do
+  [ "$a" = "--dry" ] && { DRY=1; continue; }
+  ARGS+=("$a")
+done
+
+# a bare (non-flag) token among the extras overrides the card; flags that take
+# a value (n m b w s t) must skip their own argument so it isn't mistaken for one
+PASS=(); SKIPVAL=
+for a in "${ARGS[@]}"; do
+  if [ -n "$SKIPVAL" ]; then PASS+=("$a"); SKIPVAL=; continue; fi
+  case $a in
+    -n|-m|-b|-w|-s|-t) PASS+=("$a"); SKIPVAL=1 ;;
+    -*) PASS+=("$a") ;;
+    *) CARD=$a ;;
+  esac
+done
+
+W=/Volumes/ABM/work/$UNIT${EXPLICIT_VARIANT:+-$VARIANT}
+SOCK=/tmp/$UNIT.qmp
+
+CMD=("$ENGINE" "$CARD" -g -w "$W" -s "$SOCK" -t 3600 -n "$NAND")
+[ -n "$EXTRA" ] && CMD+=($EXTRA)
+CMD+=("${PASS[@]}")
+
+if [ -n "$DRY" ]; then
+  printf '%q ' "${CMD[@]}"; echo
+else
+  exec "${CMD[@]}"
+fi
