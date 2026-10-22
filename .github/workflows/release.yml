@@ -1,0 +1,107 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+          - os: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install ninja pkg-config glib pixman gnutls capstone libslirp \
+              libssh libusb zstd libpng snappy lzo
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              build-essential ninja-build pkg-config python3 python3-venv \
+              libglib2.0-dev libpixman-1-dev libgnutls28-dev libcapstone-dev \
+              libslirp-dev libssh-dev libusb-1.0-0-dev libzstd-dev libpng-dev \
+              libsnappy-dev liblzo2-dev libsdl2-dev flex bison patchelf
+
+      - name: Configure
+        run: |
+          mkdir build-pkg
+          cd build-pkg
+          # macOS uses the Cocoa UI; SDL would drag in an unbundleable SDL3.
+          extra=
+          [ "$RUNNER_OS" = macOS ] && extra=--disable-sdl
+          ../configure --target-list=arm-softmmu,sh4-softmmu \
+              --disable-werror --enable-plugins --disable-docs $extra
+
+      - name: Build
+        run: ninja -C build-pkg qemu-system-arm qemu-system-sh4 qemu-clarion
+
+      - name: Package
+        id: pkg
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag=$GITHUB_REF_NAME
+          else
+            tag=dev-$(git rev-parse --short HEAD)
+          fi
+          archive=$(scripts/clarion/package.sh -b build-pkg -o dist "$tag")
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test
+        run: |
+          mkdir smoke
+          tar -C smoke -xzf "${{ steps.pkg.outputs.archive }}"
+          cd smoke/qemu-clarion-*
+          # The launcher prints usage and exits non-zero without arguments.
+          ./qemu-clarion 2>&1 | grep -i usage
+          libexec/qemu-system-arm -M help | grep clarion
+          libexec/qemu-system-sh4 -M help | grep clarion
+          # No shared library may be resolved outside the archive.
+          if [ "$RUNNER_OS" = macOS ]; then
+            if otool -L qemu-clarion libexec/* lib/* | grep -E '/opt/homebrew|/usr/local'; then
+              exit 1
+            fi
+          else
+            ldd libexec/* | grep -v "$PWD" | grep '=> /' | grep -vE 'lib(c|m|dl|pthread|rt|util|resolv)\.so' && exit 1
+            true
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ runner.os }}-package
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1 ||
+              gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz --clobber
