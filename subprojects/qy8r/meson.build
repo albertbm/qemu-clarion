@@ -5,11 +5,11 @@ egl_dep = dependency('egl', required: false)
 gles_dep = dependency('glesv2', required: false)
 cc = meson.get_compiler('c')
 
-qy8r_usp = static_library('qy8r_usp', 'qy8r_usp.c', install: true)
+qy8r_usp = static_library('qy8r_usp', 'qy8r_usp.c', pic: true, install: true)
 qy8r_usp_cpu = static_library('qy8r_usp_cpu', 'qy8r_usp_cpu.c',
-  link_with: qy8r_usp, install: true)
+  link_with: qy8r_usp, pic: true, install: true)
 qy8r_usp_glsl = static_library('qy8r_usp_glsl', 'qy8r_usp_glsl.c',
-  link_with: qy8r_usp, install: true)
+  link_with: qy8r_usp, pic: true, install: true)
 
 qy8r_sw = static_library('qy8r_sw',
   'qy8r.c',
@@ -17,7 +17,7 @@ qy8r_sw = static_library('qy8r_sw',
   'qy8r_sw_raster.c',
   'qy8r_usp.c',
   'qy8r_usp_cpu.c',
-  include_directories: include_directories('.'))
+  include_directories: include_directories('.'), pic: true)
 qy8r_sw_dep = declare_dependency(
   include_directories: include_directories('.'),
   link_with: qy8r_sw)
