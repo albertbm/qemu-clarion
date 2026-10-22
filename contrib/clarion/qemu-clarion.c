@@ -176,7 +176,14 @@ int main(int argc, char **argv)
         program_path = g_strdup(argv[0]);
     }
     directory = g_path_get_dirname(program_path);
-    emulator = g_strdup_printf("%s/qemu-system-%s", directory, board->target);
+    /* Release packages keep the engines in libexec/; build trees do not. */
+    emulator = g_strdup_printf("%s/libexec/qemu-system-%s", directory,
+                               board->target);
+    if (!g_file_test(emulator, G_FILE_TEST_IS_EXECUTABLE)) {
+        g_free(emulator);
+        emulator = g_strdup_printf("%s/qemu-system-%s", directory,
+                                   board->target);
+    }
     args = g_new0(char *, argc + 14);
     args[arg_count++] = emulator;
     args[arg_count++] = (char *)"-M";
