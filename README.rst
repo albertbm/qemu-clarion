@@ -28,6 +28,19 @@ No firmware is included. You supply dumps taken from your own unit.
      - ``clarion-qy8``
      - ``qemu-system-arm``
      - boots to the consent screen
+   * - QY8602NB, QY8600NE
+     - ARM (Renesas R-Car)
+     - ``clarion-qy8``
+     - ``qemu-system-arm``
+     - 2018+ Leaf (ZE1), European and US units; recognised from the
+       ``PROD`` block, same board as QY8652NB (TMA460 touch). Not yet run by
+       the maintainer
+   * - QY8202PB
+     - ARM (Renesas R-Car)
+     - ``clarion-qy8``
+     - ``qemu-system-arm``
+     - e-NV200 (ME0); recognised from the ``PROD`` block, same board as
+       QY8202NA (TMA616 touch). Not yet run by the maintainer
    * - QY7221NL
      - SH-4A
      - ``clarion-qy7``
@@ -102,7 +115,7 @@ starts QEMU. You never pass ``-M`` or ``-drive`` yourself.
    * - Argument
      - Meaning
    * - ``NOR``
-     - raw dump of the unit's NOR flash: 64 MiB for QY8652NB and QY8202NA,
+     - raw dump of the unit's NOR flash: 64 MiB for the QY8 units,
        8 MiB for QY7221NL
    * - ``SD``
      - optional raw image of the SD card for the front slot, including
