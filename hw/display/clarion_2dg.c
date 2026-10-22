@@ -38,7 +38,6 @@
 #define CLARION_2DG_HDR_BACK 0x70
 #define CLARION_2DG_HDR_LEN 0x08 /* byte offset of the length field */
 #define CLARION_2DG_MAX_WORDS (1 << 20)
-#define CLARION_2DG_FALLBACK_WORDS 16384
 #define CLARION_2DG_MAX_PATH 4096
 #define CLARION_2DG_MAX_DIM 8192
 #define CLARION_2DG_MAX_TEX 128
@@ -1246,6 +1245,14 @@ static unsigned clarion_2dg_run(Clarion2DGState *s, hwaddr list,
         break;
     }
     clarion_2dg_dst_release(c);
+    if (s->diag_trap < 0 && !c->stopped_op &&
+        walked >= max_words + CLARION_2DG_WALK_SLACK) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "clarion-2dg: list %08" HWADDR_PRIx
+                      " reached walk limit at %08" HWADDR_PRIx
+                      " after %u words without TRAP\n",
+                      list, pc, walked);
+    }
     if (qemu_loglevel_mask(LOG_UNIMP)) {
         GString *st = g_string_new(NULL);
         unsigned i;
@@ -1396,7 +1403,8 @@ static void clarion_2dg_write(void *opaque, hwaddr offset, uint64_t value,
             if (s->exec) {
                 walked = clarion_2dg_run(s, s->regs[CLARION_2DG_LIST / 4],
                                          hdr_words ? hdr_words :
-                                         CLARION_2DG_FALLBACK_WORDS);
+                                         CLARION_2DG_MAX_WORDS -
+                                         CLARION_2DG_WALK_SLACK);
             }
             if (s->diag_path && *s->diag_path) {
                 GString *ops = g_string_new(NULL);
