@@ -1252,6 +1252,31 @@ static gboolean read_present_buffer(uint32_t handle, PresentBuffer *buffer)
     return TRUE;
 }
 
+/* The default ring is app .120's; .271 maps its buffers elsewhere. */
+static gboolean learn_wsegl_ring(const PresentBuffer *buffer)
+{
+    uint32_t linear[3];
+
+    for (int i = 0; i < 3; i++) {
+        uint32_t entry;
+        uint64_t pa;
+
+        if (!read_u32((uint64_t)buffer->drawable + 0x14 + 4 * i, &entry) ||
+            !entry || !read_u32(entry, &linear[i]) || !linear[i] ||
+            !qemu_plugin_translate_vaddr(linear[i], &pa)) {
+            return FALSE;
+        }
+    }
+    if (linear[0] == linear[1] || linear[1] == linear[2] ||
+        linear[0] == linear[2] ||
+        (buffer->linear != linear[0] && buffer->linear != linear[1] &&
+         buffer->linear != linear[2])) {
+        return FALSE;
+    }
+    memcpy(wsegl_linear, linear, sizeof(linear));
+    return TRUE;
+}
+
 static gboolean present_buffer_is_supported(uint32_t handle,
                                             PresentBuffer *buffer)
 {
@@ -1260,6 +1285,9 @@ static gboolean present_buffer_is_supported(uint32_t handle,
         if (wsegl_linear[i] == buffer->linear) {
             known = TRUE;
         }
+    }
+    if (!known) {
+        known = learn_wsegl_ring(buffer);
     }
     if (!known) {
         present_skip("linear_not_in_ring", buffer->linear, buffer->index);
