@@ -274,6 +274,9 @@ static void int2_tmu_set(void *opaque, int n, int level)
 {
     ClarionQy7Int2 *s = opaque;
 
+    if (!!(s->tmu_lines & BIT(n)) == !!level) {
+        return;
+    }
     s->tmu_lines = deposit32(s->tmu_lines, n, 1, !!level);
     int2_update(s);
 }
@@ -282,6 +285,9 @@ static void int2_hpb_set(void *opaque, int n, int level)
 {
     ClarionQy7Int2 *s = opaque;
 
+    if (!!(s->hpb_pending & BIT(n)) == !!level) {
+        return;
+    }
     s->hpb_pending = deposit32(s->hpb_pending, n, 1, !!level);
     int2_update(s);
 }
@@ -291,6 +297,9 @@ static void int2_g2d_set(void *opaque, int n, int level)
     ClarionQy7Int2 *s = opaque;
 
     (void)n;
+    if (s->g2d_pending == !!level) {
+        return;
+    }
     s->g2d_pending = !!level;
     int2_update(s);
 }
@@ -300,6 +309,9 @@ static void int2_du_set(void *opaque, int n, int level)
     ClarionQy7Int2 *s = opaque;
 
     (void)n;
+    if (s->du_pending == !!level) {
+        return;
+    }
     s->du_pending = !!level;
     int2_update(s);
 }
@@ -308,6 +320,9 @@ static void int2_sdhi_set(void *opaque, int n, int level)
 {
     ClarionQy7Int2 *s = opaque;
 
+    if (!!(s->sdhi_pending & BIT(n)) == !!level) {
+        return;
+    }
     s->sdhi_pending = deposit32(s->sdhi_pending, n, 1, !!level);
     int2_update(s);
 }
@@ -317,6 +332,9 @@ static void int2_uart_set(void *opaque, int n, int level)
     ClarionQy7Int2 *s = opaque;
 
     (void)n;
+    if (s->uart_pending == !!level) {
+        return;
+    }
     s->uart_pending = !!level;
     int2_update(s);
 }
@@ -326,6 +344,9 @@ static void int2_rcan_set(void *opaque, int n, int level)
     ClarionQy7Int2 *s = opaque;
 
     (void)n;
+    if (s->rcan_pending == !!level) {
+        return;
+    }
     s->rcan_pending = !!level;
     int2_update(s);
 }
@@ -335,6 +356,9 @@ static void int2_extirq_set(void *opaque, int n, int level)
     ClarionQy7Int2 *s = opaque;
 
     (void)n;
+    if (s->extirq_pending == !!level) {
+        return;
+    }
     s->extirq_pending = !!level;
     int2_update(s);
 }
@@ -343,6 +367,9 @@ static void int2_scif_set(void *opaque, int n, int level)
 {
     ClarionQy7Int2 *s = opaque;
 
+    if (!!(s->scif_pending & BIT(n)) == !!level) {
+        return;
+    }
     s->scif_pending = deposit32(s->scif_pending, n, 1, !!level);
     int2_update(s);
 }

@@ -177,6 +177,8 @@ struct RenesasSDHIState {
     SDBus sdbus;
     MemoryRegion iomem;
     qemu_irq irq;
+    bool irq_level;
+    bool irq_level_valid;
 
     QEMUTimer *wire_timer;
     uint32_t input_clock_hz;
@@ -271,7 +273,11 @@ static void sdhi_update_irq(RenesasSDHIState *s)
                  (s->sdio_info1 & ~s->sdio_info1_mask & 0x0001));
 
     trace_renesas_sdhi_irq(s->unit, level);
-    qemu_set_irq(s->irq, level);
+    if (!s->irq_level_valid || s->irq_level != level) {
+        qemu_set_irq(s->irq, level);
+        s->irq_level = level;
+        s->irq_level_valid = true;
+    }
 }
 
 static void sdhi_abort_data(RenesasSDHIState *s)
@@ -919,6 +925,16 @@ static void sdhi_set_readonly(DeviceState *dev, bool readonly)
 
 /* --- QOM -------------------------------------------------------------- */
 
+static int sdhi_post_load(void *opaque, int version_id)
+{
+    RenesasSDHIState *s = opaque;
+
+    (void)version_id;
+    s->irq_level_valid = false;
+    sdhi_update_irq(s);
+    return 0;
+}
+
 static void sdhi_reset_hold(Object *obj, ResetType type)
 {
     RenesasSDHIState *s = RENESAS_SDHI(obj);
@@ -952,6 +968,8 @@ static void sdhi_reset_hold(Object *obj, ResetType type)
     s->host_mode = s->sdif_mode = 0;
     sdhi_abort_data(s);
     s->blen = 0;
+    s->irq_level = false;
+    s->irq_level_valid = true;
     qemu_set_irq(s->irq, 0);
 }
 
@@ -981,6 +999,7 @@ static const VMStateDescription vmstate_renesas_sdhi = {
     .name = "renesas-sdhi",
     .version_id = 4,
     .minimum_version_id = 1,
+    .post_load = sdhi_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT16(cmd, RenesasSDHIState),
         VMSTATE_UINT16(portsel, RenesasSDHIState),
