@@ -122,7 +122,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RenesasSDHIState, RENESAS_SDHI)
 #define INFO1_REMOVE        0x0008
 #define INFO1_INSERT        0x0010
 #define INFO1_SIGSTATE      0x0020      /* рівень лінії CD, не подія */
-#define INFO1_WRPROTECT     0x0080      /* рівень лінії WP, не подія */
+#define INFO1_WRPROTECT     0x0080      /* set = writes allowed (TMIO) */
 #define INFO1_REMOVE_A      0x0100
 #define INFO1_INSERT_A      0x0200
 #define INFO1_SIGSTATE_A    0x0400      /* рівень, не подія */
@@ -180,7 +180,9 @@ struct RenesasSDHIState {
 
     QEMUTimer *wire_timer;
     uint32_t input_clock_hz;
-    uint8_t wire_phase; /* 0: idle, 1: command, 2: read, 3: write, 4: stop */
+    /* 0: idle, 1: command, 2: read, 3: write, 4: stop, 5: DMA read burst */
+    uint8_t wire_phase;
+    bool burst;                 /* remaining blocks are already due */
     uint64_t wire_cycles;
     int64_t wire_started_ns;
     int64_t wire_deadline_ns;
@@ -276,6 +278,7 @@ static void sdhi_abort_data(RenesasSDHIState *s)
 {
     timer_del(s->wire_timer);
     s->wire_phase = 0;
+    s->burst = false;
     s->reading = s->writing = false;
     s->pos = 0;
     s->blocks = 0;
@@ -313,6 +316,12 @@ static unsigned sdhi_clock_divisor(RenesasSDHIState *s)
     return div == 0xff ? 1 : (div ? 4 * div : 2);
 }
 
+static uint64_t sdhi_cycles_ns(RenesasSDHIState *s, uint64_t cycles)
+{
+    return DIV_ROUND_UP(cycles * sdhi_clock_divisor(s) * NANOSECONDS_PER_SECOND,
+                        s->input_clock_hz);
+}
+
 /*
  * Start a bus phase. A chained phase continues the previous one on the
  * bus (next block of a multi-block read, auto-stop after the last block):
@@ -332,8 +341,7 @@ static void sdhi_wire_wait(RenesasSDHIState *s, uint8_t phase,
     if (!(s->clk_ctrl & CLK_SCLKEN)) {
         return;
     }
-    ns = DIV_ROUND_UP(cycles * sdhi_clock_divisor(s) * NANOSECONDS_PER_SECOND,
-                      s->input_clock_hz);
+    ns = sdhi_cycles_ns(s, cycles);
     s->wire_deadline_ns = s->wire_started_ns + ns;
     timer_mod(s->wire_timer, s->wire_deadline_ns);
 }
@@ -410,6 +418,28 @@ static bool sdhi_dma_ready(void *opaque)
            (s->reading || s->writing) && s->pos < s->blen;
 }
 
+/*
+ * Multi-block DMA read: the guest only looks at the controller when the
+ * command ends, and the DMAC drains the FIFO on its own. One timer covers
+ * every remaining block plus the automatic CMD12, ending at the same
+ * virtual instant as the per-block chain (the sum of identical per-block
+ * delays). When it fires, sdhi_wire_expired() hands all blocks to the DMAC.
+ */
+static void sdhi_wire_burst(RenesasSDHIState *s)
+{
+    bool stop = (s->cmd & CMD_MULTI) && (s->stop & STOP_SEC) &&
+                !(s->cmd & CMD_NOAUTOSTOP);
+    uint64_t bc = sdhi_block_cycles(s);
+    uint64_t ns = s->blocks * sdhi_cycles_ns(s, bc) +
+                  (stop ? sdhi_cycles_ns(s, 48 + 48) : 0);
+
+    s->wire_phase = 5;
+    s->wire_cycles = s->blocks * bc + (stop ? 48 + 48 : 0);
+    s->wire_started_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->wire_deadline_ns = s->wire_started_ns + ns;
+    timer_mod(s->wire_timer, s->wire_deadline_ns);
+}
+
 static void sdhi_start_data(RenesasSDHIState *s)
 {
     s->blen = s->size ? s->size : 512;
@@ -440,7 +470,13 @@ static void sdhi_start_data(RenesasSDHIState *s)
         s->reading = true;
         if (s->input_clock_hz) {
             s->info2 &= ~INFO2_RXRDY;
-            sdhi_wire_wait(s, 2, sdhi_block_cycles(s), false);
+            if (s->blocks > 1 && s->dmac &&
+                (s->cc_ext_mode & CC_EXT_DMASDRW) &&
+                (s->clk_ctrl & CLK_SCLKEN)) {
+                sdhi_wire_burst(s);
+            } else {
+                sdhi_wire_wait(s, 2, sdhi_block_cycles(s), false);
+            }
         } else {
             sdhi_fill_block(s);
         }
@@ -571,7 +607,9 @@ static void sdhi_block_done(RenesasSDHIState *s)
     s->blocks--;
     if (s->blocks) {
         if (s->reading) {
-            if (s->input_clock_hz) {
+            if (s->burst) {
+                sdhi_fill_block(s);     /* already due, no bus time left */
+            } else if (s->input_clock_hz) {
                 s->info2 &= ~INFO2_RXRDY;
                 sdhi_wire_wait(s, 2, sdhi_block_cycles(s), true);
             } else {
@@ -584,7 +622,7 @@ static void sdhi_block_done(RenesasSDHIState *s)
     }
     if ((s->cmd & CMD_MULTI) && (s->stop & STOP_SEC) &&
         !(s->cmd & CMD_NOAUTOSTOP)) {
-        if (s->input_clock_hz) {
+        if (s->input_clock_hz && !s->burst) {
             sdhi_wire_wait(s, 4, 48 + 48, true);
             return;
         }
@@ -653,6 +691,9 @@ static void sdhi_wire_expired(void *opaque)
     case 1:
         sdhi_execute_command(s);
         break;
+    case 5:
+        s->burst = true;
+        /* fall through */
     case 2:
         sdhi_fill_block(s);
         if (sdhi_dma_ready(s)) {
@@ -865,8 +906,9 @@ static void sdhi_set_inserted(DeviceState *dev, bool inserted)
 }
 
 /*
- * WRPROTECT у SD_INFO1 — це рівень лінії WP, тож модель бере його прямо з
- * шини (див. sdhi_info1_live). Тут лишається тільки переоцінити лінію.
+ * SD_INFO1.WRPROTECT follows TMIO polarity: the bit set means writes are
+ * allowed. The model takes it from the bus (see sdhi_info1_live); only the
+ * interrupt line needs re-evaluating here.
  */
 static void sdhi_set_readonly(DeviceState *dev, bool readonly)
 {
@@ -937,7 +979,7 @@ static void sdhi_finalize(Object *obj)
 
 static const VMStateDescription vmstate_renesas_sdhi = {
     .name = "renesas-sdhi",
-    .version_id = 3,
+    .version_id = 4,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT16(cmd, RenesasSDHIState),
@@ -977,6 +1019,7 @@ static const VMStateDescription vmstate_renesas_sdhi = {
         VMSTATE_INT64_V(wire_started_ns, RenesasSDHIState, 3),
         VMSTATE_INT64_V(wire_deadline_ns, RenesasSDHIState, 3),
         VMSTATE_TIMER_PTR_V(wire_timer, RenesasSDHIState, 3),
+        VMSTATE_BOOL_V(burst, RenesasSDHIState, 4),
         VMSTATE_END_OF_LIST()
     }
 };
