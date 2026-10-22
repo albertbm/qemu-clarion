@@ -79,6 +79,8 @@
 #define M2DG_R_DST 0x50
 #define M2DG_R_SRC_STRIDE 0x58
 #define M2DG_R_DST_STRIDE 0x5c
+#define M2DG_R_MASK 0x64
+#define M2DG_R_MASK_STRIDE 0x68
 #define M2DG_R_STRANS 0x80
 #define M2DG_R_ALPHA 0x88
 #define M2DG_R_CTRL 0xc0
@@ -566,6 +568,86 @@ static void clarion_2dg_blit_mask(ListCtx *c, int sx, int sy, int w, int h,
     }
 }
 
+/*
+ * Registers 0x100..0x138 as every captured list carries them: three
+ * (0, 1.0, 0, 0) groups followed by (2^-16, 32767.0, 2^-16). Rotation by the
+ * guest's xglRotatef state changes these words; how is not established, so
+ * only this state is drawn.
+ */
+static bool clarion_2dg_xform_is_default(const Clarion2DGState *s)
+{
+    static const uint32_t def[15] = {
+        0, 0x3f800000, 0, 0, 0, 0x3f800000, 0, 0, 0, 0x3f800000, 0, 0,
+        0x37800000, 0x46fffdff, 0x37800000,
+    };
+    unsigned i;
+
+    for (i = 0; i < ARRAY_SIZE(def); i++) {
+        if (!s->lreg_set[0x100 / 4 + i] || s->lreg[0x100 / 4 + i] != def[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/*
+ * BITBLTR with the default transform: a 16-bit source (register 0x4c, stride
+ * in pixels from 0x58) is blended onto the canvas through an 8-bit mask
+ * (register 0x64, stride in bytes from 0x68), scaled by the global alpha in
+ * register 0x88. (sx, sy) and (mx, my) are the rectangle origins in the
+ * source and in the mask; the rectangle itself is placed at (dx, dy).
+ */
+static void clarion_2dg_blit_rot(ListCtx *c, int sx, int sy, int mx, int my,
+                                 int w, int h, int dx, int dy, bool strans)
+{
+    Clarion2DGState *s = c->s;
+    hwaddr src = clarion_2dg_direct_seg(s->lreg[M2DG_R_SRC / 4]);
+    hwaddr mask = clarion_2dg_direct_seg(s->lreg[M2DG_R_MASK / 4]);
+    uint32_t sstride = s->lreg[M2DG_R_SRC_STRIDE / 4];
+    uint32_t mstride = s->lreg[M2DG_R_MASK_STRIDE / 4];
+    uint16_t key = s->lreg[M2DG_R_STRANS / 4];
+    unsigned galpha = s->lreg_set[M2DG_R_ALPHA / 4] ?
+                      s->lreg[M2DG_R_ALPHA / 4] & 0xff : 0xff;
+    uint16_t row[CLARION_2DG_MAX_DIM];
+    uint8_t mrow[CLARION_2DG_MAX_DIM];
+    int cx0, cy0, cx1, cy1, i, j;
+
+    if (!clarion_2dg_dst_map(c) || !clarion_2dg_clip(c, &cx0, &cy0, &cx1, &cy1)
+        || !s->lreg_set[M2DG_R_SRC / 4] || !s->lreg_set[M2DG_R_MASK / 4] ||
+        !sstride || !mstride || w <= 0 || h <= 0 || w > CLARION_2DG_MAX_DIM) {
+        return;
+    }
+    for (j = 0; j < h; j++) {
+        int y = dy + j;
+
+        if (y < cy0 || y > cy1) {
+            continue;
+        }
+        if (address_space_read(
+                &address_space_memory,
+                src + (((hwaddr)(sy + j) * sstride) + sx) * 2,
+                MEMTXATTRS_UNSPECIFIED, row, w * 2) != MEMTX_OK ||
+            address_space_read(
+                &address_space_memory,
+                mask + (hwaddr)(my + j) * mstride + mx,
+                MEMTXATTRS_UNSPECIFIED, mrow, w) != MEMTX_OK) {
+            continue;
+        }
+        for (i = 0; i < w; i++) {
+            int x = dx + i;
+            uint16_t v = lduw_le_p(&row[i]);
+            unsigned a = mrow[i] * galpha / 255;
+            uint16_t *p;
+
+            if (!a || x < cx0 || x > cx1 || (strans && v == key)) {
+                continue;
+            }
+            p = (uint16_t *)(c->dst + ((size_t)y * c->dst_stride + x) * 2);
+            stw_le_p(p, clarion_2dg_mix(lduw_le_p(p), v, a));
+        }
+    }
+}
+
 /* Polyline with a square brush of thickness t. */
 static void clarion_2dg_polyline(ListCtx *c, const int *vx, const int *vy,
                                  unsigned n, uint16_t colour, int t)
@@ -725,7 +807,36 @@ static void clarion_2dg_diag_blit(ListCtx *c, uint32_t w, const uint32_t *a,
             }
         }
     }
-    g_string_append(g, "]}\n");
+    g_string_append(g, "]");
+    if (op == M2DG_BITBLTR && s->lreg_set[M2DG_R_SRC / 4] && bw > 0 &&
+        bh > 0 && bw <= 256 && bh <= 256) {
+        /* Rotated blit: raw rows of both planes (list registers 0x4c, 0x64). */
+        static const struct { const char *key; unsigned base, stride, mul; } pl[] = {
+            { "p4c", M2DG_R_SRC, M2DG_R_SRC_STRIDE, 2 },
+            { "p64", 0x64, 0x68, 1 },
+        };
+        unsigned p;
+
+        for (p = 0; p < ARRAY_SIZE(pl); p++) {
+            hwaddr b = clarion_2dg_direct_seg(s->lreg[pl[p].base / 4]);
+            uint32_t st = s->lreg[pl[p].stride / 4] * pl[p].mul;
+            int j, k;
+
+            g_string_append_printf(g, ",\"%s\":[", pl[p].key);
+            for (j = 0; st && j < bh; j++) {
+                for (k = 0; k < (int)st; k++) {
+                    uint8_t v = 0;
+
+                    address_space_read(&address_space_memory,
+                                       b + (hwaddr)j * st + k,
+                                       MEMTXATTRS_UNSPECIFIED, &v, 1);
+                    g_string_append_printf(g, "%s%u", (j || k) ? "," : "", v);
+                }
+            }
+            g_string_append(g, "]");
+        }
+    }
+    g_string_append(g, "}\n");
     clarion_2dg_diag_line(s, g->str);
     g_string_free(g, true);
 }
@@ -787,6 +898,15 @@ static unsigned clarion_2dg_run(Clarion2DGState *s, hwaddr list,
         case M2DG_LCOFS:
         case M2DG_MOVE:
             words = 2; /* offset observed as 0 only; not applied */
+            if (a1 && s->diag_path && *s->diag_path &&
+                s->diag_count[op]++ < s->diag_n) {
+                char line[96];
+
+                snprintf(line, sizeof(line),
+                         "{\"pc\":%" PRIu64 ",\"w\":%u,\"nonzero_offset\":%u}\n",
+                         (uint64_t)pc, w, a1);
+                clarion_2dg_diag_line(s, line);
+            }
             c->skipped[op]++;
             break;
         case M2DG_RLCOFS:
@@ -926,6 +1046,13 @@ static unsigned clarion_2dg_run(Clarion2DGState *s, hwaddr list,
              * a3 = (left << 16 | right) extents, a4 = (up << 16 | down)
              * extents, a5 = centre XY. Centre-relative form is inferred:
              * it covers exactly the whole canvas in every captured fill.
+             *
+             * BITBLTR (0xaa) is emitted by the XGL runtime linked into
+             * auirtdll.dll and XGLDLL.dll (emitter 0x038017b4 / 0x030bd2e8,
+             * only the BITBLT-with-mask path, header flags 0x3103): a2 =
+             * (x, y) of the rectangle in the colour source, a1 = (x, y) of
+             * the rectangle in the 8-bit mask; a3..a5 as above, the centre
+             * being the pivot point when the guest gives one.
              */
             int cx = clarion_2dg_xy_x(a5) + c->ox, cy = clarion_2dg_xy_y(a5) + c->oy;
             int l = a3 >> 16, r = a3 & 0xffff, u = a4 >> 16, d = a4 & 0xffff;
@@ -945,8 +1072,14 @@ static unsigned clarion_2dg_run(Clarion2DGState *s, hwaddr list,
                 clarion_2dg_blit(c, clarion_2dg_xy_x(a2), clarion_2dg_xy_y(a2),
                                  l + r + 1, u + d + 1, cx - l, cy - u,
                                  w & M2DG_F_STRANS);
+            } else if (clarion_2dg_xform_is_default(s)) {
+                /* a1 = mask origin XY, a2 = source origin XY */
+                clarion_2dg_blit_rot(c, clarion_2dg_xy_x(a2),
+                                     clarion_2dg_xy_y(a2), clarion_2dg_xy_x(a1),
+                                     clarion_2dg_xy_y(a1), l + r + 1, u + d + 1,
+                                     cx - l, cy - u, w & M2DG_F_STRANS);
             } else {
-                drawn = false; /* STRANS key and rotated blit unestablished */
+                drawn = false; /* non-default transform: not established */
             }
             c->done[op] += drawn;
             c->skipped[op] += !drawn;
