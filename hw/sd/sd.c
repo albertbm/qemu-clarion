@@ -2300,8 +2300,10 @@ static sd_rsp_type_t sd_acmd_SD_STATUS(SDState *sd, SDRequest req)
 /* ACMD22 */
 static sd_rsp_type_t sd_acmd_SEND_NUM_WR_BLOCKS(SDState *sd, SDRequest req)
 {
-    return sd_cmd_to_sendingdata(sd, req, 0,
-                                 &sd->blk_written, sizeof(sd->blk_written));
+    /* The card sends the block count MSB first, like any other data transfer. */
+    uint32_t num = cpu_to_be32(sd->blk_written);
+
+    return sd_cmd_to_sendingdata(sd, req, 0, &num, sizeof(num));
 }
 
 /* ACMD23 */
