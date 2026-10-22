@@ -315,8 +315,8 @@ static hwaddr hpb_module_addr(ClarionHpbDmaState *s, int ch)
         /* QY7221NL serial_scif.dll configures SCI1 TX on channel 10. */
         return 0xffe4100c;
     }
-    /* The front SD driver uses channel 8 with source SD_BUF0. */
-    if (s->qy7_mode && ch == 8) {
+    /* QY7 SDHI0 uses HPB channel 8 in WinCE and channel 9 in EH12. */
+    if (s->qy7_mode && (ch == 8 || ch == 9)) {
         return 0xffe4c030;
     }
     return hpb_chan_module[ch];
@@ -355,7 +355,8 @@ static void hpb_move_one(ClarionHpbDmaState *s, int ch)
     unsigned unit = hpb_unit(s, ch);
     hwaddr mod = hpb_module_addr(s, ch);
     hwaddr src = c->dsasr, dst = c->ddasr;
-    bool sd_burst = s->qy7_mode && ch == 8 && (c->dcr & BIT(21)) &&
+    bool sd_burst = s->qy7_mode && (ch == 8 || ch == 9) &&
+                    (c->dcr & BIT(21)) &&
                     (c->dcr & DCR_SMDL) && !(c->dcr & DCR_DMDL);
     bool qy7_scif1_tx = s->qy7_mode && ch == 10;
     unsigned bytes = sd_burst ? 16 : unit;
