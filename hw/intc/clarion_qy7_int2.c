@@ -321,6 +321,9 @@ static void int2_sdhi_set(void *opaque, int n, int level)
     ClarionQy7Int2 *s = opaque;
 
     if (!!(s->sdhi_pending & BIT(n)) == !!level) {
+        if (level) {
+            int2_update(s);
+        }
         return;
     }
     s->sdhi_pending = deposit32(s->sdhi_pending, n, 1, !!level);

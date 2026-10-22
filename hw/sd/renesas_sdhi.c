@@ -273,7 +273,8 @@ static void sdhi_update_irq(RenesasSDHIState *s)
                  (s->sdio_info1 & ~s->sdio_info1_mask & 0x0001));
 
     trace_renesas_sdhi_irq(s->unit, level);
-    if (!s->irq_level_valid || s->irq_level != level) {
+    /* Repeated high levels can refresh the guest's INT2 source table. */
+    if (!s->irq_level_valid || s->irq_level != level || level) {
         qemu_set_irq(s->irq, level);
         s->irq_level = level;
         s->irq_level_valid = true;
