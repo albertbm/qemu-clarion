@@ -4616,7 +4616,6 @@ S: Maintained
 F: .github/workflows/lockdown.yml
 F: .gitlab-ci.yml
 F: .gitlab-ci.d/
-F: .travis.yml
 F: docs/devel/testing/ci*
 F: scripts/ci/
 F: tests/docker/

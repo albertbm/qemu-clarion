@@ -373,7 +373,7 @@ read_gitlabmap(".gitlab-map-manual");
 sub read_gitlabmap {
     my $mapfile = shift;
     open MAP, "<$mapfile"
-	or die "cannot open $mapfile: $!";
+	or return;
 
     while (<MAP>) {
 	next if /^#/;
