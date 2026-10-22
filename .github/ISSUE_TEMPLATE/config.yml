@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Upstream QEMU
+    url: https://www.qemu.org/contribute/report-a-bug/
+    about: Bugs that also happen without the clarion machines belong upstream.

@@ -1,0 +1,89 @@
+name: Bug report
+description: The emulator crashes, hangs, or the head unit behaves differently than on real hardware.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please do not attach flash or SD card images. They are copyrighted
+        firmware and may contain personal data. Remove VINs, phone numbers,
+        ICCIDs and other identifiers from logs and screenshots.
+  - type: dropdown
+    id: board
+    attributes:
+      label: Unit model
+      description: The model qemu-clarion detects from the PROD block (`qemu-clarion -n NOR` prints it).
+      options:
+        - QY8652NB
+        - QY8202NA
+        - QY7221NL
+        - Other (name it below)
+    validations:
+      required: true
+  - type: input
+    id: firmware
+    attributes:
+      label: Firmware version
+      description: Software version of the unit, e.g. from the version screen or the boot log.
+      placeholder: e.g. G218ENNI.120
+  - type: dropdown
+    id: sd
+    attributes:
+      label: SD card
+      options:
+        - No card
+        - Map/system card
+        - Other card (describe below)
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Emulator version
+      description: Release tag or commit hash (`git rev-parse --short HEAD`).
+    validations:
+      required: true
+  - type: dropdown
+    id: host
+    attributes:
+      label: Host
+      options:
+        - macOS (Apple silicon)
+        - macOS (Intel)
+        - Linux x86_64
+        - Linux arm64
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command line
+      description: The full command, or the output of `qemu-clarion -n ...`.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: Steps to reproduce, the screen you reached, and the time since start if it matters.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+      description: What the real unit does in the same situation, if you know.
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: Console output of the guest and QEMU. Long logs are better attached as a file.
+      render: text
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots
+      description: Emulator screenshots, and a photo of the real unit if you have one.

@@ -1,0 +1,25 @@
+name: Feature request
+description: Support for a new unit model, a missing peripheral, or a new emulator feature.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What you would like
+      description: The feature, peripheral or unit model, and what it should let you do.
+    validations:
+      required: true
+  - type: input
+    id: board
+    attributes:
+      label: Unit model
+      description: Which unit(s) this is about, e.g. QY8652NB, QY7221NL.
+  - type: textarea
+    id: hardware
+    attributes:
+      label: What the real hardware does
+      description: Observations from a real unit, register or protocol notes, guest code addresses. No firmware dumps, please.
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
