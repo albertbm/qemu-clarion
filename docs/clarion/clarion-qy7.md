@@ -143,3 +143,24 @@ Other tested codes remain unnamed unless a visible result matched a control
 on the panel photo. `0x12` and `0x47` remove a route overlay in the tested
 state, but that does not identify a physical control. The Clarif30 evidence
 records all tested VKeys and screenshots.
+
+## Guest debug output
+
+The `clarion-dbgprint` plugin prints calls to `NKDbgPrintfW`,
+`NKvDbgPrintfW`, and `OutputDebugStringW` as `DBG <return-address> <text>`.
+It reads SH-4 arguments from R4-R7 and the stack after the 16-byte home area.
+The SH-4 GDB register XML exposes the active banked registers to the plugin
+register API.
+
+Generate symbols from every kernel XIP region in the SD image and NOR image.
+The SD card can contain several XIP copies with different export addresses;
+including each unique address avoids guessing which copy is active:
+
+```sh
+python3 scripts/clarion/dbgprint-syms.py NOR SD > dbgprint.syms
+build-release/qemu-clarion --read-only NOR SD \
+  -plugin build-release/contrib/plugins/libclarion-dbgprint.dylib,syms=dbgprint.syms,out=guest-debug.log
+```
+
+XIP exports have fixed virtual addresses, so no runtime module-load adjustment
+is needed. Omit `out=...` to write to standard error.

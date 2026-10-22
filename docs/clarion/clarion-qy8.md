@@ -322,3 +322,21 @@ the guest is not redrawn after that.
   window only through MIRROR (see the MIRROR section).
 * Not modeled: the CAN bus beyond the controller itself, USB, I2C devices
   other than the TMA460.
+
+## Guest debug output
+
+The `clarion-dbgprint` plugin prints calls to `NKDbgPrintfW`,
+`NKvDbgPrintfW`, and `OutputDebugStringW` as `DBG <return-address> <text>`.
+ARM arguments are read from R0-R3 and then the stack. Wide `%s`, narrow
+`%S`, integer, pointer, and character conversions are supported.
+
+Generate symbols from the NOR kernel XIP and pass the plugin to the launcher:
+
+```sh
+python3 scripts/clarion/dbgprint-syms.py NOR > dbgprint.syms
+build-release/qemu-clarion --read-only NOR \
+  -plugin build-release/contrib/plugins/libclarion-dbgprint.dylib,syms=dbgprint.syms,out=guest-debug.log
+```
+
+The XIP export addresses are fixed virtual addresses and do not require
+runtime relocation. Omit `out=...` to write to standard error.
