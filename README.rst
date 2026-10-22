@@ -58,6 +58,25 @@ Use this optimized build to run units. A debug build
 only for QEMU assertions and symbols: the guest is noticeably slower in it
 and the QY8 user interface misses its first screen.
 
+Releases / binary packages
+==========================
+
+Every tagged release (``v*``) on the GitHub Releases page carries ready-made
+archives, ``qemu-clarion-<tag>-<os>-<arch>.tar.gz``, for macOS (arm64) and
+Linux (x86_64). Each one holds the launcher, both emulation engines
+(``libexec/``) and all the shared libraries they need (``lib/``), so nothing
+else has to be installed.
+
+.. code-block:: shell
+
+  tar xzf qemu-clarion-<tag>-darwin-arm64.tar.gz
+  cd qemu-clarion-<tag>-darwin-arm64
+  xattr -dr com.apple.quarantine .      # macOS only: the binaries are not notarized
+  ./qemu-clarion NOR [SD]
+
+The binaries are ad-hoc signed on macOS. The archives are built by
+``.github/workflows/release.yml`` using ``scripts/clarion/package.sh``.
+
 Running a unit
 ==============
 
