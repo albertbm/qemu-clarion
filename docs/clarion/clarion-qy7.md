@@ -25,6 +25,11 @@ waits for the guest's `DLE ACK` before completing the key event.
 | `M` | MAP/VOICE | `0x01` | Active KEPDRV tables map `01 -> 01 -> 0x22`; frame reaches `AuiKeyEvent`. An early UI run showed the map after M. |
 | `B` | Brightness/day-night control (inferred) | `0x21` | Active tables map `21 -> 02 -> 0xD9`; an early UI run showed `Lysstyrke` for this code under the previous host alias `S`. |
 
+Host keys follow one table for QY7 and QY8 (see the QY8 reference, “Panel
+keys and knobs”): the same key presses the same function. On QY7 only the
+codes above and the MCAN routes below are proven; other keys of the table
+(`Esc`, `Enter`, `C`, `A`, `[`/`]`, F1–F9, knobs) send nothing here.
+
 The active QY7 `kepdrv.dll` table observed after boot has two first-stage
 entries, `01 -> 01` and `21 -> 02`, and two second-stage entries,
 `01 -> 0x22` and `02 -> 0xD9`. Both codes reach `AuiKeyEvent`; the first

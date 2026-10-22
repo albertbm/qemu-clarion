@@ -91,6 +91,10 @@ typedef struct DispFrame {
 #define CMD_KEEPALIVE       0x71
 #define CMD_TOUCH           0x51
 #define CMD_PANEL_KEY       0x34
+/* kepdrv InputLcdKey (QY8605NB @0xEF880F1C): DATA[1] = matrix code, bit 7 = pressed */
+#define CMD_KEY             CMD_PANEL_KEY
+#define KEY_PRESSED         0x80
+#define CMD_ROTARY          0x35
 
 /*
  * Inter-frame gap, as in the board MCU model: the SCIF receiver has a 16-byte
@@ -151,6 +155,11 @@ struct ClarionDispMicomState {
     uint32_t key_down_mask;
     ClarionDispMicomCanKey can_key;
     void *can_key_opaque;
+
+    QEMUTimer *key_up;          /* release of a key injected from the monitor */
+    uint8_t key_held;
+
+    bool panel_jpn;             /* code table: false = row (0x10180201), true = jpn (0x10180202) */
 };
 
 static void disp_frame_free(DispFrame *frame)
@@ -490,71 +499,236 @@ static const QemuInputHandler disp_touch_handler = {
     .sync = disp_touch_sync,
 };
 
+
+static void disp_key_up(void *opaque)
+{
+    ClarionDispMicomState *s = opaque;
+
+    disp_queue(s, (const uint8_t[]){ CMD_KEY, s->key_held }, 2);
+}
+
+/* qom-set key="CODE[,HOLD_MS]": press a panel key by its matrix code */
+static void disp_set_key(Object *obj, const char *value, Error **errp)
+{
+    ClarionDispMicomState *s = CLARION_DISPMICOM(obj);
+    unsigned long code, hold = 150;
+    char *end;
+
+    code = strtoul(value, &end, 16);
+    if (end != value && *end == ',') {
+        hold = strtoul(end + 1, &end, 10);
+    }
+    if (end == value || code > 0x7f || *end) {
+        error_setg(errp, "key: expected CODE[,HOLD_MS], CODE hex 00..7f");
+        return;
+    }
+    if (timer_pending(s->key_up)) {
+        timer_del(s->key_up);
+        disp_key_up(s);
+    }
+    s->key_held = code;
+    disp_queue(s, (const uint8_t[]){ CMD_KEY, code | KEY_PRESSED }, 2);
+    timer_mod(s->key_up, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              (int64_t)hold * 1000000);
+}
+
+/* qom-set frame="34 05": raw panel frame, for experiments with other commands */
+static void disp_set_frame(Object *obj, const char *value, Error **errp)
+{
+    ClarionDispMicomState *s = CLARION_DISPMICOM(obj);
+    uint8_t data[DISP_MAX_DATA];
+    unsigned len = 0;
+    const char *p = value;
+    char *end;
+
+    while (*p) {
+        unsigned long v = strtoul(p, &end, 16);
+
+        if (end == p || v > 0xff || len == sizeof(data)) {
+            error_setg(errp, "frame: expected hex bytes");
+            return;
+        }
+        data[len++] = v;
+        p = end + strspn(end, " ,:");
+    }
+    if (len) {
+        disp_queue(s, data, len);
+    }
+}
+
+/* sign and magnitude: 0x81 is one step back, 0xff is 127 back */
+static uint8_t disp_detents(int n)
+{
+    return n < 0 ? 0x80 | MIN(-n, 0x7f) : MIN(n, 0x7f);
+}
+
+/* kepdrv swaps the bytes by panel: jpn sends 35 VOL TUNE, row 35 TUNE VOL */
+static void disp_rotary(ClarionDispMicomState *s, int vol, int tune)
+{
+    uint8_t v = disp_detents(vol), t = disp_detents(tune);
+    uint8_t a = s->panel_jpn ? v : t, b = s->panel_jpn ? t : v;
+
+    disp_queue(s, (const uint8_t[]){ CMD_ROTARY, a, b }, 3);
+}
+
+/* the touch controller owns the pointer buttons, so the wheel arrives here */
+static ClarionDispMicomState *disp_panel;
+
+void clarion_dispmicom_wheel(int detents)
+{
+    if (disp_panel && detents) {
+        /* wheel up moves the selection up, like PageUp */
+        disp_rotary(disp_panel, 0, -detents);
+    }
+}
+
+
+/*
+ * Host keyboard -> panel keys. One table for every unit, so a host key presses
+ * the same function on QY7 and QY8. Each row carries the QY7 code (panel frame
+ * 0x34, or MCAN PUSH_SW when qy7_can) and the QY8 codes for the row and jpn
+ * panels, from the kepdrv InputLcdKey tables. NO_CODE: no proven code on that
+ * unit. F1..F9 are the original QY8 aliases.
+ */
+#define NO_CODE (-1)
+
 typedef struct DispKeyMap {
-    unsigned int qemu_key;
-    uint8_t panel_code;
-    bool mcan;
+    unsigned int host;          /* Linux input code */
+    int qy7;
+    bool qy7_can;
+    int qy8_row;
+    int qy8_jpn;
 } DispKeyMap;
 
 static const DispKeyMap disp_key_map[] = {
-    { KEY_M, 1, false },   { KEY_B, 0x21, false }, { KEY_N, 0x44, true },
-    { KEY_P, 0x0c, true }, { KEY_T, 0x31, true },  { KEY_Z, 0x4c, true },
+    /* host            QY7      MCAN   QY8 row  QY8 jpn */
+    { KEY_M,           0x01,    false, 0x00,    0x32 },     /* MAP/VOICE */
+    { KEY_N,           0x44,    true,  0x13,    0x01 },     /* MENU */
+    { KEY_P,           0x0c,    true,  NO_CODE, NO_CODE },  /* MAP/VOICE (MCAN) */
+    { KEY_T,           0x31,    true,  NO_CODE, NO_CODE },  /* STATUS */
+    { KEY_Z,           0x4c,    true,  NO_CODE, NO_CODE },  /* ZERO EMISSION */
+    { KEY_B,           0x21,    false, 0x20,    0x31 },     /* brightness / display off */
+    { KEY_ESC,         NO_CODE, false, 0x30,    0x03 },     /* BACK */
+    { KEY_ENTER,       NO_CODE, false, 0x21,    0x10 },     /* TUNE press */
+    { KEY_KPENTER,     NO_CODE, false, 0x21,    0x10 },     /* TUNE press */
+    { KEY_C,           NO_CODE, false, 0x01,    0x13 },     /* CAMERA */
+    { KEY_A,           NO_CODE, false, 0x03,    0x30 },     /* AUDIO */
+    { KEY_LEFTBRACE,   NO_CODE, false, 0x31,    0x00 },     /* SEEK back */
+    { KEY_RIGHTBRACE,  NO_CODE, false, 0x32,    0x20 },     /* SEEK forward */
+    { KEY_F1,          NO_CODE, false, 0x13,    0x01 },     /* MENU */
+    { KEY_F2,          NO_CODE, false, 0x30,    0x03 },     /* BACK */
+    { KEY_F3,          NO_CODE, false, 0x20,    0x31 },     /* display off */
+    { KEY_F4,          NO_CODE, false, 0x00,    0x32 },     /* MAP */
+    { KEY_F5,          NO_CODE, false, 0x01,    0x13 },     /* CAMERA */
+    { KEY_F6,          NO_CODE, false, 0x03,    0x30 },     /* AUDIO */
+    { KEY_F7,          NO_CODE, false, 0x31,    0x00 },     /* SEEK back */
+    { KEY_F8,          NO_CODE, false, 0x32,    0x20 },     /* SEEK forward */
+    { KEY_F9,          NO_CODE, false, 0x21,    0x10 },     /* TUNE press */
 };
 
+/*
+ * QY8 knobs from the host keyboard: Up/Down (or PageUp/PageDown) turn TUNE,
+ * =/- turn VOL. Arrows because laptop keyboards have no PageUp/PageDown.
+ */
+static bool disp_knob_key(ClarionDispMicomState *s, QemuInputEvent *evt)
+{
+    switch (evt->key.key) {
+    case KEY_UP:
+    case KEY_DOWN:
+    case KEY_PAGEUP:
+    case KEY_PAGEDOWN:
+        if (evt->key.down) {
+            /* Up moves the selection up, i.e. one step back */
+            disp_rotary(s, 0, (evt->key.key == KEY_UP ||
+                               evt->key.key == KEY_PAGEUP) ? -1 : 1);
+        }
+        return true;
+    case KEY_EQUAL:
+    case KEY_MINUS:
+        if (evt->key.down) {
+            disp_rotary(s, evt->key.key == KEY_EQUAL ? 1 : -1, 0);
+        }
+        return true;
+    }
+    return false;
+}
+
+/*
+ * key-input=on selects the QY7 codes: panel keys wait for the guest's DLE ACK,
+ * MCAN keys need can-key-input=on. Otherwise the QY8 codes for panel=row|jpn.
+ */
 static void disp_key_event(DeviceState *dev, QemuConsole *src,
                            QemuInputEvent *evt)
 {
     ClarionDispMicomState *s = CLARION_DISPMICOM(dev);
+    const DispKeyMap *k = NULL;
     uint8_t data[2] = { CMD_PANEL_KEY, 0 };
+    uint32_t bit;
     unsigned int i;
+    int code;
 
     (void)src;
     if (evt->type != INPUT_EVENT_KIND_KEY) {
         return;
     }
+    if (!s->key_input && disp_knob_key(s, evt)) {
+        return;
+    }
     for (i = 0; i < ARRAY_SIZE(disp_key_map); i++) {
-        uint32_t bit;
-
-        if (evt->key.key == disp_key_map[i].qemu_key) {
-            if (disp_key_map[i].mcan && !s->can_key_input) {
-                return;
-            }
-            bit = 1U << i;
-
-            if (evt->key.down) {
-                if (s->key_down_mask & bit) {
-                    qemu_log("clarion-dispmicom: panel-key repeat-suppressed "
-                             "code=%02x\n",
-                             disp_key_map[i].panel_code);
-                    return;
-                }
-                s->key_down_mask |= bit;
-            } else {
-                if (!(s->key_down_mask & bit)) {
-                    return;
-                }
-                s->key_down_mask &= ~bit;
-            }
-            if (disp_key_map[i].mcan) {
-                if (s->can_key) {
-                    s->can_key(s->can_key_opaque, disp_key_map[i].panel_code,
-                               evt->key.down);
-                }
-                return;
-            }
-            data[1] =
-                disp_key_map[i].panel_code | (evt->key.down ? 0x80 : 0x00);
-            qemu_log("clarion-dispmicom: panel-key code=%02x down=%u\n",
-                     disp_key_map[i].panel_code, evt->key.down);
-            disp_queue_key(s, data, sizeof(data));
+        if (evt->key.key == disp_key_map[i].host) {
+            k = &disp_key_map[i];
+            break;
+        }
+    }
+    if (!k) {
+        return;
+    }
+    if (s->key_input) {
+        code = k->qy7;
+        if (code == NO_CODE || (k->qy7_can && !s->can_key_input)) {
             return;
         }
+    } else {
+        code = s->panel_jpn ? k->qy8_jpn : k->qy8_row;
+        if (code == NO_CODE) {
+            return;
+        }
+    }
+
+    bit = 1U << i;
+    if (evt->key.down) {
+        if (s->key_down_mask & bit) {
+            qemu_log("clarion-dispmicom: panel-key repeat-suppressed "
+                     "code=%02x\n", code);
+            return;
+        }
+        s->key_down_mask |= bit;
+    } else {
+        if (!(s->key_down_mask & bit)) {
+            return;
+        }
+        s->key_down_mask &= ~bit;
+    }
+
+    if (s->key_input && k->qy7_can) {
+        if (s->can_key) {
+            s->can_key(s->can_key_opaque, code, evt->key.down);
+        }
+        return;
+    }
+    data[1] = code | (evt->key.down ? KEY_PRESSED : 0);
+    qemu_log("clarion-dispmicom: panel-key code=%02x down=%u\n",
+             code, evt->key.down);
+    if (s->key_input) {
+        disp_queue_key(s, data, sizeof(data));
+    } else {
+        disp_queue(s, data, sizeof(data));
     }
 }
 
 static const QemuInputHandler disp_key_handler = {
-    .name = "qy7-panel-keys",
-    .mask = INPUT_EVENT_MASK_KEY,
+    .name  = "Clarion panel keys",
+    .mask  = INPUT_EVENT_MASK_KEY,
     .event = disp_key_event,
 };
 
@@ -708,6 +882,7 @@ static void clarion_dispmicom_reset_hold(Object *obj, ResetType type)
     s->bcc = 0;
     s->linked = false;
     s->key_down_mask = 0;
+    timer_del(s->key_up);
 }
 
 static void clarion_dispmicom_realize(DeviceState *dev, Error **errp)
@@ -716,10 +891,9 @@ static void clarion_dispmicom_realize(DeviceState *dev, Error **errp)
 
     s->frames = g_queue_new();
     s->tx = timer_new_ns(QEMU_CLOCK_VIRTUAL, disp_tx_expire, s);
+    s->key_input_handler = qemu_input_handler_register(dev, &disp_key_handler);
+    qemu_input_handler_activate(s->key_input_handler);
     if (s->key_input) {
-        s->key_input_handler =
-            qemu_input_handler_register(dev, &disp_key_handler);
-        qemu_input_handler_activate(s->key_input_handler);
         object_property_add_str(OBJECT(s), "key-raw", NULL,
                                 disp_set_key_raw);
     }
@@ -727,6 +901,37 @@ static void clarion_dispmicom_realize(DeviceState *dev, Error **errp)
         s->input_handler =
             qemu_input_handler_register(dev, &disp_touch_handler);
         qemu_input_handler_activate(s->input_handler);
+    }
+    s->key_up = timer_new_ns(QEMU_CLOCK_VIRTUAL, disp_key_up, s);
+    disp_panel = s;
+}
+
+static void clarion_dispmicom_unrealize(DeviceState *dev)
+{
+    ClarionDispMicomState *s = CLARION_DISPMICOM(dev);
+
+    qemu_input_handler_unregister(s->key_input_handler);
+    if (disp_panel == s) {
+        disp_panel = NULL;
+    }
+}
+
+/* panel=jpn|row: which QY8 code column disp_key_event uses */
+static char *disp_panel_get(Object *obj, Error **errp)
+{
+    return g_strdup(CLARION_DISPMICOM(obj)->panel_jpn ? "jpn" : "row");
+}
+
+static void disp_panel_set(Object *obj, const char *value, Error **errp)
+{
+    ClarionDispMicomState *s = CLARION_DISPMICOM(obj);
+
+    if (!strcmp(value, "jpn")) {
+        s->panel_jpn = true;
+    } else if (!strcmp(value, "row")) {
+        s->panel_jpn = false;
+    } else {
+        error_setg(errp, "panel: expected jpn or row");
     }
 }
 
@@ -745,7 +950,12 @@ static void clarion_dispmicom_class_init(ObjectClass *klass, const void *data)
     dc->realize = clarion_dispmicom_realize;
     dc->desc = "Clarion display panel micom (QY7 SCIF3 or QY8 SCIF1)";
     device_class_set_props(dc, clarion_dispmicom_props);
+    dc->unrealize = clarion_dispmicom_unrealize;
     rc->phases.hold = clarion_dispmicom_reset_hold;
+    object_class_property_add_str(klass, "key", NULL, disp_set_key);
+    object_class_property_add_str(klass, "frame", NULL, disp_set_frame);
+    object_class_property_add_str(klass, "panel", disp_panel_get,
+                                  disp_panel_set);
 }
 
 static const TypeInfo clarion_dispmicom_types[] = {

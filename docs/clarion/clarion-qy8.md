@@ -195,6 +195,32 @@ without it QEMU answers "Input handler not found":
 
 followed by the same event with `"down": false`.
 
+### Panel keys and knobs
+
+The display panel MCU (`dispmicom`) sends the bezel keys as command `0x34`
+(matrix code, bit 7 = pressed) and the two knobs as command `0x35`
+(sign-magnitude detents). Host keys map to the same functions on QY8 and QY7;
+the codes come from the `kepdrv.dll` `InputLcdKey` tables, and `panel=row|jpn`
+picks the column (`row` for EUR and USA units, the default).
+
+| Host key | Function | QY8 `row` | QY8 `jpn` |
+|---|---|---:|---:|
+| `M` (or `F4`) | MAP | `0x00` | `0x32` |
+| `N` (or `F1`) | MENU | `0x13` | `0x01` |
+| `Esc` (or `F2`) | BACK | `0x30` | `0x03` |
+| `B` (or `F3`) | display off (hold) | `0x20` | `0x31` |
+| `C` (or `F5`) | CAMERA | `0x01` | `0x13` |
+| `A` (or `F6`) | AUDIO | `0x03` | `0x30` |
+| `[` / `]` (or `F7` / `F8`) | SEEK back / forward | `0x31` / `0x32` | `0x00` / `0x20` |
+| `Enter` (or `F9`) | TUNE press | `0x21` | `0x10` |
+| Up / Down, PageUp / PageDown, mouse wheel | TUNE knob | `0x35` | `0x35` |
+| `=` / `-` | VOL knob | `0x35` | `0x35` |
+
+Keys can also be injected over QMP: `qom-set` on `/machine/panel-micom` with
+`key="CODE[,HOLD_MS]"` (hex matrix code, default hold 150 ms) or a raw frame
+body with `frame="35 01 00"`. A zoom knob and the remaining bezel keys have
+no established codes yet.
+
 ## 5. Diagnostics
 
 **Environment variables** (the main ones):

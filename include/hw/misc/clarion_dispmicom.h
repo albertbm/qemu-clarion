@@ -32,4 +32,7 @@ void clarion_dispmicom_set_can_key_sink(DeviceState *dev,
 /* Byte from the guest (write to SCFTDR of the SCIF connected to the panel). */
 void clarion_dispmicom_rx_byte(DeviceState *dev, uint8_t b);
 
+/* Host wheel as TUNE detents; positive is clockwise. No-op without a panel. */
+void clarion_dispmicom_wheel(int detents);
+
 #endif
