@@ -797,7 +797,8 @@ static void clarion_2dg_diag_blit(ListCtx *c, uint32_t w, const uint32_t *a,
                 uint16_t v = 0;
 
                 address_space_read(&address_space_memory,
-                                   s->lreg[M2DG_R_SRC / 4] +
+                                   clarion_2dg_direct_seg(
+                                       s->lreg[M2DG_R_SRC / 4]) +
                                    (((hwaddr)(clarion_2dg_xy_y(a[1]) + j) *
                                      sstride) + clarion_2dg_xy_x(a[1]) + k) * 2,
                                    MEMTXATTRS_UNSPECIFIED, &v, 2);
