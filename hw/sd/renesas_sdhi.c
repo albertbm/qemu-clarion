@@ -188,11 +188,9 @@ struct RenesasSDHIState {
     uint8_t unit;               /* номер контролера, лише для трас */
 
     /*
-     * Передача даних через DMA (CC_EXT_MODE.DMASDRW). На цій платі за неї
-     * відповідає HPB-DMAC, і зв'язок однобічний: контролер лише каже йому
-     * «в буфері є дані». Читає їх DMAC сам — звичайним читанням SD_BUF0,
-     * тобто рівно тим самим шляхом, що й PIO. Без цих двох властивостей
-     * модель поводиться як раніше (PIO і чесний лог про невідомий DMA).
+     * CC_EXT_MODE.DMASDRW uses HPB-DMAC for both transfers. It reads
+     * SD_BUF0 for module-to-memory and writes it for memory-to-module.
+     * Both directions use the same FIFO path as PIO.
      */
     DeviceState *dmac;
     uint64_t dma_buf_addr;      /* фізична адреса власного SD_BUF0 */
@@ -237,7 +235,7 @@ static uint16_t sdhi_info1_live(RenesasSDHIState *s)
 
     if (sdhi_card_present(s)) {
         v |= INFO1_SIGSTATE | INFO1_SIGSTATE_A;
-        if (sdbus_get_readonly(&s->sdbus)) {
+        if (!sdbus_get_readonly(&s->sdbus)) {
             v |= INFO1_WRPROTECT;
         }
     }
@@ -407,8 +405,9 @@ static bool sdhi_dma_ready(void *opaque)
 {
     RenesasSDHIState *s = opaque;
 
-    return !s->wire_phase && s->dmac && s->reading &&
-           (s->cc_ext_mode & CC_EXT_DMASDRW) && s->pos < s->blen;
+    return !s->wire_phase && s->dmac &&
+           (s->cc_ext_mode & CC_EXT_DMASDRW) &&
+           (s->reading || s->writing) && s->pos < s->blen;
 }
 
 static void sdhi_start_data(RenesasSDHIState *s)
@@ -458,6 +457,9 @@ static void sdhi_start_data(RenesasSDHIState *s)
     } else {
         s->writing = true;
         s->info2 |= INFO2_TXRQ;
+        if (sdhi_dma_ready(s)) {
+            clarion_hpbdma_module_poke(s->dmac, s->dma_buf_addr);
+        }
     }
 }
 
@@ -660,6 +662,9 @@ static void sdhi_wire_expired(void *opaque)
     case 3:
         sdbus_write_data(&s->sdbus, s->buf, s->blen);
         sdhi_block_done(s);
+        if (sdhi_dma_ready(s)) {
+            clarion_hpbdma_module_poke(s->dmac, s->dma_buf_addr);
+        }
         if (s->writing) {
             s->info2 |= INFO2_TXRQ;
         }

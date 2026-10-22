@@ -540,18 +540,20 @@ static void hpb_service_module(ClarionHpbDmaState *s, hwaddr addr)
         ClarionHpbChan *c = &s->ch[ch];
         uint32_t dar0, n0;
 
-        /* лише озброєний канал «модуль -> пам'ять», прив'язаний до addr */
-        if (!c->active || !c->left || hpb_module_addr(s, ch) != addr) {
-            continue;
-        }
-        if (!(c->dcr & DCR_SMDL) || (c->dcr & DCR_DMDL)) {
+        bool module_to_memory = (c->dcr & DCR_SMDL) &&
+                                !(c->dcr & DCR_DMDL);
+        bool memory_to_module = !(c->dcr & DCR_SMDL) &&
+                                (c->dcr & DCR_DMDL);
+
+        if (!c->active || !c->left || hpb_module_addr(s, ch) != addr ||
+            (!module_to_memory && !memory_to_module)) {
             continue;
         }
 
         dar0 = c->ddasr;
         n0 = c->left;
-        trace_clarion_hpbdma_module_service(ch, (uint32_t)addr, c->ddasr,
-                                            c->left);
+        trace_clarion_hpbdma_module_service(ch, (uint32_t)addr, c->dsasr,
+                                            c->ddasr, c->left);
         while (c->left && m->ready(m->opaque)) {
             hpb_move_one(s, ch);
         }
@@ -590,9 +592,10 @@ void clarion_hpbdma_module_poke(DeviceState *dev, hwaddr periph_addr)
 static void hpb_chan_start(ClarionHpbDmaState *s, int ch, bool next)
 {
     ClarionHpbChan *c = &s->ch[ch];
+    hwaddr mod = hpb_module_addr(s, ch);
     unsigned plane = 0;
 
-    /* DMEN активує idle channel; повторний DMEN не перезапускає transfer. */
+    /* DMEN activates an idle channel; repeated DMEN does not restart it. */
     if (c->active) {
         return;
     }
@@ -623,7 +626,13 @@ static void hpb_chan_start(ClarionHpbDmaState *s, int ch, bool next)
         return;
     }
 
-    /* Пам'ять -> модуль (або пам'ять -> пам'ять): наш приймач завжди готовий. */
+    if ((c->dcr & DCR_DMDL) && hpb_module_find(s, mod)) {
+        /* Wait for the peripheral to enter its receive-data state. */
+        hpb_service_module(s, mod);
+        return;
+    }
+
+    /* Memory -> module (or memory -> memory) with no module handshake. */
     while (c->left) {
         hpb_move_one(s, ch);
     }
