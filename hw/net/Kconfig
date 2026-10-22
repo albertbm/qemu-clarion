@@ -165,5 +165,5 @@ config CAN_FLEXCAN
 
 config RENESAS_CAN
     bool
-    # Контролер CAN R-Car Gen1 (R8A7778). Шини CAN модель поки не має,
-    # тому CAN_BUS свідомо НЕ вибирається.
+    # R-Car Gen1 CAN controller (R8A7778). The model has no CAN bus yet,
+    # so CAN_BUS is deliberately not selected.

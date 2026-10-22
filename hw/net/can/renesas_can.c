@@ -1,61 +1,58 @@
 /*
  * Renesas CAN controller (R-Car Gen1, R8A7778) — QY8XXX @ 0xFFFD1000.
  *
- * Це КОНТРОЛЕР, а не автомобіль. Модель знає лише про власні режими
- * (reset / halt / operation / sleep) і про пам'ять поштових скриньок.
- * Жодного CAN-буса тут немає: ні передачі, ні приймання поки не
- * реалізовано, і модель нічого не вигадує замість них.
+ * This is a CONTROLLER, not a vehicle. The model implements its modes
+ * (reset / halt / operation / sleep) and mailbox memory only. There is no CAN
+ * bus here: transmission and reception are not implemented, and the model
+ * does not invent substitutes.
  *
- * --- Звідки взята мапа регістрів ------------------------------------------
+ * --- Register map sources ------------------------------------------------
  *
- * 1. Жива траса QEMU (docs/04-journal.md, 2026-09-24): 64 групи по 16 байтів
- *    за +0x000, 64 однобайтові регістри за +0x800, далі окремі регістри
+ * 1. Live QEMU trace (2026-09-24): 64 groups of 16 bytes at +0x000, 64
+ *    single-byte registers at +0x800, followed by separate registers.
  *    +0x840, +0x842, +0x844/846, +0x84C, +0x856, +0x858.
- * 2. Драйвер `CAN.dll` (секція 0, VA 0xEF621000) — саме з нього знято
- *    семантику, а не з даташита (офіційного опису цього блока у відкритих
- *    джерелах немає).
- * 3. Імена регістрів — з `struct rcar_can_regs` драйвера Linux
- *    `drivers/net/can/rcar/rcar_can.c`, чия мапа збігається з (1) байт у
- *    байт: mb[64]×16, mkr/fidcr/mier за +0x400, mctl[64] за +0x800,
+ * 2. Driver `CAN.dll` (section 0, VA 0xEF621000) provides the semantics;
+ *    no public datasheet for this block is available.
+ * 3. Register names come from Linux driver's `struct rcar_can_regs` in
+ *    `drivers/net/can/rcar/rcar_can.c`; its map matches (1) byte for byte:
+ *    byte for byte: mb[64]×16, mkr/fidcr/mier at +0x400, mctl[64] at +0x800,
  *    CTLR +0x840, STR +0x842, BCR +0x844..846.
  *
- * --- Доведені точки драйвера ----------------------------------------------
+ * --- Established driver behavior -----------------------------------------
  *
- *   0xEF628E80  вихід зі сну: якщо CTLR & 0x400 — зняти біт і чекати,
- *               поки згасне STR & 0x400.
- *   0xEF629308  ініціалізація:
- *                 CTLR = (CTLR & ~0x300) | 0x100      — запит reset mode
- *                 100 × опитування STR & 0x100        — інакше помилка 0x21
- *                 очищення 64 скриньок, MCTL[i] = 0x40
- *                 BCR: 0xF004 -> +0x844, 0x12 -> +0x846 (біт-тайминг)
- *                 CTLR = (CTLR & ~0x300) | 0x200      — запит halt mode
- *                 100 × опитування STR & 0x200        — інакше помилка 0x21
+ *   0xEF628E80  wake from sleep: if CTLR & 0x400, clear the bit and wait for
+ *               STR & 0x400 to clear.
+ *   0xEF629308  initialization:
+ *                 CTLR = (CTLR & ~0x300) | 0x100      - request reset mode
+ *                 poll STR & 0x100 up to 100 times   - else error 0x21
+ *                 clear 64 mailboxes, MCTL[i] = 0x40
+ *                 BCR: 0xF004 -> +0x844, 0x12 -> +0x846 (bit timing)
+ *                 CTLR = (CTLR & ~0x300) | 0x200      - request halt mode
+ *                 poll STR & 0x200 up to 100 times   - else error 0x21
  *                 +0x858 = (+0x858 & 0x20) | 0x07, +0x84C = 0x08
- *                 CTLR &= ~0x300                      — запит operation mode
- *                 100 × очікування, поки згаснуть ОБИДВА STR 0x100 і 0x200
- *   0xEF6294BC  самоперевірка пам'яті скриньок: у кожну з 64 пише 0x5555 і
- *               0xAAAA за зміщеннями 0x0, 0x2, 0x6, 0x8, 0xA, 0xC і звіряє
- *               читання з маскою (таблиця за 0xEF6216AC). Маска першого
- *               півслова — 0xDFFF, решти — 0xFFFF.
+ *                 CTLR &= ~0x300                      - request operation mode
+ *                 wait up to 100 times for both STR 0x100 and 0x200 to clear
+ *   0xEF6294BC  mailbox memory test: write 0x5555 and 0xAAAA to all 64
+ *               mailboxes at offsets 0x0, 0x2, 0x6, 0x8, 0xA, 0xC, then
+ *               verify masked reads (table at 0xEF6216AC). First halfword
+ *               mask is 0xDFFF; the rest use 0xFFFF.
  *
- * --- Межа чесності --------------------------------------------------------
+ * --- Model scope ---------------------------------------------------------
  *
- * * Скидальне значення CTLR даташитом не підтверджене. Обрано 0x0100 —
- *   контролер після ввімкнення живлення стоїть у reset mode, як і будь-який
- *   CAN-контролер. Драйвер до цього нечутливий: він сам примусово задає
- *   CANM, перш ніж чекати на підтвердження.
- * * Перехід у operation mode на справжньому залізі стається після 11
- *   рецесивних бітів на шині. Приймача до моделі не під'єднано, шина вільна,
- *   тобто 11 рецесивних бітів минають одразу — тому перехід миттєвий. Це
- *   фізика вільної шини, а не заглушка.
- * * Лічильники помилок (RECR/TECR/ECSR) читаються нулем: без шини помилок
- *   немає. MSSR віддає SEST=1 — «жодної скриньки не знайдено», бо приймати
- *   нема чого.
- * * Біт 13 першого півслова скриньки читається нулем — це єдиний біт, який
- *   сам драйвер виключає зі своєї самоперевірки (маска 0xDFFF). У мапі
- *   Linux цьому відповідає резервний біт 29 32-бітного поля ID.
- * * Переривання не виводиться взагалі: жодна подія моделі його не піднімає,
- *   а номер лінії GIC для CAN нічим не доведено.
+ * * The CTLR reset value is not confirmed by a datasheet. Use 0x0100, reset
+ *   mode after power-on as expected for a CAN controller. The driver forces
+ *   CANM itself before waiting for confirmation.
+ * * Real hardware enters operation mode after 11 recessive bus bits. No
+ *   receiver is connected, so the bus is idle and those bits elapse
+ *   immediately. This models an idle bus rather than stubbing the transition.
+ * * Error counters (RECR/TECR/ECSR) read zero because there is no bus and no
+ *   errors. MSSR returns SEST=1 (no mailbox found) because there is nothing to
+ *   receive.
+ * * Bit 13 of the first mailbox halfword reads zero; it is the only bit the
+ *   driver excludes from its memory test (mask 0xDFFF). In the Linux map this
+ *   corresponds to reserved bit 29 of the 32-bit ID field.
+ * * No interrupt is generated: no model event raises one, and the CAN GIC
+ *   line number is unproven.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -75,35 +72,35 @@
 
 OBJECT_DECLARE_SIMPLE_TYPE(RenesasCANState, RENESAS_CAN)
 
-/* --- мапа блока -------------------------------------------------------- */
+/* --- block map ---------------------------------------------------------- */
 
-#define CAN_MB_BASE     0x000   /* 64 скриньки по 16 байтів               */
+#define CAN_MB_BASE     0x000   /* 64 mailboxes, 16 bytes each            */
 #define CAN_MB_SIZE     0x400
 #define CAN_MKR_BASE    0x400   /* MKR2..9, FIDCR0/1, MKIVLR*, MIER*      */
 #define CAN_MKR_SIZE    0x040
-#define CAN_CTL_BASE    0x800   /* MCTL[64] і далі керівні регістри       */
+#define CAN_CTL_BASE    0x800   /* MCTL[64] and control registers         */
 #define CAN_CTL_SIZE    0x100
 
-#define CAN_CTLR        0x840   /* Control Register,  16 біт             */
-#define CAN_STR         0x842   /* Status Register,   16 біт, лише R     */
+#define CAN_CTLR        0x840   /* Control Register, 16 bits              */
+#define CAN_STR         0x842   /* Status Register, 16 bits, read-only    */
 
 /* CTLR */
-#define CTLR_CANM       0x0300  /* режим контролера                      */
+#define CTLR_CANM       0x0300  /* controller mode                        */
 #define CTLR_CANM_OPER  0x0000
 #define CTLR_CANM_RESET 0x0100
 #define CTLR_CANM_HALT  0x0200
 #define CTLR_CANM_FRST  0x0300  /* force reset                           */
-#define CTLR_SLPM       0x0400  /* запит сну                             */
+#define CTLR_SLPM       0x0400  /* sleep request                           */
 
 /* STR */
 #define STR_RSTST       0x0100
 #define STR_HLTST       0x0200
 #define STR_SLPST       0x0400
 
-/* Регістри, що мають не просто пам'ять (зміщення в межах CAN_CTL_BASE) */
+/* Registers with behavior beyond storage (offsets from CAN_CTL_BASE). */
 #define CTL_OFF(x)      ((x) - CAN_CTL_BASE)
 #define CTL_MSSR        CTL_OFF(0x852)
-#define MSSR_SEST       0x80    /* 1 = результату пошуку немає           */
+#define MSSR_SEST       0x80    /* 1 = no search result                   */
 
 enum {
     CAN_MODE_RESET,
@@ -116,14 +113,14 @@ struct RenesasCANState {
 
     MemoryRegion iomem;
 
-    uint8_t mb[CAN_MB_SIZE];    /* пам'ять поштових скриньок             */
-    uint8_t mkr[CAN_MKR_SIZE];  /* маски/фільтри/дозволи переривань      */
-    uint8_t ctl[CAN_CTL_SIZE];  /* MCTL[64] + керівні регістри           */
+    uint8_t mb[CAN_MB_SIZE];    /* mailbox memory                         */
+    uint8_t mkr[CAN_MKR_SIZE];  /* masks/filters/interrupt enables        */
+    uint8_t ctl[CAN_CTL_SIZE];  /* MCTL[64] + control registers            */
 
     uint8_t mode;               /* CAN_MODE_*                            */
     bool sleep;
 
-    /* QY8_CAN_PC=1 — дописувати до кожного рядка траси pc/lr викликача */
+    /* QY8_CAN_PC=1 adds caller pc/lr to each trace line. */
     bool trace_pc;
 };
 
@@ -138,8 +135,8 @@ static const char *can_mode_name(uint8_t mode)
 }
 
 /*
- * STR не зберігається, а виводиться зі стану контролера — інакше це була б
- * та сама підробка «читання повертає очікуване».
+ * Derive STR from controller state instead of storing it, avoiding a fake
+ * "read back the expected value" implementation.
  */
 static uint16_t can_str(RenesasCANState *s)
 {
@@ -176,9 +173,8 @@ static void can_ctlr_write(RenesasCANState *s, uint16_t ctlr)
         break;
     default:
         /*
-         * Запит робочого режиму. На залізі контролер приєднується до шини,
-         * побачивши 11 рецесивних бітів; шина вільна, тож це відбувається
-         * одразу.
+         * Request operation mode. Hardware joins the bus after observing 11
+         * recessive bits; the bus is idle here, so this happens immediately.
          */
         s->mode = CAN_MODE_OPERATION;
         break;
@@ -191,7 +187,7 @@ static void can_ctlr_write(RenesasCANState *s, uint16_t ctlr)
     }
 }
 
-/* --- доступ до байтових масивів будь-якою шириною ---------------------- */
+/* --- access byte arrays at any width ----------------------------------- */
 
 static uint64_t can_ld(const uint8_t *p, unsigned size)
 {
@@ -214,10 +210,10 @@ static void can_st(uint8_t *p, unsigned size, uint64_t v)
 }
 
 /*
- * Хто саме звертається. Той самий прийом, що й у qy8.periph: точний PC
- * інструкції дає cpu_unwind_state_data (НЕ cpu_restore_state — той пише
- * розгорнутий стан назад у env і гість іде іншою гілкою). Рахується лише
- * при QY8_CAN_PC=1, бо розгортання стану дороге.
+ * Identify the caller. As in qy8.periph, cpu_unwind_state_data provides the
+ * exact PC (not cpu_restore_state, which writes unwound state back to env and
+ * changes the guest's execution path). Only used with QY8_CAN_PC=1 because
+ * unwinding state is expensive.
  */
 static void can_ctx(RenesasCANState *s, char *buf, size_t len)
 {
@@ -231,15 +227,16 @@ static void can_ctx(RenesasCANState *s, char *buf, size_t len)
     }
     if (cpu_unwind_state_data(cs, cs->mem_io_pc, data)) {
         /*
-         * З CF_PCREL data[0] — зсув усередині сторінки; старші біти беремо
-         * з поточного PC, бо блок трансляції не перетинає межі сторінки.
+         * With CF_PCREL, data[0] is an offset within the page; use high bits
+         * from the current PC because a translation block does not cross a
+         * page boundary.
          */
         pc = data[0];
         if (pc < qemu_target_page_size()) {
             pc |= CPU_GET_CLASS(cs)->get_pc(cs) & qemu_target_page_mask();
         }
     } else {
-        pc = CPU_GET_CLASS(cs)->get_pc(cs);   /* запасний: початок блока */
+        pc = CPU_GET_CLASS(cs)->get_pc(cs);   /* fallback: start of block */
     }
     snprintf(buf, len, " pc=0x%08" PRIx64 " t=%" PRId64, pc,
              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL));
@@ -260,7 +257,7 @@ static uint64_t can_read(void *opaque, hwaddr addr, unsigned size)
     } else if (addr >= CAN_CTL_BASE && addr < CAN_CTL_BASE + CAN_CTL_SIZE) {
         val = can_ld(&s->ctl[addr - CAN_CTL_BASE], size);
     } else {
-        qemu_log_mask(LOG_UNIMP, "renesas-can: читання поза мапою +%#"
+        qemu_log_mask(LOG_UNIMP, "renesas-can: read outside map +%#"
                       HWADDR_PRIx " (%u)\n", addr, size);
         val = 0;
     }
@@ -286,9 +283,9 @@ static void can_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
             uint8_t b = val >> (8 * i);
 
             /*
-             * Другий байт скриньки — старша половина 16-бітного слова за
-             * +0x00, і його біт 5 (тобто біт 13 слова) нікуди не пишеться:
-             * саме цей біт драйвер виключає зі своєї самоперевірки.
+             * The second mailbox byte is the high half of the 16-bit word at
+             * +0x00; bit 5 (word bit 13) is not written because the driver
+             * excludes it from its memory test.
              */
             if ((a & 0xf) == 1) {
                 b &= 0xdf;
@@ -303,7 +300,7 @@ static void can_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     }
     if (addr == CAN_STR && size == 2) {
         qemu_log_mask(LOG_GUEST_ERROR,
-                      "renesas-can: запис у STR (лише читання) %#" PRIx64 "\n",
+                      "renesas-can: write to read-only STR %#" PRIx64 "\n",
                       val);
         return;
     }
@@ -315,7 +312,7 @@ static void can_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         return;
     }
 
-    qemu_log_mask(LOG_UNIMP, "renesas-can: запис поза мапою +%#" HWADDR_PRIx
+    qemu_log_mask(LOG_UNIMP, "renesas-can: write outside map +%#" HWADDR_PRIx
                   " (%u) = %#" PRIx64 "\n", addr, size, val);
 }
 
@@ -337,11 +334,11 @@ static void can_reset_hold(Object *obj, ResetType type)
     memset(s->mkr, 0, sizeof(s->mkr));
     memset(s->ctl, 0, sizeof(s->ctl));
 
-    /* Після ввімкнення живлення контролер стоїть у режимі скидання. */
+    /* Controller starts in reset mode after power-on. */
     s->mode = CAN_MODE_RESET;
     s->sleep = false;
     can_st(&s->ctl[CTL_OFF(CAN_CTLR)], 2, CTLR_CANM_RESET);
-    /* Пошуку скриньок не було — результату немає. */
+    /* No mailbox search has run, so there is no result. */
     s->ctl[CTL_MSSR] = MSSR_SEST;
 }
 

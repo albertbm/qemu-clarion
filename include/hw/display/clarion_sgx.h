@@ -1,5 +1,5 @@
 /*
- * PowerVR SGX плати Clarion QY8XXX — пасивна модель MMIO і трасувальник BIF/MMU.
+ * PowerVR SGX for the Clarion QY8XXX board: passive MMIO model and BIF/MMU tracer.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -9,68 +9,66 @@
 #define TYPE_CLARION_SGX "clarion-sgx"
 
 /*
- * База — з живого прогону, не з аналогії. `ddi_ncg.dll` мапить блок
- * MmMapIoSpace і тримає ядерний вказівник у `psDevInfo->pvRegsBaseKM`; зонд
- * tools/qy8_sgx_recon_probe.py репозиторію nissan-can-explore знімає його на
- * точці зупинки в `SGXInitialise` і бачить фізичну базу 0xFCE00000.
+ * Base address comes from a live run, not analogy. `ddi_ncg.dll` maps the
+ * block with MmMapIoSpace and stores the kernel pointer in
+ * `psDevInfo->pvRegsBaseKM`; a probe captures it at `SGXInitialise` and sees
+ * physical base 0xFCE00000.
  *
- * Розмір 0x4000 — стандартний банк регістрів SGX у DDK. Найбільший зсув, який
- * ми справді бачили від гостя, — 0x0C84 (`EUR_CR_BIF_DIR_LIST_BASE0`), тож
- * вікна досить із запасом; воно ні з чим відомим не перетинається.
+ * Size 0x4000 is the standard SGX register bank in the DDK. The largest
+ * offset observed from the guest is 0x0C84 (`EUR_CR_BIF_DIR_LIST_BASE0`), so
+ * the window has ample room and does not overlap any known region.
  */
 #define CLARION_SGX_BASE        0xFCE00000
 #define CLARION_SGX_SIZE        0x4000
 
 /*
- * Зсуви регістрів — із публічних заголовків SGX (`sgx531defs.h` і
- * однакові в 530/535/540/545 там, де ми ними користуємось). Модель НЕ
- * тлумачить їхніх полів, окрім масок адрес, які в цих же заголовках і задані.
+ * Register offsets come from public SGX headers (`sgx531defs.h`; shared by
+ * 530/535/540/545 where used). The model does NOT interpret fields except
+ * address masks defined in those same headers.
  */
 #define SGX_CR_CORE_ID              0x0020
 #define SGX_CR_CORE_ID              0x0020
 #define SGX_CR_CORE_REVISION        0x0024
 
 /*
- * --- Ідентичність ядра ------------------------------------------------
+ * --- Core identity ------------------------------------------------------
  *
- * `EUR_CR_CORE_REVISION` (`sgx540defs.h:249..261`) — це
+ * `EUR_CR_CORE_REVISION` (`sgx540defs.h:249..261`) is
  * `DESIGNER<<24 | MAJOR<<16 | MINOR<<8 | MAINTENANCE`.
  *
- * ЗВІДКИ ВЗЯТО ЗНАЧЕННЯ. Не з припущення і не з підгонки: **його називає сама
- * прошивка**. Обробник `HostKickGetMiscInfo` кладе у свій буфер власну
- * константу `ui32CoreRevSW`, зібрану трьома інструкціями
- * (`eventhandler.use.asm:1138..1141`), а заголовок DDK прямо каже, що ця
- * константа — «SW core revision converted to internal format (as used in the
+ * VALUE SOURCE. It is neither guessed nor fitted: **the firmware names it**.
+ * Handler `HostKickGetMiscInfo` places its `ui32CoreRevSW` constant in its
+ * buffer, assembled from three instructions (`eventhandler.use.asm:1138..1141`);
+ * the DDK header states that this constant is the
+ * constant — "SW core revision converted to internal format (as used in the
  * **EUR_CR_CORE_REVISION** register)» (`sgxdefs.h:145..148`).
  *
- * У нашому образі ці три безпосередні операнди читаються дослівно
+ * In our image, these three immediate operands read literally as
  * (GPU VA 0x0E400A40..0x0E400A88):
  *
  *   mov r1, #0x00010000   MAJ = 1
  *   or  r1, r1, #0x00000200   MIN = 2
- *   or  r1, r1, #0x00000000   MAINT = 0      ⇒ 0x00010200, тобто SGX540 r1.2.0
+ *   or  r1, r1, #0x00000000   MAINT = 0      -> 0x00010200, SGX540 r1.2.0
  *
- * А драйвер вимагає `ui32CoreRev == ui32CoreRevSW`, інакше
- * `PVRSRV_ERROR_BUILD_MISMATCH` (`srvkm/.../sgxinit.c:2085`); виняток у
- * таблиці рівно один — пара (0x10100, 0x10101), і до 0x10200 він не
- * стосується. Оскільки ця прошивка на справжньому HU працювала, справжній
- * кремній мусив повертати саме `0x00010200`.
+ * The driver requires `ui32CoreRev == ui32CoreRevSW`, otherwise it reports
+ * `PVRSRV_ERROR_BUILD_MISMATCH` (`srvkm/.../sgxinit.c:2085`). Its table has
+ * one exception, pair (0x10100, 0x10101), unrelated to 0x10200. Since this
+ * firmware worked on the real HU, the silicon must have returned 0x00010200.
  */
 #define SGX_CORE_REVISION_QY8       0x00010200U
 
 /*
- * ⚠ `EUR_CR_CORE_ID` — ПІДСТАВИ НЕМАЄ, і це сказано вголос.
+ * ⚠ `EUR_CR_CORE_ID` has NO established source; this is stated explicitly.
  *
- * Мікроядро лише копіює цей регістр у `ui32CoreID`, а той в усьому DDK
- * потрапляє тільки в debug-друк (`sgxinit.c:1037`) і в значення, яке
- * `PVRSRVGetSGXRevDataKM` віддає тому, хто спитав (`sgxutils.c:1609`).
- * Жодна перевірка його не читає.
+ * The microkernel only copies this register to `ui32CoreID`; throughout the
+ * DDK this value is used only in debug output (`sgxinit.c:1037`) and returned
+ * to callers by `PVRSRVGetSGXRevDataKM` (`sgxutils.c:1609`). No check reads it.
  *
- * Тому тут нуль — і це інший випадок, ніж `MNE_CR_EVENT_STATUS`, де нуль
- * міняв потік керування й крутив мікроядро вічно. Значення, яке контракт не
- * читає, подати можна; значення, від якого залежить поведінка, — ні.
- * Модель друкує цей вибір при кожному читанні. Перевизначити:
- * `QY8_SGX_CORE_ID=` (і `QY8_SGX_CORE_REV=` для ревізії).
+ * Therefore use zero here. This differs from `MNE_CR_EVENT_STATUS`, where
+ * zero changes control flow and loops the microkernel forever. A value that
+ * the contract never reads can be supplied; behavior-dependent values cannot.
+ * The model logs this choice on every read. Override with
+ * `QY8_SGX_CORE_ID=` (and `QY8_SGX_CORE_REV=` for the revision).
  */
 #define SGX_CORE_ID_UNKNOWN         0x00000000U
 #define SGX_CR_SOFT_RESET           0x0080
@@ -118,18 +116,18 @@
 #define SGX_FEATURE_USE_NUMBER_PC_BITS 12
 
 /*
- * MNE — вузол системного кешу (`eurasia/hwdefs/mnemedefs.h`). Мікроядро
- * проходить через нього щоразу, коли хост просить `SGXMKIF_CC_INVAL_BIF_SL`.
+ * MNE is the system-cache node (`eurasia/hwdefs/mnemedefs.h`). The microkernel
+ * uses it whenever the host requests `SGXMKIF_CC_INVAL_BIF_SL`.
  *
- * ⚠ На ЦЬОМУ ядрі запит «інвалідувати все» стоїть у біті 0 самого
- * `MNE_CR_CTRL`, а не в окремому `MNE_CR_CTRL_INVAL` (0x0D20): у
- * `usedefs.h` це гілка `#if !defined(MNE_CR_CTRL_INVAL)`, і прошивка
- * підтвердила саме її — `ldr 0xD00` -> `or #1` -> `str 0xD00` -> `ldr 0xD14`,
- * інструкція в інструкцію. Тому `MNE_CR_CTRL_INVAL_ALL` тут описує біт у
- * 0x0D00, хоча ім'я маски в заголовку належить регістру 0x0D20.
+ * ⚠ On THIS core the "invalidate all" request is bit 0 of `MNE_CR_CTRL`,
+ * not the separate `MNE_CR_CTRL_INVAL` register (0x0D20): `usedefs.h` selects
+ * the `#if !defined(MNE_CR_CTRL_INVAL)` branch, confirmed by firmware
+ * instructions `ldr 0xD00` -> `or #1` -> `str 0xD00` -> `ldr 0xD14`.
+ * Therefore `MNE_CR_CTRL_INVAL_ALL` describes a bit at 0x0D00 although the
+ * header associates that mask with register 0x0D20.
  *
- * Протокол рівневий: запит виставляють, чекають на `EVENT_STATUS.INVAL`,
- * гасять його через `EVENT_CLEAR`, і лише потім знімають сам запит.
+ * The protocol is level-triggered: set the request, wait for
+ * `EVENT_STATUS.INVAL`, clear it via `EVENT_CLEAR`, then clear the request.
  */
 #define SGX_CR_MNE_CTRL             0x0D00
 #define SGX_CR_MNE_CTRL_INVAL_ALL   0x00000001U
@@ -139,25 +137,23 @@
 #define SGX_CR_MNE_EVENT_CLEAR_INVAL  0x00000001U
 
 /*
- * Триплет task-control події «Other», який init-script прошивки пише ОСТАННІМ
- * перед kick'ом.
+ * Task-control triplet for the "Other" event, written LAST by the firmware
+ * init script before the kick.
  *
- * ⚠ Раніше тут стояло «імені в жодному з публічних заголовків немає» і
- * робоча назва `SGX_CR_QY8_TASK_*`. Це було неправдою: імена є в
- * `eurasia/hwdefs/sgx540defs.h:2135..2157` того самого дерева DDK — просто
- * ми доти дивилися в заголовки інших ядер. Знайдено під час T6
- * (docs/sgx/23), підтверджено дослівним збігом зсувів.
+ * ⚠ The previous claim that no public header defined these names and the
+ * provisional names `SGX_CR_QY8_TASK_*` were wrong: the names are in
+ * `eurasia/hwdefs/sgx540defs.h:2135..2157` in the same DDK tree; we had been
+ * checking headers for other cores. Exact offset matches confirm them.
  *
- *   0x0A68 EUR_CR_EVENT_OTHER_PDS_EXEC  ADDR_MASK 0x03FFFFF0 — адреса
- *          програми PDS відносно EUR_CR_PDS_EXEC_BASE (наш прогін: 0x0080C180)
- *   0x0A6C EUR_CR_EVENT_OTHER_PDS_DATA  SIZE_MASK 0x3F — розмір сегмента
- *          даних у одиницях по 16 Б (наш прогін: 2 -> 32 Б, і це точно
- *          збігається з «2 рядки × 2 банки × 2 дв.сл.»)
+ *   0x0A68 EUR_CR_EVENT_OTHER_PDS_EXEC  ADDR_MASK 0x03FFFFF0 - PDS program
+ *          address relative to EUR_CR_PDS_EXEC_BASE (run: 0x0080C180)
+ *   0x0A6C EUR_CR_EVENT_OTHER_PDS_DATA  SIZE_MASK 0x3F - data segment size
+ *          in 16-byte units (run: 2 -> 32 bytes, matching
+ *          "2 rows x 2 banks x 2 dwords")
  *   0x0A70 EUR_CR_EVENT_OTHER_PDS_INFO  DM / ATTRIBUTE_SIZE / USESECEXEC
  *
- * Той самий триплет код мікроядра пише з боку USE інструкціями
- * `str #666/#667` (номер = байтовий зсув / 4) — docs/sgx/23 §3.
- * Докази ролі й ланцюга — docs/sgx/09-edm-boot-locator.md.
+ * The microkernel writes the same triplet from USE using `str #666/#667`
+ * (register number = byte offset / 4).
  */
 #define SGX_CR_EVENT_PDS_ENABLE     0x0A58
 #define SGX_CR_EVENT_OTHER_PDS_EXEC 0x0A68
@@ -168,7 +164,7 @@
 #define SGX_EVENT_OTHER_PDS_EXEC_ADDR_MASK  0x03FFFFF0U
 #define SGX_EVENT_OTHER_PDS_DATA_SIZE_MASK  0x0000003FU
 
-/* Маски полів адрес — дослівно з sgx*defs.h. */
+/* Address field masks, copied from sgx*defs.h. */
 #define SGX_PDS_EXEC_BASE_ADDR_MASK     0x0FF00000U
 #define SGX_EVENT_KICKER_ADDR_MASK      0x0FFFFFF0U
 #define SGX_USE_CODE_BASE_ADDR_MASK     0x00FFFFFFU
@@ -179,23 +175,23 @@
 #define SGX_CR_EVENT_KICK2_NOW          0x00000001U
 
 /*
- * Програмна подія. ⚠ Нумерація РІЗНА у двох просторах, і сплутати їх легко:
+ * Software event. ⚠ Numbering DIFFERS between two spaces and is easy to mix up:
  *
- *   регістри   `EUR_CR_EVENT_{STATUS,HOST_ENABLE,HOST_CLEAR,PDS_ENABLE}`
- *              — `SW_EVENT` це біт **14** (`sgx540defs.h:536,631,726,2043`);
- *   вхід PDS   `ir1` — `EURASIA_PDS_IR1_EDM_EVENT_SWEVENT` це біт **8**
- *              (`sgxdefs.h:3566`, гілка НЕ-543/544/554, тобто наша).
+ *   registers  `EUR_CR_EVENT_{STATUS,HOST_ENABLE,HOST_CLEAR,PDS_ENABLE}`
+ *              - `SW_EVENT` is bit **14** (`sgx540defs.h:536,631,726,2043`);
+ *   PDS input  `ir1` - `EURASIA_PDS_IR1_EDM_EVENT_SWEVENT` is bit **8**
+ *              (`sgxdefs.h:3566`, the non-543/544/554 branch used here).
  *
- * Відповідність між ними — за іменем тієї самої події, а не за позицією.
+ * Map them by the shared event name, not by bit position.
  */
 #define SGX_EVENT_SW_EVENT_MASK         0x00004000U
 #define PDS_IR1_EDM_EVENT_SWEVENT       (1u << 8)
 #define PDS_IR1_EDM_EVENT_KICKPTR_SHIFT 24
 
 /*
- * Формат MMU SGX — DDK 1.7 services4/srvkm/hwdefs/sgxmmu.h, варіант без
- * SGX_FEATURE_36BIT_MMU: device-VA = 10 біт PDE + 10 біт PTE + 12 біт зсуву,
- * по 1024 записи в каталозі й у таблиці, біт 0 = «валідний».
+ * SGX MMU format from DDK 1.7 services4/srvkm/hwdefs/sgxmmu.h, without
+ * SGX_FEATURE_36BIT_MMU: device VA = 10-bit PDE + 10-bit PTE + 12-bit offset,
+ * with 1024 entries in both directory and table, and bit 0 = valid.
  */
 #define SGX_MMU_PAGE_SHIFT      12
 #define SGX_MMU_PAGE_SIZE       (1u << SGX_MMU_PAGE_SHIFT)
@@ -205,32 +201,31 @@
 #define SGX_MMU_ENTRY_ADDR_MASK 0xFFFFF000U
 
 /*
- * --- Кодування PDS (SGX540) -------------------------------------------
+ * --- PDS encoding (SGX540) ---------------------------------------------
  *
- * Усе нижче — дослівно з публічного DDK, гілка SGX540 (без
- * `SGX_FEATURE_USE_UNLIMITED_PHASES` і без `SGX_FEATURE_PDS_EXTENDED_SOURCES`):
- * `eurasia/hwdefs/sgxdefs.h` і `eurasia/codegen/pds/pds.c` дерева
- * GFX_Linux_DDK @ f184ac914561fa100a5c92a488df777de8785f93. Нічого не вгадано;
- * розбір і посилання на рядки — docs/sgx/13 і docs/sgx/14.
+ * Everything below follows the public DDK SGX540 branch (without
+ * `SGX_FEATURE_USE_UNLIMITED_PHASES` and without `SGX_FEATURE_PDS_EXTENDED_SOURCES`):
+ * `eurasia/hwdefs/sgxdefs.h` and `eurasia/codegen/pds/pds.c` in GFX_Linux_DDK
+ * @ f184ac914561fa100a5c92a488df777de8785f93. Nothing is guessed.
  */
 #define PDS_INSTRUCTION_SIZE        4
-#define PDS_INST_SHIFT              30      /* біти 31:30 — група */
+#define PDS_INST_SHIFT              30      /* bits 31:30: group */
 #define PDS_INST_MOV                0
 #define PDS_INST_ARITH              1
 #define PDS_INST_FLOW               2
 #define PDS_INST_LOGIC              3
-#define PDS_TYPE_SHIFT              27      /* біти 29:27 — тип */
+#define PDS_TYPE_SHIFT              27      /* bits 29:27: type */
 #define PDS_TYPE_MOVS               0
 #define PDS_TYPE_MOV16              1
 #define PDS_TYPE_MOV32              2
-#define PDS_TYPE_TSTZ               0       /* у групі FLOW */
+#define PDS_TYPE_TSTZ               0       /* in FLOW group */
 #define PDS_TYPE_BRA                2
 #define PDS_TYPE_HALT               5
-#define PDS_TYPE_TSTN               1       /* у групі FLOW */
+#define PDS_TYPE_TSTN               1       /* in FLOW group */
 #define PDS_TYPE_CALL               3
 #define PDS_TYPE_RTN                4
 #define PDS_TYPE_NOP                6
-#define PDS_CC_SHIFT                24      /* біти 26:24 */
+#define PDS_CC_SHIFT                24      /* bits 26:24 */
 #define PDS_CC_P0                   0
 #define PDS_CC_P1                   1
 #define PDS_CC_P2                   2
@@ -241,11 +236,11 @@
 #define PDS_CC_ALWAYS               7
 
 /*
- * Логічні операції — `sgxdefs.h:3119..3176`, гілка БЕЗ
- * `SGX_FEATURE_PDS_EXTENDED_SOURCES` (наша, SGX540): `SRC2SEL` немає взагалі,
- * друге джерело — завжди банк DS1, і `SRC2` стоїть на 10, а не на 9.
+ * Logical operations use `sgxdefs.h:3119..3176`, the branch WITHOUT
+ * `SGX_FEATURE_PDS_EXTENDED_SOURCES` (SGX540): no `SRC2SEL`; source 2 is
+ * always DS1 bank, and `SRC2` is at bit 10, not bit 9.
  */
-#define PDS_TYPE_OR                 0       /* у групі LOGIC */
+#define PDS_TYPE_OR                 0       /* in LOGIC group */
 #define PDS_TYPE_AND                1
 #define PDS_TYPE_XOR                2
 #define PDS_TYPE_NOT                3
@@ -267,9 +262,9 @@
 #define PDS_LOGIC_SRC1_TIM          0x02
 
 /*
- * TSTZ/TSTN — `sgxdefs.h:3068..3090`. Предикат p0..p2 (біти 2:0) дістає
- * результат порівняння з нулем одного з двох джерел; SRCSEL (біт 8) вибирає,
- * якого саме. SRC1 — ds0[] або вхідний регістр ir0/ir1, SRC2 — завжди ds1[].
+ * TSTZ/TSTN use `sgxdefs.h:3068..3090`. Predicate p0..p2 (bits 2:0) gets
+ * the result of testing one of two sources against zero; SRCSEL (bit 8)
+ * selects the source. SRC1 is ds0[] or input register ir0/ir1; SRC2 is ds1[].
  */
 #define PDS_TST_DEST_MASK           0x7
 #define PDS_TST_SRC1SEL_SHIFT       23
@@ -284,29 +279,29 @@
 #define PDS_TST_SRC1_IR1            0x01
 
 /*
- * BRA/CALL — `sgxdefs.h:3106..3109` (`FLOW_DEST` біти 18:0).
+ * BRA/CALL — `sgxdefs.h:3106..3109` (`FLOW_DEST` bits 18:0).
  *
- * ⚠ Тут легко помилитися на один зсув, і ми на цьому вже спіймалися.
- * `pdsasm/main.c:4736` рахує `uDest = uLabelOffset << ALIGNSHIFT`, але
- * `PDSEncodeBRA` (`sgxpdsdefs.h:775..782`) кладе в поле `uDest >> ALIGNSHIFT`.
- * Зсуви взаємно скорочуються, отже в полі лежить **номер інструкції**, а
- * байтовий зсув від початку сегмента коду = поле << ALIGNSHIFT.
+ * ⚠ It is easy to get the shift wrong here; this has happened before.
+ * `pdsasm/main.c:4736` computes `uDest = uLabelOffset << ALIGNSHIFT`, while
+ * `PDSEncodeBRA` (`sgxpdsdefs.h:775..782`) stores `uDest >> ALIGNSHIFT` in the field.
+ * The shifts cancel, so the field contains the **instruction number**; the
+ * byte offset from the start of the code segment is field << ALIGNSHIFT.
  */
 #define PDS_FLOW_DEST_MASK          0x7FFFF
 #define PDS_FLOW_DEST_ALIGNSHIFT    2
 
 /*
- * MOVS, гілка БЕЗ `SGX_FEATURE_PDS_EXTENDED_SOURCES` (тобто наша, SGX540).
- * ⚠ Ця гілка інша, ніж розширена: `SRC2SEL` там немає взагалі (джерело 2 —
- * завжди банк DS1), `SRC2` стоїть на 13, а свізли — на 11/9/7/5, не 10/8/6/4.
- * `SRC1`/`SRC2` індексують ЧЕТВЕРНІ слова, тож індекс двійного слова —
+ * MOVS without `SGX_FEATURE_PDS_EXTENDED_SOURCES` (our SGX540 variant).
+ * ⚠ This differs from the extended variant: there is no `SRC2SEL` (source 2
+ * always uses bank DS1), `SRC2` is at bit 13, and swizzles are at 11/9/7/5,
+ * not 10/8/6/4. `SRC1`/`SRC2` index QUADWORDS, so the doubleword index is
  * `src * PDS_NUM_DWORDS_PER_QWORD + (swiz & 1)` (`pdsdisasm.c`).
  */
 #define PDS_MOVS_SRC1SEL_SHIFT      23
 #define PDS_MOVS_SRC1SEL_REG        1
 /*
- * Коли SRC1SEL = REG, поле SRC1 індексує не datastore, а вхідні регістри
- * задачі (`sgxdefs.h:2674..2676`).
+ * When SRC1SEL = REG, SRC1 indexes the task's input registers rather than
+ * the datastore (`sgxdefs.h:2674..2676`).
  */
 #define PDS_MOVS_SRC1_IR0           0x00
 #define PDS_MOVS_SRC1_IR1           0x01
@@ -350,15 +345,15 @@
 #define PDS_MOV32_SRC_PC            0x04
 #define PDS_MOV32_SRC_TIM           0x06
 
-/* Розмір банку datastore, `sgxdefs.h:2485..2491`: 0..47 константи, 48..63 temp. */
+/* Datastore bank size, `sgxdefs.h:2485..2491`: 0..47 constants, 48..63 temps. */
 #define PDS_DATASTORE_PERBANKSIZE   64
 
-/* Розкладка сегмента даних: PDS_NUM_DWORDS_PER_ROW = 2 для SGX540. */
+/* Data segment layout: PDS_NUM_DWORDS_PER_ROW = 2 on SGX540. */
 #define PDS_NUM_DWORDS_PER_ROW      2
 #define PDS_NUM_USE_TASK_CONTROL_WORDS  3
 #define PDS_NUM_DMA_CONTROL_WORDS   2
 
-/* DOUTD — DMA-інтерфейс PDS */
+/* DOUTD — PDS DMA interface */
 #define PDS_DOUTD1_BSIZE_MASK       0xF
 #define PDS_DOUTD1_BLINES_SHIFT     4
 #define PDS_DOUTD1_BLINES_MASK      0xF
@@ -373,16 +368,16 @@
 #define PDS_DOUTD1_INSTR_LINEFILL   2
 
 /*
- * Вторинні атрибути мікроядра. Розкладку задає `PVRSRV_SGX_EDMPROG_SECATTR`
- * (`services4/srvinit/devices/sgx/sgx_mkif.h:144..156`): двійне слово 0 —
- * `sTA3DCtl`, 1 — `sHostCtl`, 2 — `sCCBCtl`, далі `sMKState`. А
- * `usedefs.h:68..72` дає імена, якими користується сам код USE:
- * `R_HostCtl = SA(sHostCtl)`, тобто рівно `sa[1]` у лістингу мікроядра.
+ * Microkernel secondary attributes. Their layout is defined by
+ * `PVRSRV_SGX_EDMPROG_SECATTR` (`services4/srvinit/devices/sgx/sgx_mkif.h:144..156`):
+ * doubleword 0 is `sTA3DCtl`, 1 is `sHostCtl`, 2 is `sCCBCtl`, followed by
+ * `sMKState`. `usedefs.h:68..72` gives the names used by USE code:
+ * `R_HostCtl = SA(sHostCtl)`, exactly `sa[1]` in the microkernel listing.
  *
- * `SGX_UKERNEL_SA_BURST_SIZE = 16` двійних слів (`sgx_mkif.h:171`), а
- * загальний розмір — `SGX_UKERNEL_NUM_SEC_ATTRIB` (`sgx_mkif.h:174`); для
- * нашої збірки DOUTD везе 2 рядки по 16, тобто 32 двійних слова. Банк тримаємо
- * з запасом до максимуму поля AO.
+ * `SGX_UKERNEL_SA_BURST_SIZE = 16` doublewords (`sgx_mkif.h:171`), and the
+ * total size is `SGX_UKERNEL_NUM_SEC_ATTRIB` (`sgx_mkif.h:174`). In our build,
+ * DOUTD transfers 2 rows of 16, or 32 doublewords. The bank includes margin
+ * up to the AO field maximum.
  */
 #define SGX_SA_DWORDS               (PDS_DOUTD1_AO_MASK + 1)
 #define SGX_SA_TA3DCTL              0
@@ -390,24 +385,24 @@
 #define SGX_SA_CCBCTL               2
 
 /*
- * DOUTA — запис у ПЕРВИННІ атрибути задачі USE (`sgxdefs.h:3654..3662`).
- * Слово 0 — самі дані (усі 32 біти), слово 1 несе `AO` — зсув у банку
- * атрибутів, біти 18:8 у нашій гілці (CLRMSK `0xFFF800FF`).
+ * DOUTA writes to the USE task's PRIMARY attributes (`sgxdefs.h:3654..3662`).
+ * Word 0 contains the data (all 32 bits); word 1 carries `AO`, the offset in
+ * the attribute bank, bits 18:8 in our variant (CLRMSK `0xFFF800FF`).
  *
- * Саме цим обробник подій мікроядра починає роботу:
- * `movs douta, ir0, INPUT_IR0_PA_DEST` і те саме для `ir1`
- * (`services4/srvinit/devices/sgx/eventhandler.pds.asm:84..85`) — тобто
- * перекладає прапорці події з вхідних регістрів у атрибути, щоб код USE міг
- * перевірити, яка подія сталася.
+ * The microkernel event handler starts this way:
+ * `movs douta, ir0, INPUT_IR0_PA_DEST` and likewise for `ir1`
+ * (`services4/srvinit/devices/sgx/eventhandler.pds.asm:84..85`): it transfers
+ * event flags from input registers into attributes so USE code can check
+ * which event occurred.
  */
 #define PDS_NUM_ATTRIB_CONTROL_WORDS 2
 #define PDS_DOUTA1_AO_SHIFT         8
 #define PDS_DOUTA1_AO_MASK          0x7FF
 
-/* Банк первинних атрибутів; розмір — за максимумом поля AO. */
+/* Primary attribute bank; size follows the AO field maximum. */
 #define SGX_PA_DWORDS               (PDS_DOUTA1_AO_MASK + 1)
 
-/* DOUTU — інтерфейс запуску задачі USE */
+/* DOUTU: USE task launch interface */
 #define PDS_DOUTU0_CBASE_MASK       0xF
 #define PDS_DOUTU0_COFF_SHIFT       4
 #define PDS_DOUTU0_COFF_MASK        0xF
@@ -421,15 +416,15 @@
 #define PDS_DOUTU1_MODE_SHIFT       26
 
 /*
- * --- Кодування USE (SGX540) -------------------------------------------
+ * --- USE encoding (SGX540) ---------------------------------------------
  *
- * Дослівно з `eurasia/hwdefs/sgxdefs.h` того самого дерева DDK. Інструкція —
- * пара 32-бітних слів little-endian: word0 (низ) і word1 (верх). Опкод — у
- * word1, біти 31:27.
+ * Directly from `eurasia/hwdefs/sgxdefs.h` in the same DDK tree. An
+ * instruction is a pair of little-endian 32-bit words: word0 (low) and word1
+ * (high). The opcode is in word1, bits 31:27.
  *
- * ⚠ Біт 18 word1 КОНТЕКСТНО-ЗАЛЕЖНИЙ: для інструкцій без операнда S0 це
- * `END` (кінець задачі), для LD/ST це `S0BEXT`, для TEST — `PARTIAL`.
- * Не можна перевіряти його наосліп для всіх опкодів.
+ * ⚠ Bit 18 of word1 is CONTEXT-DEPENDENT: `END` (end task) for instructions
+ * without S0 operand, `S0BEXT` for LD/ST, and `PARTIAL` for TEST. Do not test
+ * it blindly for every opcode.
  */
 #define USE_INST_SIZE               8
 
@@ -445,7 +440,7 @@
 #define USE1_OP_ST                  30
 #define USE1_OP_SPECIAL             31
 
-/* Розширений предикат (біти 26:24) — `sgxdefs.h:5166..5176`. */
+/* Extended predicate (bits 26:24), `sgxdefs.h:5166..5176`. */
 #define USE1_EPRED_SHIFT            24
 #define USE1_EPRED_MASK             0x7
 #define USE1_EPRED_ALWAYS           0
@@ -458,10 +453,10 @@
 #define USE1_EPRED_PNMOD4           7
 
 /*
- * Короткий предикат (біти 26:25) — `sgxdefs.h:5184..5190`. Цілочисельні
- * інструкції (IMAE і решта групи INT) несуть предикат ТУТ, а не в полі
- * EPRED: у них біт 27 зайнято номером опкоду, а 26:25 лишилися предикату.
- * Сплутати простір легко, тому поля названо окремо.
+ * Short predicate (bits 26:25), `sgxdefs.h:5184..5190`. Integer instructions
+ * (IMAE and the rest of the INT group) carry their predicate HERE, not in
+ * EPRED: bit 27 holds the opcode, leaving 26:25 for the predicate. Keep the
+ * fields separate to avoid confusing these encodings.
  */
 #define USE1_SPRED_SHIFT            25
 #define USE1_SPRED_MASK             0x3
@@ -470,14 +465,14 @@
 #define USE1_SPRED_P1               2
 #define USE1_SPRED_NOTP0            3
 
-/* Прапорці word1 — `sgxdefs.h:5198..5206`. */
+/* word1 flags, `sgxdefs.h:5198..5206`. */
 #define USE1_END                    0x00040000U
 #define USE1_S0BEXT                 0x00040000U
 #define USE1_S1BEXT                 0x00020000U
 #define USE1_S2BEXT                 0x00010000U
 #define USE1_DBEXT                  0x00080000U
 
-/* Поля регістрів — `sgxdefs.h:5225..5305`. */
+/* Register fields, `sgxdefs.h:5225..5305`. */
 #define USE1_S0BANK_SHIFT           2
 #define USE1_S0BANK_MASK            0x1
 #define USE1_D1BANK_SHIFT           0
@@ -491,7 +486,7 @@
 #define USE0_SRC2_SHIFT             0
 #define USE0_REG_MASK               0x7F
 
-/* Банки. Std — коли відповідний *BEXT знято, Ext — коли виставлено. */
+/* Banks: Std when the corresponding *BEXT is clear; Ext when set. */
 #define USE_S0STDBANK_TEMP          0
 #define USE_S0STDBANK_PRIMATTR      1
 #define USE_S0EXTBANK_OUTPUT        0
@@ -510,13 +505,13 @@
 #define USE_D1EXTBANK_SECATTR       0
 
 /*
- * Індексована адресація. Приймач `mov` у банку `D1EXTBANK_INDEX`
- * (`sgxdefs.h:5260`) несе в полі номера не номер регістра, а МАСКУ: еталонний
- * асемблер приймає лише 1, 2, 3 і відкидає решту з «Invalid index mask»
- * (`useasm.c:1920..1927`). Індексований операнд (`S12EXTBANK_INDEXED` як
- * джерело, `D1STDBANK_INDEXED` як приймач) тримає в полі номера трійку
- * {банк, вибір регістра, зсув}: біти 6:5 — банк, біт 4 — IDXSEL, біти 3:0 —
- * зсув (`sgxdefs.h:7719..7733`, складання — `useasm.c:1023..1060`).
+ * Indexed addressing. A `mov` destination in `D1EXTBANK_INDEX`
+ * (`sgxdefs.h:5260`) stores a MASK, not a register number, in the index field:
+ * the reference assembler accepts only 1, 2, 3 and rejects other values with
+ * "Invalid index mask" (`useasm.c:1920..1927`). An indexed operand
+ * (`S12EXTBANK_INDEXED` source, `D1STDBANK_INDEXED` destination) encodes
+ * {bank, register selection, offset}: bits 6:5 bank, bit 4 IDXSEL, bits 3:0
+ * offset (`sgxdefs.h:7719..7733`; assembled in `useasm.c:1023..1060`).
  */
 #define USE_D1STDBANK_INDEXED       3
 #define USE_D1EXTBANK_INDEX         2
@@ -532,7 +527,7 @@
 #define USE_INDEX_MASK_H            2
 #define USE_INDEX_BANK_SIZE         2
 
-/* SPECIAL: категорія (біти 21:20) — `sgxdefs.h:6453..6459`. */
+/* SPECIAL: category (bits 21:20) — `sgxdefs.h:6453..6459`. */
 #define USE1_SPECIAL_OPCAT_SHIFT    20
 #define USE1_SPECIAL_OPCAT_MASK     0x3
 #define USE1_SPECIAL_OPCAT_FLOWCTRL 0
@@ -540,7 +535,7 @@
 #define USE1_SPECIAL_OPCAT_OTHER    2
 #define USE1_SPECIAL_OPCAT_VISTEST  3
 
-/* FLOWCTRL: підопкод (біти 8:6) — `sgxdefs.h:6496..6507`. */
+/* FLOWCTRL: sub-opcode (bits 8:6) — `sgxdefs.h:6496..6507`. */
 #define USE1_FLOWCTRL_OP2_SHIFT     6
 #define USE1_FLOWCTRL_OP2_MASK      0x7
 #define USE1_FLOWCTRL_OP2_BA        0
@@ -551,19 +546,19 @@
 #define USE1_FLOWCTRL_OP2_NOP       5
 
 /*
- * `SETL` і `SAVL` — це `mov pclink, src1` і `mov dst, pclink`
- * (`useasm.c:14077..14120`): окремої інструкції «запиши регістр зв'язку» в
- * асемблері немає, є спеціальна форма `mov`. Джерело SETL читається як SRC1,
- * приймач SAVL — звичайним полем призначення.
+ * `SETL` and `SAVL` encode `mov pclink, src1` and `mov dst, pclink`
+ * (`useasm.c:14077..14120`): the assembler has no separate instruction to
+ * write the link register; it uses a special `mov` form. SETL reads SRC1,
+ * while SAVL uses the normal destination field.
  *
- * ⚠ Регістр зв'язку тримає НОМЕР ІНСТРУКЦІЇ відносно вікна коду, а не адресу:
- * host-kick обробники мікроядро віддає хостові саме так —
- * `ui32ServiceAddress = <зсув мітки> / EURASIA_USE_INSTRUCTION_SIZE`
- * (`srvinit/devices/sgx/sgxinit.c:690..692`), і це значення потрапляє в
- * `pclink` без жодного перетворення. Той самий простір, що й у цілі `ba`.
+ * ⚠ The link register holds an instruction number relative to the code
+ * window, not an address. The microkernel returns host-kick handlers to the
+ * host as `ui32ServiceAddress = <label offset> / EURASIA_USE_INSTRUCTION_SIZE`
+ * (`srvinit/devices/sgx/sgxinit.c:690..692`); this value enters `pclink`
+ * unchanged. It uses the same address space as the `ba` target.
  */
 
-/* Гілка: `sgxdefs.h:6518..6521`. Зсув у word0 — НОМЕР ПАРИ, крок 8 Б. */
+/* Branch: `sgxdefs.h:6518..6521`. The word0 offset is a PAIR number, step 8 B. */
 #define USE1_BRANCH_SAVELINK        0x00000200U
 #define USE0_BRANCH_OFFSET_MASK     0x00000FFFU
 #define USE1_FLOWCTRL_NOSCHED       0x00000800U
@@ -578,7 +573,7 @@
                                      USE1_FLOWCTRL_EXCEPTION | \
                                      USE1_FLOWCTRL_SYNCEND)
 
-/* OTHER: підопкод (біти 26:24) — `sgxdefs.h:6656..6666`. */
+/* OTHER: sub-opcode (bits 26:24) — `sgxdefs.h:6656..6666`. */
 #define USE1_OTHER_OP2_SHIFT        24
 #define USE1_OTHER_OP2_MASK         0x7
 #define USE1_OTHER_OP2_IDF          0
@@ -589,14 +584,15 @@
 #define USE1_OTHER_OP2_LDRSTR       6
 #define USE1_OTHER_OP2_WOP          7
 
-/* MOECTRL: підопкод (біти 26:24) — `sgxdefs.h:6553..6560`. */
+/* MOECTRL: sub-opcode (bits 26:24) — `sgxdefs.h:6553..6560`. */
 #define USE1_MOECTRL_OP2_SHIFT      24
 #define USE1_MOECTRL_OP2_MASK       0x7
 #define USE1_MOECTRL_OP2_SMLSI      2
 
 /*
- * LIMM — `sgxdefs.h:7435..7447`. 32-бітна константа розрізана на три шматки:
- * біти 20:0 у word0, біти 25:21 у word1[8:4], біти 31:26 у word1[17:12].
+ * LIMM — `sgxdefs.h:7435..7447`. The 32-bit constant is split into three
+ * parts: bits 20:0 in word0, bits 25:21 in word1[8:4], and bits 31:26 in
+ * word1[17:12].
  */
 #define USE0_LIMM_IMML21_MASK       0x001FFFFFU
 #define USE1_LIMM_IMM2521_SHIFT     4
@@ -605,18 +601,18 @@
 #define USE1_LIMM_IMM3126_MASK      0x3F
 
 /*
- * Предикат LIMM живе у власному полі (біти 11:9, `sgxdefs.h:7443..7444`), а
- * набір значень у нього той самий, що й у звичайного EPRED: еталонний
- * асемблер кладе туда результат того самого `EncodePredicate(..., FALSE)`
+ * The LIMM predicate has its own field (bits 11:9, `sgxdefs.h:7443..7444`),
+ * with the same values as regular EPRED: the reference assembler puts the
+ * result of the same `EncodePredicate(..., FALSE)` there
  * (`useasm.c:14012`, `useasm.c:2664..2671`).
  */
 #define USE1_LIMM_EPRED_SHIFT       9
 #define USE1_LIMM_EPRED_MASK        0x7
 
 /*
- * LDRSTR (`str`/`ldr`) — `sgxdefs.h:7461..7475`. Номер спецрегістра склеєний
- * із двох полів: SRC2 (біти 6:0) і SRC2EXT (біти 20:14), зсунутого на 7.
- * За T6 (docs/sgx/23) номер × 4 = байтовий зсув регістра SGX.
+ * LDRSTR (`str`/`ldr`) — `sgxdefs.h:7461..7475`. The special-register number
+ * combines SRC2 (bits 6:0) and SRC2EXT (bits 20:14), shifted by 7. Per T6,
+ * number × 4 is the byte offset of the SGX register.
  */
 #define USE1_LDRSTR_DSEL_STORE      0x00080000U
 #define USE0_LDRSTR_SRC2EXT_SHIFT   14
@@ -641,24 +637,24 @@
 #define USE1_LDST_IMODE_RESERVED    3
 
 /*
- * Банк приймача LD — окремий однобітовий прапорець, а не поле D1BANK
- * (`sgxdefs.h:6397..6399`). Асемблер прямо забороняє будь-який інший банк:
+ * The LD destination bank is a separate one-bit flag, not the D1BANK field
+ * (`sgxdefs.h:6397..6399`). The assembler explicitly forbids any other bank:
  * «The destination for an LD must be the primary attribute bank or the
  * temporary bank» (`useasm.c:12266`).
  */
 #define USE1_LDST_DBANK_PRIMATTR    0x00000080U
 
 /*
- * ⚠ `MOEEXPAND` — ІНВЕРСНИЙ прапорець режиму вибірки (`sgxdefs.h:6376`).
- * Еталонний декодер: `if (!(uInst1 & MOEEXPAND)) FETCHENABLE`
- * (`usedisasm.c:2286..2288`). Тобто:
+ * ⚠ `MOEEXPAND` is an INVERTED fetch-mode flag (`sgxdefs.h:6376`).
+ * Reference decoder: `if (!(uInst1 & MOEEXPAND)) FETCHENABLE`
+ * (`usedisasm.c:2286..2288`). Thus:
  *
- *   MOEEXPAND = 1 → звичайний доступ, повтори розгортає MOE;
- *   MOEEXPAND = 0 → режим ВИБІРКИ (`.fetchN`): N поспіль двослів у N поспіль
- *                   регістрів приймача, MOE в цьому не бере участі.
+ *   MOEEXPAND = 1 → normal access; MOE expands repeats;
+ *   MOEEXPAND = 0 → FETCH mode (`.fetchN`): N consecutive doublewords into N
+ *                   consecutive destination registers; MOE is not involved.
  *
- * Лічильник в обох режимах той самий — `RMSKCNT`, і його значення на одиницю
- * менше за N (`useasm.c:12176`: `(uRptCount - 1) << RMSKCNT_SHIFT`;
+ * Both modes use the same counter, `RMSKCNT`, whose value is one less than N
+ * (`useasm.c:12176`: `(uRptCount - 1) << RMSKCNT_SHIFT`;
  * `usedisasm.c:2306`: `uMaskCount + 1`).
  */
 #define USE1_LDST_MOEEXPAND         0x00200000U
@@ -666,23 +662,23 @@
 #define USE1_RMSKCNT_MASK           0xF
 
 /*
- * `.fcfill` = force cache line fill (`sgxdefs.h:6413`) — підказка кешу даних.
- * Кеша в моделі немає, тому вимога виконується тривіально, а не «пропущена».
+ * `.fcfill` = force cache line fill (`sgxdefs.h:6413`), a data-cache hint.
+ * The model has no cache, so this requirement is trivially satisfied.
  */
 #define USE1_LDST_FCLFILL           0x00000002U
 #define USE1_LDST_RANGEENABLE       0x00000040U
 #define USE1_LDST_INCSGN            0x00000008U
 
 /*
- * IMAE — цілочисельне множення з додаванням, `sgxdefs.h:5155, 6021..6055`.
- * Семантика — з коментаря самого компілятора IMG (`usc2/finalise.c:3137`):
+ * IMAE is integer multiply-add, `sgxdefs.h:5155, 6021..6055`.
+ * Its semantics come from the IMG compiler comment (`usc2/finalise.c:3137`):
  *
  *   IMAE  DST, SRC0, #SRC1, SRC2   //  DST = SRC0 * SRC1 + SRC2
  *
- * Множники — ПІВСЛОВА (16 біт), і яке саме півслово, обирають прапорці
- * SRC0H/SRC1H; додаток SRC2 має власний тип (16 із нулями, 16 зі знаком або
- * повні 32 біти). Псевдоінструкція `iaddu32 d, a, b` — це той самий IMAE з
- * SRC1 = #1 (`useasm.c:6217..6252`), тому окремо її реалізовувати не треба.
+ * The multipliers are HALFWORDS (16 bits); SRC0H/SRC1H select which half.
+ * SRC2 has its own type (16-bit zero-extended, 16-bit sign-extended, or full
+ * 32-bit). The `iaddu32 d, a, b` pseudo-instruction is the same IMAE with
+ * SRC1 = #1 (`useasm.c:6217..6252`), so it needs no separate implementation.
  */
 #define USE1_IMAE_SRC0H_SELECTHIGH  0x01000000U
 #define USE1_IMAE_SRC1H_SELECTHIGH  0x00200000U
@@ -699,7 +695,7 @@
 #define USE1_IMAE_ORSHIFT_SHIFT     3
 #define USE1_IMAE_ORSHIFT_MASK      0x7
 
-/* Лічильник повторів цілочисельної групи — `sgxdefs.h:5641..5643`. */
+/* Integer group repeat counter — `sgxdefs.h:5641..5643`. */
 #define USE1_INT_RCOUNT_SHIFT       12
 #define USE1_INT_RCOUNT_MASK        0x7
 
@@ -718,25 +714,25 @@
 #define USE1_TEST_STST_RESERVED     3
 
 /*
- * ⚠ У `TEST` ДВІ незалежні перевірки — нуля й знака, — і як їх поєднати,
- * каже окремий біт: `CRCOMB` виставлений = AND, знятий = OR
- * (`sgxdefs.h:5509`, `usedisasm.c:9385`). Значення `NONE` в обох полях —
- * це не «немає перевірки», а «перевірка завжди істинна»
+ * ⚠ `TEST` has TWO independent checks, for zero and sign; a separate bit
+ * selects how they combine: `CRCOMB` set = AND, clear = OR
+ * (`sgxdefs.h:5509`, `usedisasm.c:9385`). `NONE` in either field does not
+ * mean "no check"; it means "check always true"
  * (`usedisasm.c:9222..9232`: `STST_NONE -> SIGN_TRUE`,
- * `ZTST_NONE -> ZERO_TRUE`), тому з AND вона просто не заважає.
+ * `ZTST_NONE -> ZERO_TRUE`), so with AND it does not affect the result.
  *
- * `POSITIVE` означає «біт знака ЗНЯТО», а не «> 0», і це видно з самого
- * асемблера (`use.l:761..767`), де суфікси розкриваються дослівно:
+ * `POSITIVE` means "sign bit CLEAR", not "> 0". This is clear from the
+ * assembler itself (`use.l:761..767`), where the suffixes expand literally:
  *
- *   .tests  -> n&t    знак стоїть
- *   .testns -> p&t    знак знято          <- наш випадок
- *   .testp  -> p&nz   «додатне» = знак знято І не нуль
- *   .testn  -> n&nz   «від'ємне»
+ *   .tests  -> n&t    sign bit set
+ *   .testns -> p&t    sign bit clear      <- our case
+ *   .testp  -> p&nz   "positive" = sign bit clear AND nonzero
+ *   .testn  -> n&nz   "negative"
  *
- * Тобто якби `POSITIVE` уже означало «> 0», то `.testp` не мусив би окремо
- * додавати `nz`. Звідси ідіом мікроядра «перевірити біт N»:
- * `shl.testns p0, rX, #(31 - N)` — зсунути біт у знак і перевірити, що він
- * знятий.
+ * If `POSITIVE` already meant "> 0", `.testp` would not need to add `nz`.
+ * Hence the microkernel idiom for testing bit N:
+ * `shl.testns p0, rX, #(31 - N)` shifts the bit into the sign position and
+ * tests that it is clear.
  */
 #define USE1_TEST_CRCOMB_AND        0x00000080U
 #define USE1_TEST_PDST_SHIFT        2
@@ -760,9 +756,9 @@
 #define USE0_TEST_ALUOP_BW_ASR      7
 
 /*
- * Бітові операції — `sgxdefs.h:5603..5630`. Опкод задає ГРУПУ (ANDOR, XOR,
- * SHLROL, SHRASR), а однобітове поле OP2 (біт 3) вибирає всередині неї.
- * SRC2INV інвертує друге джерело, SRC2ROT крутить його перед операцією.
+ * Bitwise operations — `sgxdefs.h:5603..5630`. The opcode selects a GROUP
+ * (ANDOR, XOR, SHLROL, SHRASR); one-bit OP2 (bit 3) selects within it.
+ * SRC2INV inverts the second source; SRC2ROT rotates it before the operation.
  */
 #define USE1_BITWISE_OP2_SHIFT      3
 #define USE1_BITWISE_OP2_MASK       0x1
@@ -772,16 +768,16 @@
 #define USE1_BITWISE_PARTIAL        0x00000004U
 
 /*
- * ⚠ Безпосередній операнд бітових операцій — НЕ 7-бітний `SRC2`, а 16-бітний,
- * склеєний із трьох полів (`sgxdefs.h:5611..5636`):
+ * ⚠ The bitwise operation immediate is NOT the 7-bit `SRC2`; it is 16 bits,
+ * assembled from three fields (`sgxdefs.h:5611..5636`):
  *
- *   біти  6:0  — `SRC2`               (word0 6:0)
- *   біти 13:7  — `SRC2IEXTLPSEL`      (word0 20:14)
- *   біти 15:14 — `SRC2IEXTH`          (word1 5:4)
+ *   bits  6:0  — `SRC2`               (word0 6:0)
+ *   bits 13:7  — `SRC2IEXTLPSEL`      (word0 20:14)
+ *   bits 15:14 — `SRC2IEXTH`          (word1 5:4)
  *
- * Звідси й `EURASIA_USE_BITWISE_MAXIMUM_UNROTATED_IMMEDIATE = 0xFFFF`.
- * Прочитавши лише `SRC2`, модель бачила маски як нулі — і ланцюг перевірок
- * подій провалювався наскрізь, нічого не збігаючи.
+ * Hence `EURASIA_USE_BITWISE_MAXIMUM_UNROTATED_IMMEDIATE = 0xFFFF`.
+ * Reading only `SRC2` made the model see masks as zero, so the event-check
+ * chain never matched anything.
  */
 #define USE0_BITWISE_SRC2IEXTLPSEL_SHIFT 14
 #define USE0_BITWISE_SRC2IEXTLPSEL_MASK  0x7F
@@ -789,9 +785,9 @@
 #define USE1_BITWISE_SRC2IEXTH_MASK      0x3
 
 /*
- * MOVC — `sgxdefs.h:5375..5393`. Поле TSTDTYPE = UNCOND означає звичайний
- * `mov dst, src1` без умови; саме в такій формі мікроядро копіює вторинні
- * атрибути в тимчасові регістри.
+ * MOVC — `sgxdefs.h:5375..5393`. TSTDTYPE = UNCOND means a normal,
+ * unconditional `mov dst, src1`; the microkernel uses this form to copy
+ * secondary attributes into temporary registers.
  */
 #define USE1_MOVC_TSTDTYPE_SHIFT    8
 #define USE1_MOVC_TSTDTYPE_MASK     0x7
@@ -803,11 +799,11 @@
 #define USE1_EMIT_TARGET_PDS        2
 
 /*
- * Sideband 0 програми PDS — `sgxdefs.h:7298..7306`. Саме звідси модель бере
- * розмір сегмента даних запущеної програми, а не з припущення: поле
- * PDSDATASIZE (біти 27:23) рахується в одиницях по 16 Б. У нашому образі
- * `mov r0, #0x01800800` (мітка `IUKP1_PDSConstSizeSec`) дає
- * (0x01800800 >> 23) & 0x1F = 3, тобто 48 Б — рівно 3 «рядки» розбирача.
+ * PDS program sideband 0 — `sgxdefs.h:7298..7306`. The model gets the
+ * running program's data-segment size from this field, not an assumption:
+ * PDSDATASIZE (bits 27:23) is in 16-byte units. In our image,
+ * `mov r0, #0x01800800` (label `IUKP1_PDSConstSizeSec`) yields
+ * (0x01800800 >> 23) & 0x1F = 3, or 48 bytes: exactly 3 parser rows.
  */
 #define PDSSB0_PDSDATASIZE_SHIFT    23
 #define PDSSB0_PDSDATASIZE_MASK     0x1F
@@ -815,7 +811,7 @@
 #define PDSSB0_USEATTRSIZE_MASK     0xFF
 #define PDSSB0_SIZE_ALIGNSHIFT      4
 
-/* Кількість тимчасових регістрів USE, які тримає мікроядро (sgx_mkif.h:165). */
+/* Number of USE temporary registers held by the microkernel (sgx_mkif.h:165). */
 #define USE_NUM_TEMPS               32
 #define USE_NUM_PREDICATES          4
 

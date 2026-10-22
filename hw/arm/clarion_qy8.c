@@ -1,23 +1,23 @@
 /*
- * Clarion QY8XXX head unit (Nissan Leaf) — емуляція плати.
+ * Clarion QY8XXX head unit (Nissan Leaf) board emulation.
  *
- * SoC: Renesas R8A7778 (R-Car M1A), одноядерний Cortex-A9.
- * ОС:  Windows CE, XIP просто з флеш на CS0 (reset-вектор @PA 0).
+ * SoC: Renesas R8A7778 (R-Car M1A), single-core Cortex-A9.
+ * OS: Windows CE, XIP directly from flash on CS0 (reset vector @PA 0).
  *
- * Карта пам'яті знята з OEMAddressTable самого завантажувача
- * (nand_20260827.bin @0x11c2c), а не вгадана:
+ * Memory map extracted from the bootloader's OEMAddressTable
+ * (@0x11c2c), not guessed:
  *
- *   VA 80000000 -> PA 00000000  64 MB   флеш CS0 (той самий дамп)
+ *   VA 80000000 -> PA 00000000  64 MB   CS0 flash (same image)
  *   VA 84000000 -> PA 04000000   8 MB   CS1
  *   VA 84800000 -> PA 18000000   8 MB
  *   VA 85000000 -> PA 18800000   8 MB
  *   VA 85800000 -> PA f0000000   8 MB   L2C (PL310 @f0100000)
- *   VA 88000000 -> PA 08000000 128 MB   DDR (сюди вантажиться ядро)
- *   VA 90000000 -> PA 10000000 128 MB   DDR (тут виконується eboot)
- *   VA 9c000000 -> PA fc000000  64 MB   периферія
+ *   VA 88000000 -> PA 08000000 128 MB   DDR (kernel load address)
+ *   VA 90000000 -> PA 10000000 128 MB   DDR (eboot execution address)
+ *   VA 9c000000 -> PA fc000000  64 MB   peripherals
  *
- * Периферія — стандартні блоки Renesas; адреси збігаються з r8a7778.dtsi
- * і з константами, що лежать у коді eboot.
+ * Peripherals are standard Renesas blocks; addresses match r8a7778.dtsi
+ * and constants in the eboot code.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -73,28 +73,27 @@
 #include "exec/target_page.h"
 #include "qom/object.h"
 
-/* --- фізична карта плати --------------------------------------------- */
+/* --- board physical map ------------------------------------------------ */
 
 #define QY8_FLASH_BASE      0x00000000
 #define QY8_FLASH_SIZE      (64 * MiB)
 
 /*
- * Мікросхема CS0 — паралельна NOR, а не NAND (ім'я файлів дампа історичне).
- * Це видно з самого завантажувача: `NCG2K2_FlashRom` (флеш 0x1114c) читає
- * ID послідовністю AMD — `AA`@0xAAAA, `55`@0x5554, `90`@0xAAAA — і потім
- * слова за 0xA0000000/0xA0000002, а стирання (0x113d8) додає `80`,`AA`,`55`
- * і `30` за адресою сектора. Детектор (0x1127c) друкує
- * `ManuID/DevID` і зводить g_wSelectFlashType:
+ * The CS0 chip is parallel NOR, not NAND (the dump filename is historical).
+ * The bootloader confirms this: `NCG2K2_FlashRom` (flash 0x1114c) reads
+ * the ID with the AMD sequence `AA`@0xAAAA, `55`@0x5554, `90`@0xAAAA, then
+ * words at 0xA0000000/0xA0000002. Erase (0x113d8) adds `80`,`AA`,`55` and
+ * `30` at the sector address. The detector (0x1127c) prints `ManuID/DevID`
+ * and maps them to g_wSelectFlashType:
  *
- *   ManuID 0x89 або 0x1F + DevID 0x227E -> 0x30  "MICRON_PC28F512"
+ *   ManuID 0x89 or 0x1F + DevID 0x227E -> 0x30  "MICRON_PC28F512"
  *   ManuID 0x20          + DevID 0x227E -> 0x227E
  *   ManuID 0x01                          -> 0     "NORMAL"
  *
- * Береться перший варіант: 0x89/0x227E — це Micron PC28F512M29EW, 512 Мбіт
- * (рівно 64 МБ дампа), x16, однорідні сектори по 128 КБ, набір команд AMD.
- * Крок сектора збігається з тим, що робить сам монітор: `backupcr` іде по
- * блоках із кроком 0x20000 саме для типу 0x30 (0x11804..0x11828), і для
- * решти типів — 0x10000.
+ * Use the first variant: 0x89/0x227E identifies a Micron PC28F512M29EW,
+ * 512 Mbit (exactly 64 MB), x16, with uniform 128 KB sectors and AMD commands.
+ * The sector stride matches the monitor: `backupcr` walks blocks in steps of
+ * 0x20000 for type 0x30 (0x11804..0x11828), and 0x10000 for other types.
  */
 #define QY8_FLASH_SECTOR    (128 * KiB)
 #define QY8_FLASH_MANUF_ID  0x0089      /* Micron/Intel */
@@ -103,7 +102,7 @@
 #define QY8_CS1_BASE        0x04000000
 #define QY8_CS1_SIZE        (8 * MiB)
 
-#define QY8_DDR0_BASE       0x08000000      /* образ ядра, VA 0x88000000 */
+#define QY8_DDR0_BASE       0x08000000      /* kernel image, VA 0x88000000 */
 #define QY8_DDR0_SIZE       (128 * MiB)
 #define QY8_DDR1_BASE       0x10000000      /* eboot, VA 0x90000000      */
 #define QY8_DDR1_SIZE       (128 * MiB)
@@ -114,37 +113,37 @@
 #define QY8_SRAM1_SIZE      (8 * MiB)
 
 /*
- * Головне вікно DDR.
+ * Main DDR window.
  *
- * reset-stage @PA 0x17e0 пише в DBCONF0 (DBSC3 + 0x24; ім'я взято з таблиці
- * монітора самого eboot, флеш 0x24088) значення 0x0f030a02. OAL @0x88011ef0
- * читає той самий регістр і за полем [28:24] обирає гілку: 0x0d -> 256 МБ,
- * 0x0e -> 512 МБ, інакше -> 1024 МБ. Решта полів (rows 15, banks 8, cols 10,
- * шина 32 біт) дає рівно 1 ГіБ, тож гілка 1024 узгоджена сама з собою.
+ * Reset stage @PA 0x17e0 writes 0x0f030a02 to DBCONF0 (DBSC3 + 0x24; name
+ * taken from the eboot monitor table at flash 0x24088). OAL @0x88011ef0 reads
+ * the same register and selects a branch from field [28:24]: 0x0d -> 256 MB,
+ * 0x0e -> 512 MB, otherwise -> 1024 MB. The remaining fields (15 rows, 8
+ * banks, 10 columns, 32-bit bus) yield exactly 1 GiB, consistent with 1024.
  *
- * У контролера є лише один DBCONF0 і один DBRNK0 -> одна безперервна область.
- * Три вікна, які OAL роздає як extension DRAM у гілці 1024 (0x44000000 +64 МБ,
- * 0x58000000 +128 МБ, 0x60000000 +480 МБ), разом займають [0x44000000,
- * 0x7e000000); єдине природно вирівняне вікно на 1 ГіБ, що їх вміщує,
- * починається з 0x40000000. Самотест завантажувача (DIPSW=4, CTP_DramBank)
- * незалежно перевіряє 0x40000000 і 0x58000000 як банки DRAM.
+ * The controller has one DBCONF0 and one DBRNK0, hence one contiguous region.
+ * The three extension DRAM windows from the OAL's 1024 branch (0x44000000
+ * +64 MB, 0x58000000 +128 MB, 0x60000000 +480 MB) cover [0x44000000,
+ * 0x7e000000). The only naturally aligned 1 GiB window containing them
+ * starts at 0x40000000. The bootloader self-test (DIPSW=4, CTP_DramBank)
+ * independently tests 0x40000000 and 0x58000000 as DRAM banks.
  *
- * ⚠️ Це ще не остаточна модель плати. qy8.ddr0 (PA 0x08000000) і qy8.ddr1
- * (PA 0x10000000) лишаються тут окремою пам'яттю, хоча на залізі вони,
- * найпевніше, alias цієї ж DDR: діра 0x48000000..0x58000000 розміром рівно
- * 256 МБ виключена з обох гілок і точно дорівнює тим 256 МБ, які
- * OEMAddressTable ядра відображає низько. Але цей зв'язок лише виведено, а
- * не доведено, тож поки що гість бачить більше пам'яті, ніж є на платі.
+ * ⚠️ This is not yet a final board model. qy8.ddr0 (PA 0x08000000) and
+ * qy8.ddr1 (PA 0x10000000) remain separate memory regions, although on
+ * hardware they are likely aliases of this DDR: the 256 MB hole at
+ * 0x48000000..0x58000000 is excluded from both branches and exactly matches
+ * the 256 MB mapped low by the kernel OEMAddressTable. This link is inferred,
+ * not proven, so for now the guest sees more memory than the board has.
  */
 #define QY8_DDR_BASE        0x40000000
 #define QY8_DDR_SIZE        (1 * GiB)
-/* Перемикач для контрольного A/B: 0 — вікно не створюється взагалі. */
+/* A/B control: 0 disables creation of this window. */
 #define QY8_DDR_ENABLED     1
 
-/* eboot виконується звідси (VA 0x97C00000 -> PA 0x17C00000) */
+/* eboot executes here (VA 0x97C00000 -> PA 0x17C00000) */
 #define QY8_EBOOT_PA        0x17C00000
 
-/* GIC — як у r8a7778.dtsi; обидві бази присутні в коді eboot */
+/* GIC as in r8a7778.dtsi; both bases appear in eboot code */
 #define QY8_GIC_CPU_BASE    0xFE430000
 #define QY8_GIC_DIST_BASE   0xFE438000
 #define QY8_NUM_IRQ         256
@@ -153,51 +152,49 @@
 
 /*
  * Display Unit — display@fff80000 reg = <0xfff80000 0x40000> (r8a7779.dtsi).
- * Модель — hw/display/clarion_du.c. Дисплей програмує ЗАВАНТАЖУВАЧ: він
- * вмикає 800x480 на каналі 0 і лишає DOOR = 0. Регістрів площини він не
- * пише взагалі, тож вікно до M3b лишається чорним — це стан системи, а не
- * вада моделі (docs/20, розділ «M4»).
+ * Model: hw/display/clarion_du.c. The BOOTLOADER programs the display: it
+ * enables 800x480 on channel 0 and leaves DOOR = 0. It does not write any
+ * plane registers, so the display remains black until M3b; this is the system
+ * state, not a model defect.
  */
 #define QY8_DU_BASE         0xFFF80000
 /*
- * Лінія переривання DU — **GIC_SPI 31**, підтверджено 24.09.2026 (див.
- * docs/04-journal.md і docs/20-qemu-board.md, «Топологія переривань»):
- * OEMInterruptHandler має для GIC id 63 власний case, а таблиці OAL із
- * живого гостя дають g_oalIrq2SysIntr[63] = 37 — рівно той SYSINTR, який
- * бере ddi_ncg.dll. Раніше здавалося, що OAL на SPI 31 не реагує: насправді
- * обробник доходив до демукса INTC2 (0xFE782048) і вмирав там, бо моделі
- * цього слова не було.
+ * DU interrupt line is **GIC_SPI 31**, confirmed 2026-09-24: the
+ * OEMInterruptHandler has a dedicated case for GIC ID 63, and live guest OAL
+ * tables map g_oalIrq2SysIntr[63] = 37, the SYSINTR used by ddi_ncg.dll. The
+ * OAL appeared not to react to SPI 31 because the handler reached the INTC2
+ * demux at 0xFE782048 and stalled there; that register was not modeled.
  *
- * Номер лишається властивістю машини `du-spi` — зручно для дослідів.
+ * Keep the number as the machine property `du-spi` for experiments.
  */
-#define QY8_DU_SPI          31          /* підтверджено таблицями OAL */
+#define QY8_DU_SPI          31          /* confirmed by OAL tables */
 #define QY8_I2C4_SPI        77          /* GIC ID 109 = SPI 77 */
 #define QY8_GPIO4_SPI       103         /* GIC ID 135 = SPI 103 */
 #define QY8_SHCORE_SPI      54          /* GIC INTID 86 = SPI 54 */
 #define QY8_SHCORE_BASE     0xFE700000
 #define QY8_SHCORE_SHARED_BASE 0xFE790000
 
-#define QY8_SCIF_BASE       0xFFE40000      /* scif0..scif5, крок 0x1000 */
+#define QY8_SCIF_BASE       0xFFE40000      /* scif0..scif5, stride 0x1000 */
 #define QY8_SCIF_STRIDE     0x1000
 #define QY8_NUM_SCIF        6
 
 /*
- * Консоль завантажувача — SCIF3 (0xFFE43000), а не SCIF0. Це не здогад:
- * OEMInitDebugSerial @VA 0x97c14758 будує базу двома інструкціями
- * (mov r3,#0x3000; sub r3,r3,#0x1c0000 -> 0xFFE43000) і кладе її в глобал
- * 0x97cc249c, з якого putchar @0x97c14784 бере base+0x10 (SCFSR.TDFE) і
- * base+0x0c (SCFTDR). Тому перший -serial (при -nographic це stdio)
- * чіпляємо саме до SCIF3, решту — до наступних за порядком.
+ * The bootloader console is SCIF3 (0xFFE43000), not SCIF0. This is confirmed
+ * by OEMInitDebugSerial @VA 0x97c14758, which builds the base with two
+ * instructions (mov r3,#0x3000; sub r3,r3,#0x1c0000 -> 0xFFE43000) and stores
+ * it in global 0x97cc249c. putchar @0x97c14784 reads base+0x10 (SCFSR.TDFE)
+ * and base+0x0c (SCFTDR). Therefore connect the first -serial (stdio with
+ * -nographic) to SCIF3 and subsequent ports in order.
  */
 #define QY8_SCIF_DEBUG      3
 
-/* SCIF4 — лінк до супутнього МК плати (docs/20, «M3b»), не консоль. */
+/* SCIF4 is the board companion MCU link, not the console. */
 #define QY8_SCIF_MICOM      4
 
 /*
- * SCIF1 — лінк до МК панелі дисплея (Display Micom), не консоль. Реєстр
- * гостя: Drivers\Launch\SCIF1 -> serial_scif.dll, Prefix 'SCI', Index 1,
- * тобто ім'я потоку `SCI1:`, яке відкриває CLcdDrv::SCIF_Init @0xEF71724C.
+ * SCIF1 is the Display Micom link, not the console. Guest registry entry
+ * Drivers\Launch\SCIF1 -> serial_scif.dll, Prefix 'SCI', Index 1 gives stream
+ * name `SCI1:`, opened by CLcdDrv::SCIF_Init @0xEF71724C.
  */
 #define QY8_SCIF_DISPMICOM  1
 
@@ -211,33 +208,33 @@ static int qy8_scif_chr_index(int scif)
 }
 
 /*
- * SDHI0/SDHI1 — два слоти SD (mmc@ffe4c000 / mmc@ffe4d000 у r8a7778.dtsi).
- * У реєстрі пристрою це Drivers\SD\Card (PortNumber 0, профіль SDProfile,
- * «Main Slot SD Card») і Drivers\SD\Card2 (PortNumber 1, SDProfile2,
- * «Sub Slot SD Card»). Обидва обслуговує SDHC.dll.
+ * SDHI0/SDHI1 are the two SD slots (mmc@ffe4c000 / mmc@ffe4d000 in
+ * r8a7778.dtsi). The device registry uses Drivers\SD\Card (PortNumber 0,
+ * profile SDProfile, "Main Slot SD Card") and Drivers\SD\Card2
+ * (PortNumber 1, SDProfile2, "Sub Slot SD Card"). Both use SDHC.dll.
  *
- * Переривання обов'язкове: свою гілку опитування (WaitEvent @0xefa318d8,
- * режим 1) драйвер запускає з нульовим таймаутом, тож вона завершується
- * помилкою одразу, і завершення команди він чекає лише від ISR.
+ * Interrupts are required: the driver starts its polling path (WaitEvent
+ * @0xefa318d8, mode 1) with a zero timeout, so it fails immediately and waits
+ * for command completion only through the ISR.
  */
 #define QY8_CAN_BASE        0xFFFD1000
 #define QY8_SDHI_BASE       0xFFE4C000
 #define QY8_SDHI_STRIDE     0x1000
 #define QY8_NUM_SDHI        2
-/* SD_BUF0 — порт даних; саме його читає DMAC (hpb_chan_module[21/22]) */
+/* SD_BUF0 is the data port read by DMAC (hpb_chan_module[21/22]). */
 #define QY8_SDHI_BUF0       0x30
 
 /*
- * Лінії GIC. OALIntrRequestIrqs (nk.exe @0x88012b34) дає логічний IRQ за
- * фізичною базою пристрою: 0xFFE4C000 -> 119 (@0x88012fc0),
- * 0xFFE4D000 -> 120 (@0x88012fe8). Логічний IRQ тут тотожний GIC ID, а
- * SPI n = ID n + 32, тобто SDHI0 = SPI 87, SDHI1 = SPI 88 — рівно те, що
- * стоїть у r8a7778.dtsi для mmc@ffe4c000 / mmc@ffe4d000. Далі OAL мапить
- * IRQ 119 -> SYSINTR 20 і IRQ 120 -> SYSINTR 23 (дамп g_oalIrq2SysIntr).
+ * GIC lines. OALIntrRequestIrqs (nk.exe @0x88012b34) assigns a logical IRQ
+ * by device physical base: 0xFFE4C000 -> 119 (@0x88012fc0), 0xFFE4D000 ->
+ * 120 (@0x88012fe8). Here the logical IRQ equals the GIC ID, and SPI n = ID
+ * n + 32, so SDHI0 = SPI 87 and SDHI1 = SPI 88, matching r8a7778.dtsi for
+ * mmc@ffe4c000 / mmc@ffe4d000. The OAL then maps IRQ 119 -> SYSINTR 20 and
+ * IRQ 120 -> SYSINTR 23 (g_oalIrq2SysIntr table).
  */
 #define QY8_SDHI_SPI0       87
 
-/* --- контролер плати на CS-шині @0x18800000 --------------------------- */
+/* --- board controller on CS bus @0x18800000 --------------------------- */
 
 #define QY8_BCTL_BASE       0x18800000
 #define QY8_BCTL_SIZE       0x40
@@ -245,7 +242,7 @@ static int qy8_scif_chr_index(int scif)
 #define BCTL_STATUS         0x00
 #define BCTL_DIPSW          0x02
 
-/* Біти статусу, які опитує завантажувач у циклі @0x1148 (див. нижче). */
+/* Status bits polled by the bootloader in loop @0x1148 (see below). */
 #define BCTL_ST_PWR         0x0080
 #define BCTL_ST_BOOT        0x0400
 
@@ -261,34 +258,34 @@ static int qy8_scif_chr_index(int scif)
 #define BCTL_ST_RV          0x1000      /* bit 12: 0 = in reverse */
 
 /*
- * Card-detect обох слотів SD живе в тому самому 16-бітному слові, що й DIPSW.
- * Знято з бітових аксесорів `GPIO.dll` (читання vtbl+0x1C0 @VA 0xEF6C3204,
- * запис vtbl+0x1C4 @0xEF6C3850; base = змаплений PA 0x18800000):
+ * Card-detect for both SD slots shares the 16-bit word with DIPSW.
+ * Derived from `GPIO.dll` bit accessors (read vtbl+0x1C0 @VA 0xEF6C3204,
+ * write vtbl+0x1C4 @0xEF6C3850; base = mapped PA 0x18800000):
  *
- *   IOCTL 0x800A2174 -> ldrh [base+0x02] >> 5 & 1   card-detect слота 0
- *   IOCTL 0x800A20EC -> ldrh [base+0x02] >> 6 & 1   card-detect слота 1
+ *   IOCTL 0x800A2174 -> ldrh [base+0x02] >> 5 & 1   slot 0 card-detect
+ *   IOCTL 0x800A20EC -> ldrh [base+0x02] >> 6 & 1   slot 1 card-detect
  *
- * До них ходить `SDHC.dll`: `SD_Sense_Card` (@0xEFA2D888) читає біт через
- * `GPI1:`, а `CSDHCAccess::SDHC_CardCheck` (@0xEFA29ED4) віддає «картка є»
- * лише коли біт дорівнює НУЛЮ (@0xEFA2D904: `*out = (bit == 1) ? 2 : 1`,
- * @0xEFA29FDC: результат 1 лише при `*out == 1`). Тобто лінія активно-низька:
- * порожній слот із підтяжкою читається як 1. Збій IOCTL прошивка теж трактує
- * як «немає картки» — це її безпечний дефолт.
+ * `SDHC.dll` accesses these through `SD_Sense_Card` (@0xEFA2D888), which reads
+ * the bit via `GPI1:`, and `CSDHCAccess::SDHC_CardCheck` (@0xEFA29ED4), which
+ * reports "card present" only when the bit is ZERO (@0xEFA2D904:
+ * `*out = (bit == 1) ? 2 : 1`; @0xEFA29FDC: result 1 only when `*out == 1`).
+ * The line is active-low: an empty slot with pull-up reads as 1. The firmware
+ * also treats an IOCTL failure as "no card", its safe default.
  *
- * ⚠ Слово +0x02 суто вхідне: у записувальному аксесорі для нього немає жодної
- * гілки (усі 19 вихідних защіпок лежать у +0x04 і +0x00). Тому тут можна
- * накладати біти при читанні, не боячись затерти щось, що пише гість.
+ * ⚠ Word +0x02 is input-only: the write accessor has no branch for it (all
+ * 19 output latches are at +0x04 and +0x00). Bits can therefore be overlaid
+ * on reads without overwriting guest-written state.
  */
-#define BCTL_CD0            0x0020      /* біт 5: слот 0, 0 = картка є */
-#define BCTL_CD1            0x0040      /* біт 6: слот 1, 0 = картка є */
+#define BCTL_CD0            0x0020      /* bit 5: slot 0, 0 = card present */
+#define BCTL_CD1            0x0040      /* bit 6: slot 1, 0 = card present */
 
-/* Режими DIPSW — таблиця переходів eboot @VA 0x97c07e28 */
-#define QY8_DIPSW_NORM_RES  5           /* "NORM(RES)>>" — як із TEST_B1 */
+/* DIPSW modes from the eboot transition table @VA 0x97c07e28 */
+#define QY8_DIPSW_NORM_RES  5           /* "NORM(RES)>>", as in TEST_B1 */
 
-/* --- HSCIF0 (високошвидкісний SCIF) @0xFFE48000 ----------------------- */
+/* --- HSCIF0 (high-speed SCIF) @0xFFE48000 ------------------------------ */
 
 /*
- * Окремий блок, а не сьомий SCIF. У r8a7778.dtsi це власний вузол:
+ * Separate block, not a seventh SCIF. It has its own node in r8a7778.dtsi:
  *
  *     hscif0: serial@ffe48000 {
  *             compatible = "renesas,hscif-r8a7778",
@@ -297,75 +294,76 @@ static int qy8_scif_chr_index(int scif)
  *             interrupts = <GIC_SPI 118 IRQ_TYPE_LEVEL_HIGH>;
  *     };
  *
- * тобто база поза вікном SCIF0..SCIF5 (0xFFE40000..0xFFE45FFF), розмір 0x60
- * і власна лінія. Донедавна ці 96 байтів потрапляли у широкий qy8.periph
- * (prio −1000), який на читання віддає нулі.
+ * Its base is outside the SCIF0..SCIF5 window (0xFFE40000..0xFFE45FFF), it
+ * has size 0x60 and its own interrupt. Previously these 96 bytes fell into
+ * the broad qy8.periph region (prio -1000), which returns zero on reads.
  *
- * Навіщо це знадобилося. При ввімкненому вікні extension DDR ядро піднімає
- * ДРУГИЙ екземпляр serial_scif.dll із базою PA 0xFFE48000. Його
- * HWSetCommState @VA 0xefa48158 починає з очікування кінця передачі:
+ * Why this model is needed: when the extension DDR window is enabled, the
+ * kernel starts a SECOND serial_scif.dll instance at PA 0xFFE48000.
+ * HWSetCommState @VA 0xefa48158 begins by waiting for transmission to finish:
  *
  *     0xefa48190  ldr  r0, [r5, #0x10]   ; VA SCFSR
  *     0xefa48194  bl   READ_REGISTER_USHORT
  *     0xefa48198  uxth r3, r0
  *     0xefa4819c  tst  r3, #0x40         ; TEND
- *     0xefa481a0  bne  0xefa481a8        ; вихід — далі SetBaudRate тощо
- *     0xefa481a4  b    0xefa48190        ; інакше назад, без Sleep
+ *     0xefa481a0  bne  0xefa481a8        ; exit, then SetBaudRate, etc.
+ *     0xefa481a4  b    0xefa48190        ; otherwise loop, without Sleep
  *
- * Це spin без виходу з планувальника, а потік має пріоритет 50. Нуль від
- * qy8.periph означає TEND = 0 назавжди: 11 754 863 читання 0xFFE48010 за
- * 30 с, менеджер пристроїв голодує, ActivateDeviceEx("Drivers\BuiltIn") не
- * повертається (docs/04-journal.md, запис від 2026-09-23).
+ * This is a spin loop that never yields, and the thread has priority 50.
+ * Returning zero from qy8.periph leaves TEND = 0 forever: 11,754,863 reads
+ * of 0xFFE48010 in 30 seconds, starving the device manager and preventing
+ * ActivateDeviceEx("Drivers\BuiltIn") from returning.
  *
- * Регістрова мапа — SCIx_HSCIF_REGTYPE з drivers/tty/serial/sh-sci.c:
+ * Register map: SCIx_HSCIF_REGTYPE from drivers/tty/serial/sh-sci.c:
  * SCSMR 0x00/16, SCBRR 0x04/8, SCSCR 0x08/16, SCxTDR 0x0c/8, SCxSR 0x10/16,
  * SCxRDR 0x14/8, SCFCR 0x18/16, SCFDR 0x1c/16, SCSPTR 0x20/16, SCLSR 0x24/16,
  * SCDL 0x30/16, SCCKS 0x34/16, HSSRR 0x40/16, HSRTRGR 0x54/16, HSTTRGR 0x58/16;
- * там же fifosize = 128 (у SCIF — 16).
+ * It also sets fifosize = 128 (16 for SCIF).
  *
- * ⚠ TEND і TDFE тут НЕ сталі: вони рахуються з наповненості передавального
- * FIFO. Після скидання FIFO порожній, тож TEND = 1 одразу — саме цього
- * драйверові й бракувало. Але щойно гість покладе байти у SCFTDR, TEND
- * зійде, доки модель їх не віддасть. Так зупинка на TEND лишається
- * спостережуваною, а не замаскованою константою 0x40.
+ * ⚠ TEND and TDFE are NOT constant here; they reflect transmit FIFO
+ * occupancy. After reset the FIFO is empty, so TEND = 1 immediately, as the
+ * driver requires. When the guest writes to SCFTDR, TEND clears until the
+ * model drains the bytes. Thus a TEND stall remains observable instead of
+ * being hidden by a constant 0x40.
  *
- * Виміряно на живому буті (увесь бут — 55 звернень замість 11 754 864):
+ * Measured during a live boot (55 accesses for the entire boot, down from
+ * 11,754,864):
  *
- *     r 0x20                 ; SCSPTR — одноразовий зонд, як і раніше
- *     r 0x10                 ; SCFSR: TEND = 1 -> spin виходить з ПЕРШОГО читання
- *     w 0x08 = 0             ; SCSCR: вимкнути TE/RE
+ *     r 0x20                 ; SCSPTR - one-time probe, as before
+ *     r 0x10                 ; SCFSR: TEND = 1 -> loop exits on FIRST read
+ *     w 0x08 = 0             ; SCSCR: disable TE/RE
  *     w 0x18 = 0x6           ; SCFCR: RFRST|TFRST
- *     r/w 0x10 = 0           ; погасити прапорці
- *     r/w 0x24 = 0           ; SCLSR: погасити ORER
- *     w 0x40 = 0x800f        ; HSSRR = SRE | SRCYC — суто HSCIF-ний регістр
+ *     r/w 0x10 = 0           ; clear flags
+ *     r/w 0x24 = 0           ; SCLSR: clear ORER
+ *     w 0x40 = 0x800f        ; HSSRR = SRE | SRCYC, HSCIF-only register
  *     w 0x34 = 0             ; SCCKS
- *     w 0x30 = 0x30          ; SCDL — подільник
- *     w 0x50 = 0x64          ; поза мапою sh-sci.c (див. нижче)
- *     w 0x54 = 0x40          ; HSRTRGR = 64 — рівно sci_port rx_trigger HSCIF
- *     w 0x58 = 0             ; HSTTRGR = 0 — рівень передавача
- *     w 0x08 = 0x2e, 0x3e    ; TE|RE|REIE|CKE1; ні RIE, ні TIE
- *     w 0x0c ×6              ; 10 02 23 10 03 30 — один кадр у лінію
+ *     w 0x30 = 0x30          ; SCDL divider
+ *     w 0x50 = 0x64          ; outside sh-sci.c map (see below)
+ *     w 0x54 = 0x40          ; HSRTRGR = 64, the HSCIF sci_port rx_trigger
+ *     w 0x58 = 0             ; HSTTRGR = 0, transmitter threshold
+ *     w 0x08 = 0x2e, 0x3e    ; TE|RE|REIE|CKE1; neither RIE nor TIE
+ *     w 0x0c ×6              ; 10 02 23 10 03 30, one frame on the link
  *
- * Звідси три речі, які модель НЕ вгадує, а бере з цього заміру:
- *  - HSSRR @0x40 із SRE — підтверджує, що це справді HSCIF, а не сьомий SCIF;
- *  - HSTTRGR = 0, тобто TDFE = «FIFO передавача порожній» — саме так його й
- *    рахує qy8_hscif_tdfe();
- *  - гість НЕ вмикає ні RIE, ні TIE, тож відсутність переривання передавача
- *    тут нічого не ламає.
+ * Three model details come from this measurement rather than guesswork:
+ *  - HSSRR @0x40 with SRE confirms this is HSCIF, not a seventh SCIF;
+ *  - HSTTRGR = 0, so TDFE means "transmit FIFO empty", as computed by
+ *    qy8_hscif_tdfe();
+ *  - the guest enables neither RIE nor TIE, so no transmitter interrupt is
+ *    needed here.
  *
- * ⚠ offset 0x50 (значення 0x64 = 100) у мапі sh-sci.c немає; гість пише його
- * один раз і ніколи не читає. Тому він свідомо лишається НЕзмодельованим і
- * падає в LOG_UNIMP під іменем qy8.hscif0 — вигадувати йому семантику не
- * було б на чому. Якщо колись знадобиться — це єдине місце, куди дивитися.
+ * ⚠ Offset 0x50 (value 0x64 = 100) is absent from the sh-sci.c map; the guest
+ * writes it once and never reads it. It is deliberately left UNMODELED and
+ * reported via LOG_UNIMP as qy8.hscif0. There is no evidence for inventing
+ * semantics. If needed later, this is the place to investigate.
  *
- * Чого тут НЕМАЄ і чому:
- *  - каналу DMA: HPB-DMAC обслуговує SCIF4 (лінк до micom); жодного доказу,
- *    що цей порт озброює DMA, немає, а вигадувати slave-id не можна;
- *  - переривання передавача: як і в моделі SCIF, лінію піднімає тільки
- *    приймач і тільки при RIE (див. застереження про шторм вище);
- *  - будь-яких ненульових reset-значень: усі регістри-сховища стартують з 0,
- *    а все, що поза мапою, іде в LOG_UNIMP під власним іменем — щоб
- *    наступний блокер було видно поіменно, а не серед шуму qy8.periph.
+ * Deliberate omissions:
+ *  - DMA channel: HPB-DMAC serves SCIF4 (the micom link); there is no evidence
+ *    that this port enables DMA, and a slave ID must not be invented;
+ *  - transmitter interrupt: as in the SCIF model, only the receiver raises
+ *    the line, and only with RIE enabled;
+ *  - nonzero reset values: all register storage starts at 0. Unmapped
+ *    accesses go to LOG_UNIMP under their own name so the next blocker is
+ *    identifiable instead of hidden in qy8.periph noise.
  */
 
 #define QY8_HSCIF_BASE      0xFFE48000
@@ -388,7 +386,7 @@ static int qy8_scif_chr_index(int scif)
 #define HSCIF_HSRTRGR   0x54
 #define HSCIF_HSTTRGR   0x58
 
-/* SCFCR: скидання FIFO передавача/приймача (та сама мапа, що в SCIF) */
+/* SCFCR: reset TX/RX FIFOs (same map as SCIF) */
 #define SCFCR_TFRST     0x0004
 #define HSCIF_SCFCR_RFRST 0x0002
 #define HSCIF_SCSCR_RIE   0x0040
@@ -401,11 +399,11 @@ static int qy8_scif_chr_index(int scif)
 #define QY8_HSCIF_FIFO  128             /* sh-sci.c: fifosize = 128 */
 
 /*
- * Скільки віртуального часу «летить» один байт. Швидкість вивести нізвідки:
- * гість програмує подільник уже після цього очікування, а SCBRR при
- * такій самій послідовності на SCIF отримує 0. Тому, як і з
- * QY8_SCIF_IDLE_NS, береться стала: важлива не її точність, а те, що
- * передавач має ненульовий час зайнятості й TEND випливає зі стану.
+ * Virtual transmission time per byte. Baud rate cannot be derived: the guest
+ * programs the divider after this wait, and SCBRR is 0 for the same sequence
+ * on SCIF. As with QY8_SCIF_IDLE_NS, use a fixed value. Its precision is less
+ * important than ensuring the transmitter stays busy for nonzero time and
+ * TEND follows the device state.
  */
 #define QY8_HSCIF_TX_NS     10000
 
@@ -413,23 +411,23 @@ typedef struct Qy8Hscif {
     MemoryRegion mr;
     CharFrontend chr;
     qemu_irq irq;
-    QEMUTimer *tx;              /* злив передавального FIFO */
-    QEMUTimer *idle;            /* пауза в лінії -> DR, як у SCIF */
+    QEMUTimer *tx;              /* drain transmit FIFO */
+    QEMUTimer *idle;            /* line idle -> DR, as in SCIF */
     uint16_t scsmr, scscr, scfcr, scsptr, scdl, sccks, hssrr;
     uint16_t hsrtrgr, hsttrgr, sclsr;
     uint8_t scbrr;
     uint8_t rx[QY8_HSCIF_FIFO];
     unsigned rx_len;
-    unsigned tx_len;            /* байти в передавальному FIFO */
+    unsigned tx_len;            /* bytes in transmit FIFO */
     bool dr;
 } Qy8Hscif;
 
-/* RTRG[7:6] у SCFCR; для HSCIF рівень може приходити і з HSRTRGR */
+/* RTRG[7:6] in SCFCR; HSCIF can also get the threshold from HSRTRGR */
 static unsigned qy8_hscif_rtrg(Qy8Hscif *h)
 {
     static const unsigned lvl[4] = { 1, 4, 8, 14 };
 
-    /* sh-sci.c бере рівень приймача з HSRTRGR, коли той запрограмований */
+    /* sh-sci.c uses HSRTRGR as the receive threshold when programmed */
     if (h->hsrtrgr) {
         return MIN(h->hsrtrgr, QY8_HSCIF_FIFO);
     }
@@ -441,17 +439,18 @@ static bool qy8_hscif_rdf(Qy8Hscif *h)
     return h->rx_len >= qy8_hscif_rtrg(h);
 }
 
-/* TEND — передавач порожній: ні у FIFO, ні «в дроті» нічого немає */
+/* TEND: transmitter empty, with nothing in the FIFO or "on the wire" */
 static bool qy8_hscif_tend(Qy8Hscif *h)
 {
     return h->tx_len == 0;
 }
 
 /*
- * TDFE — «у передавальному FIFO даних не більше за рівень запуску».
- * Рівень беремо з HSTTRGR; після скидання він 0, тобто TDFE = FIFO порожній.
- * Це строгіше за залізо (там рівень програмований), зате не вимагає
- * вигаданого reset-значення й ніколи не дозволить запис у повний FIFO.
+ * TDFE means "transmit FIFO occupancy is at or below the threshold".
+ * HSTTRGR supplies the threshold; after reset it is 0, so TDFE means the FIFO
+ * is empty. This is stricter than hardware, where the threshold is
+ * programmable, but requires no invented reset value and never permits a
+ * write to a full FIFO.
  */
 static bool qy8_hscif_tdfe(Qy8Hscif *h)
 {
@@ -460,7 +459,7 @@ static bool qy8_hscif_tdfe(Qy8Hscif *h)
 
 static void qy8_hscif_update_irq(Qy8Hscif *h)
 {
-    /* Тільки приймач і тільки при RIE — див. застереження в моделі SCIF. */
+    /* Receiver only, and only with RIE enabled; see the SCIF model note. */
     qemu_set_irq(h->irq, (qy8_hscif_rdf(h) || h->dr) && (h->scscr & HSCIF_SCSCR_RIE));
 }
 
@@ -518,7 +517,7 @@ static uint64_t qy8_hscif_read(void *opaque, hwaddr addr, unsigned size)
     case HSCIF_SCFCR:
         return h->scfcr;
     case HSCIF_SCFDR:
-        /* старший байт — заповненість FIFO передавача, молодший — приймача */
+        /* High byte: TX FIFO occupancy; low byte: RX FIFO occupancy. */
         return ((h->tx_len & 0xff) << 8) | (h->rx_len & 0xff);
     case HSCIF_SCSPTR:
         return h->scsptr;
@@ -535,8 +534,8 @@ static uint64_t qy8_hscif_read(void *opaque, hwaddr addr, unsigned size)
     case HSCIF_HSTTRGR:
         return h->hsttrgr;
     default:
-        qemu_log_mask(LOG_UNIMP, "qy8.hscif0: читання поза мапою %#" HWADDR_PRIx
-                      " (%u Б)\n", addr, size);
+        qemu_log_mask(LOG_UNIMP, "qy8.hscif0: read outside map at %#" HWADDR_PRIx
+                      " (%u bytes)\n", addr, size);
         return 0;
     }
 }
@@ -568,8 +567,8 @@ static void qy8_hscif_write(void *opaque, hwaddr addr, uint64_t val,
             h->tx_len++;
         }
         /*
-         * Вивід синхронний — як у моделі SCIF; у FIFO лишається тільки
-         * лічильник зайнятості, з якого й випливають TEND/TDFE.
+         * Output is synchronous, as in the SCIF model; only the occupancy
+         * counter remains in the FIFO and determines TEND/TDFE.
          */
         qemu_chr_fe_write_all(&h->chr, &ch, 1);
         break;
@@ -586,14 +585,14 @@ static void qy8_hscif_write(void *opaque, hwaddr addr, uint64_t val,
         qy8_hscif_update_irq(h);
         break;
     case HSCIF_SCFSR:
-        /* прапорці гасяться записом нуля у відповідний біт */
+        /* Clear flags by writing zero to the corresponding bit. */
         if (!(val & HSCIF_SCFSR_DR)) {
             h->dr = false;
         }
         qy8_hscif_update_irq(h);
         break;
     case HSCIF_SCLSR:
-        h->sclsr &= val;        /* ORER гаситься записом нуля */
+        h->sclsr &= val;        /* ORER is cleared by writing zero. */
         break;
     case HSCIF_SCSPTR:
         h->scsptr = val;
@@ -615,8 +614,8 @@ static void qy8_hscif_write(void *opaque, hwaddr addr, uint64_t val,
         h->hsttrgr = val;
         break;
     default:
-        qemu_log_mask(LOG_UNIMP, "qy8.hscif0: запис поза мапою %#" HWADDR_PRIx
-                      " = %#" PRIx64 " (%u Б)\n", addr, val, size);
+        qemu_log_mask(LOG_UNIMP, "qy8.hscif0: write outside map at %#" HWADDR_PRIx
+                      " = %#" PRIx64 " (%u bytes)\n", addr, val, size);
         break;
     }
 }
@@ -652,28 +651,26 @@ static void qy8_hscif_receive(void *opaque, const uint8_t *buf, int size)
 }
 
 /*
- * Куди МК (обидва — плати на SCIF4 і панелі на SCIF1) кладуть свої байти.
- * Повертаємо, скільки прийнято.
+ * Deliver bytes from either MCU (board on SCIF4 or panel on SCIF1).
+ * Return the number accepted.
  *
- * Кадр мусить лягти в приймач ОДНІЄЮ посилкою. Наївне «скільки влізло у
- * 16-байтовий FIFO, решту наступного разу» розриває будь-який довший кадр, бо
- * між шматками встигає спрацювати таймер тиші SCIF (QY8_SCIF_IDLE_NS = 200
- * мкс, а МК доливає через *_FILL_NS = 1 мс). А `qy8_scif_idle_expire()` — це
- * не просто «підняти DR»: він ще й закриває набір DMA через
- * `clarion_hpbdma_eod()`. Тобто гість отримує не один кадр, а кілька
- * 16-байтових огризків, кожен як окрему завершену посилку.
+ * A frame must reach the receiver as ONE burst. A naive "send what fits in
+ * the 16-byte FIFO, then send the rest later" splits longer frames because
+ * the SCIF idle timer fires between chunks (QY8_SCIF_IDLE_NS = 200 us, while
+ * the MCU refills after *_FILL_NS = 1 ms). `qy8_scif_idle_expire()` does more
+ * than set DR: it also closes the DMA set via `clarion_hpbdma_eod()`. The guest
+ * would receive several separate 16-byte fragments instead of one frame.
  *
- * На живому лінку такого немає: байти йдуть безперервним потоком, а DMA
- * вигрібає FIFO на ходу. У моделі вигрібання миттєве
- * (qy8_scif_receive -> qy8_scif_rx_pump), тому просто доливаємо, доки є
- * місце — віртуальний час усередині циклу не рухається, таймер тиші не
- * спрацьовує, і кадр лишається однією посилкою.
+ * This does not happen on a live link: bytes arrive continuously while DMA
+ * drains the FIFO. In the model draining is immediate (qy8_scif_receive ->
+ * qy8_scif_rx_pump), so refill while space remains. Virtual time does not
+ * advance inside the loop, the idle timer does not fire, and the frame stays
+ * one burst.
  *
- * Симптоми, з яких це знайдено: МК панелі — кадр 0x24 (20 Б) розривався на
- * два недокадри й гість відповідав NAK; МК плати — кадр «набір команд»
- * `08 0a` (~70 Б) не доходив до розбирача EdaDrv взагалі, лінк назавжди
- * лишався у стані 2, ACM-ID 61 ніколи не виставлявся (docs/24 у
- * nissan-can-explore).
+ * Observed symptoms: the panel MCU's 0x24 frame (20 bytes) split into two
+ * incomplete frames and the guest replied with NAK; the board MCU's command
+ * set frame `08 0a` (~70 bytes) never reached the EdaDrv parser, leaving the
+ * link permanently in state 2 and ACM-ID 61 unset.
  */
 static int qy8_micom_burst(ClarionScif *s, const uint8_t *buf, int len)
 {
@@ -684,7 +681,7 @@ static int qy8_micom_burst(ClarionScif *s, const uint8_t *buf, int len)
         int n;
 
         if (room <= 0) {
-            break;                  /* DMA не озброєний — решту доллє МК */
+            break;                  /* DMA not armed; MCU will send the rest */
         }
         n = MIN(room, len - done);
         clarion_scif_receive(s, buf + done, n);
@@ -708,13 +705,13 @@ static int qy8_ublox_sink(void *opaque, const uint8_t *buf, int len)
     return qy8_micom_burst(opaque, buf, len);
 }
 
-/* --- TMU (таймери Renesas, регістрова мапа як у SH TMU) --------------- */
+/* --- TMU (Renesas timers, register map as in SH TMU) ------------------- */
 
 #define QY8_TMU_BASE        0xFFD80000
 #define QY8_TMU_CHANS       3
-#define QY8_TMU_SPI0        32          /* канал n -> SPI 32+n -> IRQ 64+n;
-                                           перевірено: eboot вмикає IRQ 65
-                                           одночасно зі стартом каналу 1 */
+#define QY8_TMU_SPI0        32          /* channel n -> SPI 32+n -> IRQ 64+n;
+                                           verified: eboot enables IRQ 65
+                                           when channel 1 starts */
 #define QY8_PCLK            65000000    /* P-clock R8A7778 */
 
 #define TMU_TOCR    0x00
@@ -838,7 +835,7 @@ static void qy8_tmu_write(void *opaque, hwaddr addr, uint64_t val,
             return;
         }
         if (addr == b + 8) {
-            /* UNF скидається записом нуля в цей біт */
+            /* Clear UNF by writing zero to this bit. */
             c->tcr = (val & ~TCR_UNF) | (c->tcr & val & TCR_UNF);
             if (c->running) {
                 ptimer_transaction_begin(c->ptimer);
@@ -861,37 +858,35 @@ static const MemoryRegionOps qy8_tmu_ops = {
     .valid.max_access_size = 4,
 };
 
-/* --- контролер плати (зовнішня мікросхема на CS, 16-бітні регістри) ---- */
+/* --- board controller (external CS chip, 16-bit registers) ------------- */
 
 /*
- * Це не блок SoC, а окремий чип на шині CS; у прошивці він — джерело DIPSW
- * і сигналів дозволу старту. Що саме з нього читають, знято з коду:
+ * This is a separate chip on the CS bus, not an SoC block. The firmware uses
+ * it for DIPSW and startup-enable signals. Reads below were derived from code:
  *
- *   +0x00  статус. Завантажувач у циклі @0x1148 читає його двічі поспіль
- *          (антидребезг зовнішньої шини) і дивиться біт 0x400 — «можна
- *          виходити зі standby»; без нього лічильник r7 не спадає до нуля
- *          і машина йде на скидання по watchdog @0x11e0. Біт 0x80 керує
- *          другим лічильником (r6), за яким @0x1a6c у +0x04 пишеться
- *          0x8000 або 0.
- *   +0x02  DIPSW. Молодші 3 біти: перша стадія @0x12c4 порівнює з 4
- *          (режим оновлення з флеш-офсета 0x60000), а eboot друкує
- *          "DIPSW=%x" @0x97c0686c і обирає за ними режим буту.
- *   +0x04, +0x06, +0x08, +0x0c, +0x14 — пишуться під час ініціалізації.
+ *   +0x00  status. The bootloader reads it twice in loop @0x1148 (external
+ *          bus debounce) and checks bit 0x400, "leave standby". Without it,
+ *          counter r7 never reaches zero and watchdog reset occurs at
+ *          @0x11e0. Bit 0x80 controls a second counter (r6); @0x1a6c then
+ *          writes 0x8000 or 0 to +0x04.
+ *   +0x02  DIPSW. The first stage @0x12c4 compares the low 3 bits with 4
+ *          (flash update mode at offset 0x60000); eboot prints "DIPSW=%x"
+ *          @0x97c0686c and selects the boot mode from these bits.
+ *   +0x04, +0x06, +0x08, +0x0c, +0x14 are written during initialization.
  */
 typedef struct Qy8Bctl {
     MemoryRegion mr;
     uint16_t reg[QY8_BCTL_SIZE / 2];
-    SDBus *sd[QY8_NUM_SDHI];    /* шини SDHI — джерело card-detect */
+    SDBus *sd[QY8_NUM_SDHI];    /* SDHI buses provide card-detect state */
 } Qy8Bctl;
 
 /*
- * Card-detect не зберігається в reg[]: його рахуємо на кожному читанні з
- * фактичної топології QEMU. `sdbus_get_inserted()` віддає true лише коли на
- * шині є пристрій-картка І в нього вставлений блочний backend (hw/sd/core.c:
- * `get_card()` повертає NULL для порожньої шини; hw/sd/sd.c:
- * `sd_get_inserted()` = `blk && blk_is_inserted(blk)`). Тобто це саме
- * «картка під'єднана», а не «контролер існує»: обидва SDHI в моделі є завжди,
- * картку в слот вставляє лише `-drive if=sd,index=N`.
+ * Card-detect is not stored in reg[]; derive it on every read from QEMU's
+ * actual topology. `sdbus_get_inserted()` is true only when the bus has a card
+ * device with a block backend (`get_card()` returns NULL for an empty bus;
+ * `sd_get_inserted()` checks `blk && blk_is_inserted(blk)`). This represents
+ * an inserted card, not an existing controller: both SDHI controllers always
+ * exist in the model, and `-drive if=sd,index=N` inserts a card into a slot.
  */
 static uint16_t qy8_bctl_card_detect(Qy8Bctl *b)
 {
@@ -901,7 +896,7 @@ static uint16_t qy8_bctl_card_detect(Qy8Bctl *b)
 
     for (i = 0; i < QY8_NUM_SDHI; i++) {
         if (!b->sd[i] || !sdbus_get_inserted(b->sd[i])) {
-            bits |= cd[i];          /* порожньо -> 1 (активно-низька лінія) */
+            bits |= cd[i];          /* empty -> 1 (active-low line) */
         }
     }
     return bits;
@@ -924,13 +919,12 @@ static void qy8_bctl_write(void *opaque, hwaddr addr, uint64_t val,
     Qy8Bctl *b = opaque;
 
     /*
-     * +0x00 при читанні — статус, при записі — щось інше: перша стадія
-     * @0x1a6c кладе туди 0x2000 і одразу після того читає той самий
-     * регістр, очікуючи цілі біти 0x80/0x400. Якщо дати запису затерти
-     * читану половину, наступний тік нагляду @0x97c10e84 бачить 0x400
-     * скинутим, ставить стан 1, а ще через тік іде на скидання по
-     * watchdog @0x97c10d38 ("_p"). Тобто плани читання й запису тут
-     * різні — запис у статус просто не чіпає те, що читається.
+     * +0x00 is status on read and a different register on write: stage one
+     * @0x1a6c writes 0x2000 there, then immediately reads the same address,
+     * expecting bits 0x80/0x400 to remain set. If the write overwrote the
+     * read value, the next watchdog poll @0x97c10e84 would see 0x400 clear,
+     * set state 1, and reset on the following tick at @0x97c10d38 ("_p").
+     * Read and write views therefore differ; writes do not alter status.
      */
     if (addr == BCTL_STATUS) {
         return;
@@ -950,42 +944,41 @@ static const MemoryRegionOps qy8_bctl_ops = {
 
 
 
-/* --- простір, який ні в що не декодується ----------------------------- */
+/* --- unmapped address space -------------------------------------------- */
 
 /*
- * QEMU за замовчуванням відповідає на доступ до нічийної фізичної адреси
- * зовнішнім аварійним завершенням (data/prefetch abort). Ця плата так не
- * поводиться, і доказ тому — сама прошивка: ядро WinCE ЗОНДУЄ пам'ять.
+ * By default, QEMU responds to an unmapped physical address with an external
+ * data/prefetch abort. This board does not: the WinCE kernel probes memory.
  *
- * Процедура @0x880489ec отримує (початок, довжина, робоча VA), відображає
- * сторінку-кандидат у вікно 0xC04B0000 і двійковим пошуком шукає верхню межу
- * ОЗП: зберігає два слова, пише підпис 0x6a08bc95/0xfd1247e3, читає назад і
- * за збігом рухає нижню межу вгору, а за розбіжністю — верхню вниз.
+ * Routine @0x880489ec takes (start, length, working VA), maps a candidate page
+ * at 0xC04B0000 and binary-searches for the top of RAM: it saves two words,
+ * writes signatures 0x6a08bc95/0xfd1247e3, reads them back, then moves the
+ * lower bound up on a match and the upper bound down on a mismatch.
  *
- * Перший виклик іде по справжньому ОЗП (PA 0x0d6f0000, 0x9e0000 — це
- * ulRAMStart..ulRAMEnd із ROMHDR ядра) і проходить. Другий питає про
- * можливий додатковий банк PA 0x44000000 розміром 64 МБ — адреси, якої
- * немає в жодному відображенні самого ядра (його таблиця L1: флеш @0,
- * DDR @0x08000000 256 МБ, вікна 0x18000000, 0xf0000000, 0xfc000000).
- * Тобто зондування нічийного простору тут — штатний хід, і читання звідти
- * мусить просто повернути сміття, інакше алгоритм узагалі не міг би
- * працювати. У нас же воно давало abort -> ядро падало у вектор @0xffff0010.
+ * The first call probes real RAM (PA 0x0d6f0000, size 0x9e0000, matching
+ * ulRAMStart..ulRAMEnd in the kernel ROMHDR) and succeeds. The second probes
+ * a possible 64 MB bank at PA 0x44000000, which is absent from every kernel
+ * mapping (L1 table: flash @0, 256 MB DDR @0x08000000, windows at 0x18000000,
+ * 0xf0000000, and 0xfc000000). Probing this unmapped space is expected; reads
+ * must return arbitrary data for the algorithm to work. Here it caused an
+ * abort, sending the kernel to vector @0xffff0010.
  *
- * Тому нижнім шаром кладемо «порожнечу»: читання дає нулі, запис гине.
- * Пріоритет нижчий за все інше, зокрема за qy8.periph (-1000), тож жоден
- * справжній регістр вона не перехоплює, а доступи все одно видно з -d unimp.
+ * Provide a low-priority "void" region: reads return zero and writes are
+ * ignored. Its priority is below all other regions, including qy8.periph
+ * (-1000), so it cannot intercept real registers; accesses remain visible
+ * with -d unimp.
  */
 static uint64_t qy8_void_read(void *opaque, hwaddr addr, unsigned size)
 {
-    qemu_log_mask(LOG_UNIMP, "qy8.void: читання з нічийної адреси %#" HWADDR_PRIx
-                  " (%u Б)\n", addr, size);
+    qemu_log_mask(LOG_UNIMP, "qy8.void: read from unmapped address %#" HWADDR_PRIx
+                  " (%u bytes)\n", addr, size);
     return 0;
 }
 
 static void qy8_void_write(void *opaque, hwaddr addr, uint64_t val,
                            unsigned size)
 {
-    qemu_log_mask(LOG_UNIMP, "qy8.void: запис у нічийну адресу %#" HWADDR_PRIx
+    qemu_log_mask(LOG_UNIMP, "qy8.void: write to unmapped address %#" HWADDR_PRIx
                   " = %#" PRIx64 "\n", addr, val);
 }
 
@@ -1016,7 +1009,7 @@ static const MemoryRegionOps qy8_void_ops = {
 #define QY8_INT2_USB_OHCI   (1u << 0)
 #define QY8_INT2_USB_EHCI   (1u << 1)
 
-/* --- GPIO (R-Car, 6 банків по 0x1000) --------------------------------- */
+/* --- GPIO (R-Car, 6 banks of 0x1000) ---------------------------------- */
 
 
 #define QY8_GPIO_BASE       0xFFC40000
@@ -1039,7 +1032,7 @@ typedef struct Qy8Gpio {
     MemoryRegion mr;
     uint32_t iointsel, inoutsel, outdt;
     uint32_t intdt, intmsk, posneg, edglevel, filonoff;
-    uint32_t in_level;          /* рівні на вхідних лініях */
+    uint32_t in_level;          /* input line levels */
     qemu_irq parent_irq;
     DeviceState *tma460_reset_target;
     bool tma460_irq_enabled;
@@ -1112,7 +1105,7 @@ static uint64_t qy8_gpio_read(void *opaque, hwaddr addr, unsigned size)
     case GPIO_OUTDT:
         return g->outdt;
     case GPIO_INDT:
-        /* виходи читаються як те, що ми туди записали; входи — рівень лінії */
+        /* Outputs read back their written value; inputs read the line level. */
         return (g->outdt & g->inoutsel) | (g->in_level & ~g->inoutsel);
     case GPIO_INTMSK:
         return g->intmsk;
@@ -1206,62 +1199,61 @@ static const MemoryRegionOps qy8_gpio_ops = {
 };
 
 /*
- * Рівні на вхідних лініях плати.
+ * Levels on the board's input lines.
  *
- * GPIO1 біт 0 — сигнал «лишатися в standby». Цикл @0x1148 читає INDT двічі
- * поспіль і, якщо біт стоїть, іде на 0x1188: там r8:=1, і коли лічильник
- * r7 добігає нуля, @0x120c перевіряє r8 і заводить watchdog @0x11e0 на
- * скидання. Тобто одиниця на цьому піні — це не «плата готова», а «не
- * вантажитися»; щоб бут пішов далі, лінія має бути в нулі. Той самий пін
- * @0x1bfc отримує GPIO1.INTCLR біт 0, тобто він ще й джерело переривання.
+ * GPIO1 bit 0 is the "stay in standby" signal. Loop @0x1148 reads INDT twice
+ * and, if the bit is set, branches to 0x1188: r8 becomes 1, and when counter
+ * r7 reaches zero, @0x120c checks r8 and starts watchdog reset @0x11e0. A one
+ * on this pin therefore means "do not boot", not "board ready"; boot proceeds
+ * only when the line is low. The same pin receives GPIO1.INTCLR bit 0 at
+ * @0x1bfc, so it is also an interrupt source.
  */
 static const uint32_t qy8_gpio_in_level[QY8_GPIO_BANKS] = {
     [1] = 0x00000000,
 };
 
 
-/* --- qy8.periph: широкий перехоплювач із контекстом викликача ---------- */
+/* --- qy8.periph: broad intercept with caller context ------------------- */
 
 /*
- * Те саме, що `unimplemented-device`, але з відповіддю на питання «хто це
- * робить». Поведінка для гостя НЕ змінюється: читання так само повертає 0,
- * запис так само нікуди не йде. Додається лише рядок журналу.
+ * Like `unimplemented-device`, but also answers "who did this". Guest-visible
+ * behavior is unchanged: reads return 0 and writes are discarded. Only a log
+ * line is added.
  *
- * QY8_UNIMP_PC=N у середовищі вмикає розширений формат для перших N
- * доступів до кожної адреси:
+ * QY8_UNIMP_PC=N enables the extended format for the first N accesses to
+ * each address:
  *
  *   qy8.periph: unimplemented device write (size 4, offset 0x0100730,
  *       value 0x00000000) pc=0x88011a2c lr=0xefd8b118 mode=0x13 t=61234
  *
- * `pc` точний: він береться з даних розгортання блока трансляції
- * (`cpu_unwind_state_data`), інакше в env лежав би PC початку блока.
- * `t` — гостьовий час у мс, той самий годинник, що друкує консоль ядра,
- * тож рядок можна покласти поруч із етапом буту.
+ * `pc` is exact: it comes from translation block unwind data
+ * (`cpu_unwind_state_data`); otherwise env would contain the block's start PC.
+ * `t` is guest time in ms, using the same clock as the kernel console, so the
+ * line can be correlated with a boot stage.
  *
- * Без змінної середовища формат рядка байт-у-байт такий самий, як у
- * стандартного unimplemented-device, щоб наявні розбирачі логів працювали.
+ * Without the environment variable, the line format is byte-for-byte the
+ * same as standard unimplemented-device output, preserving existing parsers.
  */
-#define QY8_PERIPH_SEEN 2048        /* хеш-таблиця «offset -> скільки разів» */
+#define QY8_PERIPH_SEEN 2048        /* hash table: offset -> count */
 
 #define QY8_PERIPH_BASE 0xF0000000
-#define QY8_PERIPH_RANGES 8         /* скільки діапазонів «трасувати завжди» */
+#define QY8_PERIPH_RANGES 8         /* number of ranges to always trace */
 
 typedef struct Qy8Periph {
     MemoryRegion mr;
-    unsigned trace_pc;          /* скільки перших разів на адресу показувати */
+    unsigned trace_pc;          /* number of initial accesses to trace */
     hwaddr seen_off[QY8_PERIPH_SEEN];
     unsigned seen_cnt[QY8_PERIPH_SEEN];
-    /* QY8_UNIMP_PC_ALL: діапазони ФІЗИЧНИХ адрес без обмеження на кількість */
+    /* QY8_UNIMP_PC_ALL: physical address ranges with unlimited tracing */
     unsigned nranges;
     hwaddr rlo[QY8_PERIPH_RANGES], rhi[QY8_PERIPH_RANGES];
 } Qy8Periph;
 
 /*
- * Розгортання стану процесора коштує дорого: якщо робити його на кожному
- * доступі, гість сповільнюється приблизно вдесятеро (виміряно A/B: 5910
- * рядків логу за 45 с проти 687). А потрібне воно лише щоб назвати
- * викликача, тобто перші кілька разів на кожну адресу. Далі адреса вже
- * відома й рядок пишеться звичайним швидким шляхом.
+ * Unwinding CPU state is expensive: doing it for every access slows the guest
+ * by about 10x (A/B measurement: 5910 log lines in 45 s vs. 687). It is only
+ * needed to identify the caller on the first few accesses to each address;
+ * subsequent lines use the normal fast path.
  */
 static bool qy8_periph_want_ctx(Qy8Periph *p, hwaddr addr)
 {
@@ -1272,7 +1264,7 @@ static bool qy8_periph_want_ctx(Qy8Periph *p, hwaddr addr)
         hwaddr pa = QY8_PERIPH_BASE + addr;
 
         if (pa >= p->rlo[probe] && pa < p->rhi[probe]) {
-            return true;        /* цей блок зараз вивчаємо — без обмежень */
+            return true;        /* this range is under study; no limit */
         }
     }
     if (!p->trace_pc) {
@@ -1282,13 +1274,13 @@ static bool qy8_periph_want_ctx(Qy8Periph *p, hwaddr addr)
         unsigned k = (i + probe) % QY8_PERIPH_SEEN;
 
         if (p->seen_cnt[k] && p->seen_off[k] != addr) {
-            continue;           /* колізія — далі по таблиці */
+            continue;           /* collision; continue probing */
         }
         p->seen_off[k] = addr;
         p->seen_cnt[k]++;
         return p->seen_cnt[k] <= p->trace_pc;
     }
-    return false;               /* таблиця переповнена: краще швидко, ніж ніяк */
+    return false;               /* table full: prefer fast path */
 }
 
 static void qy8_periph_ctx(char *buf, size_t len)
@@ -1296,7 +1288,7 @@ static void qy8_periph_ctx(char *buf, size_t len)
     CPUState *cs = current_cpu;
     CPUARMState *env;
 
-    uint64_t data[4];    /* TARGET_INSN_START_WORDS для ARM = 3 */
+    uint64_t data[4];    /* TARGET_INSN_START_WORDS is 3 for ARM */
     uint32_t pc;
 
     buf[0] = '\0';
@@ -1305,24 +1297,25 @@ static void qy8_periph_ctx(char *buf, size_t len)
     }
     env = cpu_env(cs);
     /*
-     * Точний PC інструкції, що робить доступ. Саме cpu_unwind_state_data,
-     * а НЕ cpu_restore_state: той пише розгорнутий стан назад у env, і
-     * блок трансляції продовжує виконуватися з підміненими регістрами —
-     * перевірено, гість після цього йде іншою гілкою (A/B розходиться на
-     * ~680-му рядку логу). Ця ж функція лише читає дані розгортання.
+     * Exact PC of the instruction making the access. Use
+     * cpu_unwind_state_data, NOT cpu_restore_state: the latter writes the
+     * unwound state back to env, and the translation block continues with
+     * altered registers. This was verified: the guest then takes a different
+     * branch (A/B diverges around log line 680). This function only reads the
+     * unwind data.
      */
     if (cpu_unwind_state_data(cs, cs->mem_io_pc, data)) {
         /*
-         * З CF_PCREL (типово для системної емуляції) data[0] — це зсув
-         * усередині сторінки, а не повний PC; старші біти беремо з env,
-         * бо блок трансляції ніколи не перетинає межу сторінки.
+         * With CF_PCREL (typical for system emulation), data[0] is an offset
+         * within the page, not a full PC. Take the high bits from env because
+         * a translation block never crosses a page boundary.
          */
         pc = (uint32_t)data[0];
         if (pc < qemu_target_page_size()) {
             pc |= (uint32_t)env->regs[15] & (uint32_t)qemu_target_page_mask();
         }
     } else {
-        pc = (uint32_t)env->regs[15];   /* запасний варіант: початок блока */
+        pc = (uint32_t)env->regs[15];   /* fallback: start of the block */
     }
     snprintf(buf, len, " pc=0x%08x lr=0x%08x mode=0x%02x t=%" PRId64,
              pc, (uint32_t)env->regs[14],
@@ -1371,13 +1364,13 @@ static const MemoryRegionOps qy8_periph_ops = {
 /* --- DBSC3 (DDR3 SDRAM Controller) @0xFE800000 ----------------------- */
 
 /*
- * Контролер DDR3. Перша стадія буту (reset-stage, PC 0x17e0) записує
- * конфігурацію DDR-фізичного рівня; одне зі слів — 0x0f030a02 у регістр
- * DBPDCNT3 (offset 0x24). Пізніше OAL (PC 0x88011f04) перечитує ту саму
- * адресу й очікує збережене значення. Без цього регістра запис ішов у
- * широкий qy8.periph (-1000), який його відкидав.
+ * DDR3 controller. The boot reset stage (PC 0x17e0) writes DDR PHY
+ * configuration, including 0x0f030a02 to DBPDCNT3 (offset 0x24). Later the
+ * OAL (PC 0x88011f04) reads the same address and expects the value to persist.
+ * Without this register, the write fell through to qy8.periph (-1000) and
+ * was discarded.
  *
- * Решта регістрів поки не потрібна — логуємо через LOG_UNIMP.
+ * Other registers are not needed yet and are logged via LOG_UNIMP.
  */
 #define QY8_DBSC3_BASE      0xFE800000
 #define QY8_DBSC3_SIZE      0x10000
@@ -1429,36 +1422,36 @@ static const MemoryRegionOps qy8_dbsc3_ops = {
     .valid.max_access_size = 4,
 };
 
-/* --- CPG: засувки MSTPCR (Module Stop Control) ------------------------ */
+/* --- CPG: MSTPCR latches (Module Stop Control) ------------------------ */
 
 /*
- * MSTPCR0/1/3/4/5/6 — керування подачею такту на модулі: біт 1 = «модуль
- * зупинено», 0 = «тактується». Імена й адреси НЕ вгадані: вони є в таблиці
- * імен регістрів самого завантажувача (nand @0x24010) і збігаються з
- * mstp0..5_clks@ffc800xx у r8a7778.dtsi.
+ * MSTPCR0/1/3/4/5/6 control module clocks: bit 1 means "module stopped", 0
+ * means "clocked". Names and addresses are not guessed; they appear in the
+ * bootloader's register-name table (@0x24010) and match mstp0..5_clks@ffc800xx
+ * in r8a7778.dtsi.
  *
- * Навіщо модель. І завантажувач, і OAL роблять із ними read-modify-write:
+ * Why this model exists: both the bootloader and OAL use read-modify-write:
  *
- *     v = MSTPCRn;  v &= ~mask;  MSTPCRn = v;   // пустити модуль
- *     if (MSTPCRn & mask) fail;                 // перевірка
- *     v = MSTPCRn;  v |=  mask;  MSTPCRn = v;   // зупинити модуль
- *     if ((MSTPCRn & mask) != mask) fail;       // перевірка
+ *     v = MSTPCRn;  v &= ~mask;  MSTPCRn = v;   // start module
+ *     if (MSTPCRn & mask) fail;                 // verify
+ *     v = MSTPCRn;  v |=  mask;  MSTPCRn = v;   // stop module
+ *     if ((MSTPCRn & mask) != mask) fail;       // verify
  *
- * Доки ці адреси падали в широкий qy8.periph, запис губився, а читання
- * давало 0. Тому RMW між завантажувачем і WinCE був розірваний, а перевірка
- * після «зупинити» завжди провалювалася.
+ * When these addresses fell through to qy8.periph, writes were lost and
+ * reads returned 0. This broke the RMW sequence between the bootloader and
+ * WinCE, and the check after "stop" always failed.
  *
- * Модель — рівно засувка: що записали, те й читається. Тактування ми не
- * моделюємо, тож жодних інших наслідків у неї немає.
+ * The model is a plain latch: reads return the last written value. Clocking
+ * is not modeled, so it has no other effects.
  *
- * ⚠️ Reset-значення MSTPCR нам НЕ відоме (в доступних джерелах його немає),
- * тому модель стартує з нулів. Це свідомо НЕ відтворення power-on стану
- * SoC — мета лише в тому, щоб зберігалися значення, які пише сам гість.
- * Якщо reset-значення колись знайдеться, змінити треба саме цей масив.
+ * ⚠️ MSTPCR reset values are UNKNOWN (not present in available sources), so
+ * the model starts at zero. This does not reproduce the SoC power-on state;
+ * it only preserves values written by the guest. If reset values are found,
+ * update this array.
  *
- * Статусні регістри MSTPSR1/4/6 (0xFFC80044/48/4C) навмисно НЕ чіпаємо:
- * вони й далі читаються нулем через qy8.periph, і саме нуль означає
- * «модуль працює», якого OAL і чекає після «пустити».
+ * Deliberately leave status registers MSTPSR1/4/6 (0xFFC80044/48/4C) alone:
+ * they continue to read as zero through qy8.periph, and zero means "module
+ * running", which the OAL expects after starting a module.
  */
 typedef struct Qy8Mstp {
     MemoryRegion mr;
@@ -1507,65 +1500,64 @@ static const MemoryRegionOps qy8_mstp_ops = {
     .valid.max_access_size = 4,
 };
 
-/* --- INTC2: статусні слова демукса ------------------------------------ */
+/* --- INTC2: demux status words ----------------------------------------- */
 
 /*
- * Три слова в INTC2, кожне на 4 байти: 0xFE782048 (DU), 0xFE7820F4 (SDHI0),
+ * Three 4-byte INTC2 words: 0xFE782048 (DU), 0xFE7820F4 (SDHI0),
  * 0xFE7820F8 (SDHI1).
  *
- * Навіщо. Жодна з цих ліній GIC не веде до драйвера напряму:
- * OEMInterruptHandler (nk.exe @0x8800b5a0) має для кожної власний case, який
- * спершу маскує лінію в GICD_ICENABLER, а потім кличе демультиплексор. Той
- * читає статусне слово, і лише ненульове значення дає логічний IRQ:
+ * Why they are needed: none of these GIC lines lead directly to a driver.
+ * OEMInterruptHandler (nk.exe @0x8800b5a0) has a case for each line; it first
+ * masks the line in GICD_ICENABLER, then calls a demultiplexer. The demux
+ * reads the status word, and only a nonzero value produces a logical IRQ:
  *
- *   GIC ID 63  (SPI 31, DU)    case 0x8800b6d8 -> демукс 0x88011e94:
+ *   GIC ID 63  (SPI 31, DU)    case 0x8800b6d8 -> demux 0x88011e94:
  *       v = MMIO32(0xFE782048);
  *       if (v & 0x0000FFFF) return OALIntrTranslateIrq(63);   // -> SYSINTR 37
  *       if (v & 0xFFFF0000) return OALIntrTranslateIrq(167);
  *       return SYSINTR_NOP;
  *
- *   GIC ID 119 (SPI 87, SDHI0) case 0x8800bb9c -> демукс 0x8800da90:
+ *   GIC ID 119 (SPI 87, SDHI0) case 0x8800bb9c -> demux 0x8800da90:
  *       if (MMIO32(0xFE700008)) { MMIO32(0xFE782280) = 0x100;
  *                                 return OALIntrTranslateIrq(119); }
  *       if (MMIO32(0xFE7820F4) & 0xF) return OALIntrTranslateIrq(119);
  *       return SYSINTR_NOP;                                   // -> SYSINTR 20
  *
- *   GIC ID 120 (SPI 88, SDHI1) case 0x8800bbc4 -> демукс 0x8800db68:
- *       те саме зі словом 0xFE7820F8, ACK 0x200 і IRQ 120. // -> SYSINTR 23
+ *   GIC ID 120 (SPI 88, SDHI1) case 0x8800bbc4 -> demux 0x8800db68:
+ *       same with word 0xFE7820F8, ACK 0x200 and IRQ 120. // -> SYSINTR 23
  *
- * Без цих слів читається нуль, демукс повертає SYSINTR_NOP, ядро не кличе
- * InterruptDone — і лінія лишається замаскованою назавжди. Саме так
- * поводилася модель до 24.09.2026 (див. docs/04-journal.md).
+ * Without these words, reads return zero, the demux returns SYSINTR_NOP, the
+ * kernel does not call InterruptDone, and the line remains masked forever.
  *
- * Прив'язка «база пристрою -> логічний IRQ» знята з OALIntrRequestIrqs
+ * The "device base -> logical IRQ" mapping comes from OALIntrRequestIrqs
  * (nk.exe @0x88012b34): 0xFFE4C000 -> 0x77 (119) @0x88012fc0,
  * 0xFFE4D000 -> 0x78 (120) @0x88012fe8, 0xFFE4F000 -> 0x76 (118).
- * Далі — дамп живих таблиць OAL: g_oalIrq2SysIntr[119] = 20,
+ * The following values come from live OAL tables: g_oalIrq2SysIntr[119] = 20,
  * g_oalIrq2SysIntr[120] = 23, g_oalIrq2SysIntr[63] = 37.
  *
- * Що НЕ доведено: котрий саме біт кожного слова належить пристрою. OAL
- * перевіряє половину слова цілком (DU) або біти 0..3 (SDHI), тож модель ставить
- * біт 0. Це не «підганяння, щоб гість пішов далі»: слово віддзеркалює
- * РЕАЛЬНИЙ стан лінії, а не константу.
+ * Not established: which exact bit in each word belongs to the device. The
+ * OAL checks the whole half-word (DU) or bits 0..3 (SDHI), so the model sets
+ * bit 0. This does not force the guest forward; the word reflects the REAL
+ * line state rather than a constant.
  *
- * Гілку 0xFE700008 свідомо лишено нулем: цього блоку ми не моделюємо, а
- * друга гілка демукса дає той самий логічний IRQ без запису куди-небудь.
+ * Deliberately leave branch 0xFE700008 at zero: this block is not modeled,
+ * and the demux's second branch produces the same logical IRQ without writes.
  *
- * Слова тільки на читання: у всьому nk.exe їх ніхто не пише.
+ * These words are read-only: nk.exe never writes them.
  */
 #define QY8_INT2_STATUS_DU      0xFE782048
 #define QY8_INT2_STATUS_SDHI0   0xFE7820F4
 #define QY8_INT2_STATUS_SDHI1   0xFE7820F8
 #define QY8_INT2_STATUS_USB     0xFE782058
 #define QY8_INT2_STATUS_SHCORE 0xFE78208C
-#define QY8_INT2_BIT            (1u << 0)   /* біт у слові — не доведений */
-#define QY8_INT2_SHCORE_BIT     0x10000    /* підтверджено для IRQ 86 */
+#define QY8_INT2_BIT            (1u << 0)   /* word bit is not established */
+#define QY8_INT2_SHCORE_BIT     0x10000    /* confirmed for IRQ 86 */
 
 typedef struct Qy8Int2Line {
     MemoryRegion mr;
     const char *name;
     hwaddr pa;
-    uint32_t pending;           /* біти джерел, що тримають лінію GIC */
+    uint32_t pending;           /* source bits holding the GIC line high */
 } Qy8Int2Line;
 
 static uint64_t qy8_int2_read(void *opaque, hwaddr addr, unsigned size)
@@ -1580,8 +1572,8 @@ static void qy8_int2_write(void *opaque, hwaddr addr, uint64_t val,
 {
     Qy8Int2Line *l = opaque;
 
-    qemu_log_mask(LOG_UNIMP, "qy8.int2: запис у статусний регістр %s %#"
-                  HWADDR_PRIx " = %#" PRIx64 " (ігнорується)\n",
+    qemu_log_mask(LOG_UNIMP, "qy8.int2: write to status register %s %#"
+                  HWADDR_PRIx " = %#" PRIx64 " (ignored)\n",
                   l->name, l->pa + addr, val);
 }
 
@@ -1605,7 +1597,7 @@ static void qy8_int2_line_init(MemoryRegion *sysmem, Qy8Int2Line *l,
     memory_region_add_subregion_overlap(sysmem, pa, &l->mr, 1);
 }
 
-/* --- машина ----------------------------------------------------------- */
+/* --- machine ----------------------------------------------------------- */
 
 #define TYPE_QY8_MACHINE MACHINE_TYPE_NAME("clarion-qy8")
 OBJECT_DECLARE_SIMPLE_TYPE(Qy8MachineState, QY8_MACHINE)
@@ -1630,7 +1622,7 @@ struct Qy8MachineState {
     DeviceState *gic;
     DeviceState *du;
     DeviceState *dmac;
-    DeviceState *lbdma;      /* DMA читання NOR @0xFF801000 */
+    DeviceState *lbdma;      /* NOR read DMA @0xFF801000 */
     ClarionScif scif[QY8_NUM_SCIF];
     Qy8Hscif hscif0;
     DeviceState *micom;
@@ -1657,11 +1649,11 @@ struct Qy8MachineState {
     Qy8Periph periph;
     MemoryRegion voidmr;
 
-    uint8_t dipsw;              /* режим буту, властивість машини */
-    uint32_t du_spi;            /* лінія GIC для DU, властивість машини */
-    uint32_t du_dotclk;         /* точкова частота DU, Гц; 0 = без такту */
-    bool micom_on;              /* вбудований супутній МК на SCIF4 */
-    bool dispmicom_on;          /* вбудований МК панелі на SCIF1 */
+    uint8_t dipsw;              /* boot mode, machine property */
+    uint32_t du_spi;            /* DU GIC line, machine property */
+    uint32_t du_dotclk;         /* DU dot clock in Hz; 0 = no clock */
+    bool micom_on;              /* built-in board MCU on SCIF4 */
+    bool dispmicom_on;          /* built-in panel MCU on SCIF1 */
     bool gps_on;
     char *gps_lat;
     char *gps_lon;
@@ -1671,7 +1663,7 @@ struct Qy8MachineState {
     bool i2c4_recorder_on;      /* opt-in I2C4 transaction recorder */
     bool tma460_on;             /* opt-in bounded TMA460 model */
     bool tma460_synthetic_profile_on; /* opt-in synthetic profile */
-    bool i2c_empty_on;          /* opt-in: I2C0..I2C2 з порожньою шиною */
+    bool i2c_empty_on;          /* opt-in: I2C0..I2C2 with empty buses */
     char *board;                /* property value: "auto" or canonical name */
     const ClarionBoardInfo *board_info; /* resolved in qy8_init() */
     const Qy8BoardProperties *board_properties;
@@ -1686,17 +1678,17 @@ struct Qy8MachineState {
     char *render_log;
     char *render_dump_dir;
 
-    MemoryRegion flash;          /* лише коли флеш подано як ROM */
-    DriveInfo *flash_drive;      /* -drive if=pflash: записувана копія */
+    MemoryRegion flash;          /* only when flash is provided as ROM */
+    DriveInfo *flash_drive;      /* -drive if=pflash: writable copy */
     MemoryRegion ddr, ddr0, ddr1;
     MemoryRegion sram0, sram1;
     MemoryRegion ddr1_shadow;
 };
 
 /*
- * Лінія DU: одночасно GIC SPI 31 і біт у статусному слові INTC2. OAL читає
- * це слово в демультиплексорі (див. qy8_int2_read), тож без нього підняття
- * самої лінії GIC нічого не дає.
+ * DU line: GIC SPI 31 plus a bit in the INTC2 status word. The OAL reads this
+ * word in its demultiplexer (see qy8_int2_read), so raising the GIC line alone
+ * is insufficient.
  */
 static void qy8_du_irq(void *opaque, int n, int level)
 {
@@ -1707,8 +1699,8 @@ static void qy8_du_irq(void *opaque, int n, int level)
 }
 
 /*
- * Лінії SDHI: так само, як у DU — одночасно GIC SPI 87/88 і біт у власному
- * статусному слові INTC2, без якого демукс OAL поверне SYSINTR_NOP.
+ * SDHI lines: like DU, each uses GIC SPI 87/88 and a bit in its INTC2 status
+ * word; without it, the OAL demux returns SYSINTR_NOP.
  */
 static void qy8_sdhi_irq(void *opaque, int n, int level)
 {
@@ -2026,28 +2018,27 @@ static void qy8_init(MachineState *machine)
 
     s->cpu = ARM_CPU(object_new(machine->cpu_type));
     object_property_set_bool(OBJECT(s->cpu), "has_el3", false, &error_fatal);
-    /* скидання починається з 0x0 — флеш CS0, XIP */
+    /* Reset starts at 0x0: CS0 flash, XIP. */
     object_property_set_int(OBJECT(s->cpu), "rvbar", 0, NULL);
     qdev_realize(DEVICE(s->cpu), NULL, &error_fatal);
 
-    /* --- пам'ять --- */
+    /* --- memory --- */
 
-    /* найнижчий шар: нічийні адреси читаються нулями, а не дають abort */
+    /* Bottom layer: unmapped addresses read as zero instead of aborting. */
     memory_region_init_io(&s->voidmr, NULL, &qy8_void_ops, s,
                           "qy8.void", 0x100000000ULL);
     memory_region_add_subregion_overlap(sysmem, 0, &s->voidmr, -1500);
 
     /*
-     * Флеш CS0 подається гостю двома способами.
+     * Provide CS0 flash to the guest in either of two ways.
      *
-     * Без `-drive if=pflash` — як було: ROM, куди `-bios` кладе байти дампа.
-     * Гостьові записи туди нікуди не йдуть, ID флеш не читаються, стирання
-     * неможливе; для читального трасування цього досить.
+     * Without `-drive if=pflash`, use ROM populated from the dump by `-bios`.
+     * Guest writes are discarded, flash IDs are unavailable, and erases are
+     * impossible; this is sufficient for read-only tracing.
      *
-     * З `-drive if=pflash,format=raw,file=КОПІЯ.bin` — справжня модель
-     * мікросхеми (`cfi.pflash02`): гість бачить ID, може стерти сектор і
-     * записати слово, а зміни лягають у ФАЙЛ КОПІЇ. Вихідний дамп при цьому
-     * не потрібен і не чіпається.
+     * With `-drive if=pflash,format=raw,file=COPY.bin`, use the chip model
+     * (`cfi.pflash02`): the guest can read IDs, erase sectors and write words;
+     * changes go to the COPY FILE. The source dump is not used or modified.
      */
     s->flash_drive = drive_get(IF_PFLASH, 0, 0);
     if (s->flash_drive) {
@@ -2066,9 +2057,9 @@ static void qy8_init(MachineState *machine)
         qdev_prop_set_uint16(fl, "id2", 0x22a3); /* PC28F512M29AWxB ext. ID */
         qdev_prop_set_uint16(fl, "id3", 0x2201);
         /*
-         * Адреси розблокування. Завантажувач пише за БАЙТОВИМИ 0xAAAA і
-         * 0x5554; модель для x16 ділить на 2 і лишає 11 біт, тобто 0x555 і
-         * 0x2AA — рівно типові значення набору команд AMD.
+         * Unlock addresses. The bootloader writes byte addresses 0xAAAA and
+         * 0x5554; the x16 model divides by 2 and keeps 11 bits, yielding
+         * 0x555 and 0x2AA, the standard AMD command values.
          */
         qdev_prop_set_uint16(fl, "unlock-addr0", 0x555);
         qdev_prop_set_uint16(fl, "unlock-addr1", 0x2aa);
@@ -2090,73 +2081,74 @@ static void qy8_init(MachineState *machine)
     qy8_add_ram(sysmem, &s->sram1, "qy8.sram1", QY8_SRAM1_BASE, QY8_SRAM1_SIZE);
 
     /*
-     * Тінь DDR1 за PA 0x90000000 — милиця під конвеєр, а не деталь плати.
+     * DDR1 shadow at PA 0x90000000 is a pipeline workaround, not a board feature.
      *
-     * `Launch` завантажувача (VA 0x97c1204c) вимикає MMU і ОДРАЗУ наступною
-     * інструкцією стрибає на фізичну адресу трампліна:
+     * The bootloader's `Launch` (VA 0x97c1204c) disables the MMU and branches
+     * to the physical trampoline on the very next instruction:
      *
-     *      97c12118  mcr p15,0,r1,c1,c0,0   ; SCTLR.M := 0 — MMU вимкнено
+     *      97c12118  mcr p15,0,r1,c1,c0,0   ; SCTLR.M := 0 - MMU disabled
      *      97c1211c  mov pc, r0             ; r0 = VAtoPA(0x97c12130) = 0x17c12130
-     *      97c12120  nop x4                 ; набивка під злив конвеєра
+     *      97c12120  nop x4                 ; pipeline flush padding
      *
-     * На живому Cortex-A9 `mov pc,r0` уже вибрано в конвеєр, поки MMU був
-     * увімкнений, тож вибірка за старим відображенням; ARM ARM і не обіцяє,
-     * що зміна SCTLR.M побачиться до context-synchronizing operation. QEMU ж
-     * застосовує запис миттєво: обриває блок трансляції й перевибирає
-     * 0x97c1211c уже з вимкненим MMU, тобто за PA 0x97C1211C. Там у нас нічого
-     * немає -> prefetch abort -> PC=0xc -> «нульовий слайд» по таблиці векторів
-     * до ASCII-імені @0x28 -> data abort -> вічна петля. Саме це й ловив
+     * On a real Cortex-A9, `mov pc,r0` is already in the pipeline while the
+     * MMU is enabled, so instruction fetch uses the old mapping; the ARM ARM
+     * does not guarantee SCTLR.M changes take effect before a context-
+     * synchronizing operation. QEMU applies the write immediately, ends the
+     * translation block, then fetches 0x97c1211c with the MMU disabled, as
+     * PA 0x97C1211C. That address is unmapped here: prefetch abort -> PC=0xc
+     * -> zero-slide through the vector table to the ASCII name at @0x28 ->
+     * data abort -> infinite loop. This was observed during boot.
      * `info registers` (abt32, PC=0x10).
      *
-     * Тому робимо ті кілька слів досяжними за фізичною адресою, рівною їхній
-     * VA: DDR1 (PA 0x10000000, там живе eboot) ще раз видно за 0x90000000 —
-     * рівно так, як його ж OEMAddressTable ставить VA 0x90000000 -> PA
-     * 0x10000000. Це вікно потрібне тільки на час «MMU вже вимкнено, а PC ще
-     * віртуальний»; далі виконання йде за справжніми PA (0x17c12130, потім
-     * ядро @0x08001000).
+     * Make those few words reachable at physical addresses matching their
+     * VAs: DDR1 (PA 0x10000000, containing eboot) is also visible at
+     * 0x90000000, matching the OEMAddressTable mapping VA 0x90000000 -> PA
+     * 0x10000000. This window is needed only while the MMU is disabled but PC
+     * is still virtual; execution then continues at real PAs (0x17c12130,
+     * followed by the kernel at @0x08001000).
      */
     memory_region_init_alias(&s->ddr1_shadow, NULL, "qy8.ddr1-shadow",
                              &s->ddr1, 0, QY8_DDR1_SIZE);
     memory_region_add_subregion(sysmem, 0x90000000, &s->ddr1_shadow);
 
-    /* --- вміст флеш: дамп плати через -bios --- */
+    /* --- flash contents: board dump via -bios --- */
     if (s->flash_drive) {
         /*
-         * Вміст уже прийшов із блочного бекенда `-drive if=pflash`, і саме
-         * туди підуть гостьові стирання й записи. `-bios` тут зайвий і
-         * небезпечний: він мовчки перекрив би копію байтами іншого файлу.
+         * Contents already come from the `-drive if=pflash` block backend,
+         * which receives guest erases and writes. `-bios` is unnecessary and
+         * unsafe here: it would silently overwrite the copy with another file.
          */
         if (machine->firmware) {
-            error_report("clarion-qy8: -bios і -drive if=pflash разом не "
-                         "можна — вміст флеш береться з копії");
+            error_report("clarion-qy8: -bios and -drive if=pflash cannot be "
+                         "used together; flash contents come from the copy");
             exit(1);
         }
     } else {
         if (!machine->firmware) {
-            error_report("clarion-qy8: треба -bios <дамп флеш 64 МБ> "
-                         "або -drive if=pflash,format=raw,file=<копія>");
+            error_report("clarion-qy8: specify -bios <64 MB flash dump> or "
+                         "-drive if=pflash,format=raw,file=<copy>");
             exit(1);
         }
         fname = g_strdup(machine->firmware);
         sz = load_image_mr(fname, &s->flash);
         if (sz < 0) {
-            error_report("clarion-qy8: не вдалося прочитати %s", fname);
+            error_report("clarion-qy8: failed to read %s", fname);
             exit(1);
         }
         /*
-         * Годиться будь-який дамп CS0 — стоковий, чужий чи власноруч
-         * патчений: машина нічого з нього не розбирає, вона просто кладе
-         * байти під reset-вектор. Розмір має бути рівно 64 МБ (дамп без OOB),
-         * інакше решта вікна лишиться нулями і бут піде не туди.
+         * Any CS0 dump is accepted, stock, modified or from another unit: the
+         * machine does not parse it, but places the bytes at the reset vector.
+         * It must be exactly 64 MB (without OOB data), or the rest of the
+         * window stays zero and boot will fail.
          */
         if (sz != QY8_FLASH_SIZE) {
-            warn_report("clarion-qy8: %s має %d байт, а не 64 МБ — "
-                        "решта флеш-вікна лишиться нулями", fname, (int)sz);
+            warn_report("clarion-qy8: %s is %d bytes, not 64 MB; "
+                        "the rest of the flash window remains zero", fname, (int)sz);
         }
         g_free(fname);
     }
 
-    /* --- GIC (в A9 R-Car Gen1 він окремий, не в private region) --- */
+    /* --- GIC (separate from the A9 R-Car Gen1 private region) --- */
     s->gic = qdev_new(TYPE_ARM_GIC);
     qdev_prop_set_uint32(s->gic, "revision", 2);
     qdev_prop_set_uint32(s->gic, "num-cpu", 1);
@@ -2195,14 +2187,14 @@ static void qy8_init(MachineState *machine)
     }
 
     /*
-     * --- I2C0..I2C2: та сама обмежена модель контролера, шина ПОРОЖНЯ ---
+     * --- I2C0..I2C2: same limited controller model, buses EMPTY ---
      *
-     * Діагностичний режим (docs/31): без моделі клієнти цих контролерів
-     * (бібліотека тюнера, Usb.exe) на кожній транзакції чекають переривання
-     * 3000 мс. Порожня шина дає чесний для неї результат — NACK адреси
-     * (MNR) — одразу. На справжній платі пристрої там є, тож це не
-     * поведінка заліза, а швидка помилка замість повільної; типово вимкнено.
-     * GIC ID за таблицею OEMInterruptHandler: 99, 110, 108 (SPI = ID - 32).
+     * Diagnostic mode: without a model, clients (tuner library, Usb.exe) wait
+     * 3000 ms for an interrupt on every transaction. An empty bus immediately
+     * returns NACK (MNR), its truthful response. Devices exist on the real
+     * board, so this is a fast failure in place of a slow one and is disabled
+     * by default. GIC IDs from OEMInterruptHandler are 99, 110, 108
+     * (SPI = ID - 32).
      */
     if (s->i2c_empty_on) {
         static const struct { hwaddr base; int spi; } ctl[] = {
@@ -2217,7 +2209,7 @@ static void qy8_init(MachineState *machine)
         }
     }
 
-    /* --- I2C4: bounded T142/T143 models; other controllers stay unmodeled --- */
+    /* --- I2C4: bounded model; other controllers stay unmodeled ------------ */
     if (s->i2c4_on) {
         I2CBus *bus;
 
@@ -2251,10 +2243,10 @@ static void qy8_init(MachineState *machine)
     /*
      * --- HPB-DMAC ---
      *
-     * Бази й переривання — з hpb_dmae_resources[] у setup-r8a7778.c:
-     * канальні регістри 0xffc08000/0x1000, спільні 0xffc09000/0x170,
-     * gic_iid(0x7b) і 5 ліній поспіль (IRQ 123..127 = SPI 91..95).
-     * Ставимо до SCIF, бо приймачі SCIF віддають байти саме сюди.
+     * Bases and interrupts from hpb_dmae_resources[] in setup-r8a7778.c:
+     * channel registers 0xffc08000/0x1000, shared registers 0xffc09000/0x170,
+     * gic_iid(0x7b), and 5 consecutive lines (IRQ 123..127 = SPI 91..95).
+     * Place before SCIF because SCIF receivers deliver bytes here.
      */
     s->dmac = qdev_new(TYPE_CLARION_HPBDMA);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(s->dmac), &error_fatal);
@@ -2267,13 +2259,12 @@ static void qy8_init(MachineState *machine)
     }
 
     /*
-     * --- Супутній МК (micom) на SCIF4 ---
+     * --- Board companion MCU (micom) on SCIF4 ---
      *
-     * На платі це окрема мікросхема, тож типово вона є. Без неї ядро WinCE
-     * не проходить ініціалізацію лінку й бут не доходить до GWES. Вимкнути —
-     * `-M clarion-qy8,micom=off`: тоді SCIF4 поводиться як звичайний порт і
-     * до нього можна причепити зовнішній відповідач через -serial
-     * (tools/qy8_micom.py), щоб гратися з нерозібраними командами.
+     * This is a separate chip on the board and is enabled by default. Without
+     * it, WinCE cannot initialize the link and boot does not reach GWES.
+     * Disable with `-M clarion-qy8,micom=off`; SCIF4 then acts as a normal
+     * port for an external responder connected through -serial.
      */
     if (s->micom_on) {
         s->micom = qdev_new(TYPE_CLARION_MICOM);
@@ -2281,15 +2272,14 @@ static void qy8_init(MachineState *machine)
     }
 
     /*
-     * --- МК панелі дисплея (Display Micom) на SCIF1 ---
+     * --- Display panel MCU (Display Micom) on SCIF1 ---
      *
-     * Окрема мікросхема в блоці дисплея, теж розпаяна на живому авто, тож
-     * типово вона є. Без неї `lcddrv.dll` відкриває `SCI1:`, шле свій
-     * 10 02 23 10 03 30 і назавжди стоїть у WaitCommEvent: ACM-модуль 129
-     * ніколи не виставляється, і DrawOi малює перший кадр аж після
-     * 5-секундного таймауту очікування на 129. Вимкнути —
-     * `-M clarion-qy8,dispmicom=off`: тоді SCIF1 поводиться як звичайний
-     * порт і до нього можна причепити власний відповідач через -serial.
+     * A separate chip in the display unit, also present on the real vehicle,
+     * so enabled by default. Without it, `lcddrv.dll` opens `SCI1:`, sends
+     * 10 02 23 10 03 30 and waits forever in WaitCommEvent: ACM module 129 is
+     * never signaled, and DrawOi renders its first frame only after the 5 s
+     * wait for 129 expires. Disable with `-M clarion-qy8,dispmicom=off`; SCIF1
+     * then acts as a normal port for an external responder on -serial.
      */
     if (s->dispmicom_on) {
         s->dispmicom = qdev_new(TYPE_CLARION_DISPMICOM);
@@ -2340,11 +2330,11 @@ static void qy8_init(MachineState *machine)
 
     /* --- HSCIF0 --- */
     /*
-     * Вузьке вікно 0x60 з пріоритетом 1: перекриває широкий qy8.periph
-     * (-1000), але нічого іншого не зачіпає — між SCIF5 (0xFFE45FFF) і
-     * HSCIF0 лежать три незайняті кілобайти. Сьомий -serial (індекс 6,
-     * після шести SCIF) чіпляється сюди, якщо його задали; без нього порт
-     * просто не має співрозмовника, як непідключений роз'єм на платі.
+     * Narrow 0x60 window with priority 1: overrides broad qy8.periph (-1000)
+     * without affecting anything else. Three unused kilobytes lie between
+     * SCIF5 (0xFFE45FFF) and HSCIF0. The seventh -serial (index 6, after six
+     * SCIF ports) is connected here when specified; otherwise it has no peer,
+     * like an unconnected board connector.
      */
     s->hscif0.tx = timer_new_ns(QEMU_CLOCK_VIRTUAL, qy8_hscif_tx_expire,
                                 &s->hscif0);
@@ -2400,13 +2390,13 @@ static void qy8_init(MachineState *machine)
                                                 g, 11));
     }
 
-    /* --- контролер плати: DIPSW і дозвіл виходу зі standby --- */
+    /* --- board controller: DIPSW and standby exit enable --- */
     s->bctl.reg[BCTL_STATUS >> 1] = BCTL_ST_PWR | BCTL_ST_BOOT;
     qy8_bctl_set_inputs(s);
     s->bctl.reg[BCTL_DIPSW >> 1] = s->dipsw & 7;
     memory_region_init_io(&s->bctl.mr, NULL, &qy8_bctl_ops, &s->bctl,
                           "qy8.bctl", QY8_BCTL_SIZE);
-    /* перекриває вікно sram1, бо на платі це той самий CS */
+    /* Overrides the sram1 window because the board uses the same CS. */
     memory_region_add_subregion_overlap(sysmem, QY8_BCTL_BASE,
                                         &s->bctl.mr, 1);
 
@@ -2433,11 +2423,11 @@ static void qy8_init(MachineState *machine)
     sysbus_connect_irq(SYS_BUS_DEVICE(s->ohci), 0,
                        qemu_allocate_irq(qy8_usb_irq, s, 0));
 
-    /* --- Display Unit: справжнє вікно QEMU --- */
+    /* --- Display Unit: actual QEMU window --- */
     /*
-     * Лінія переривання GIC_SPI 31. Кадровий період модель бере з регістрів
-     * HCR/VCR, які програмує сам гість; точкову частоту — з властивості
-     * `dotclk` (ESCR02 = 0, такт зовнішній, у регістрах його немає).
+     * Interrupt line GIC_SPI 31. The model derives frame period from HCR/VCR,
+     * programmed by the guest; dot clock comes from property `dotclk`
+     * (ESCR02 = 0 selects an external clock, which is not in the registers).
      */
     s->du = qdev_new(TYPE_CLARION_DU);
     qdev_set_id(s->du, g_strdup("qy8-du"), &error_fatal);
@@ -2453,8 +2443,8 @@ static void qy8_init(MachineState *machine)
                        qemu_allocate_irq(qy8_du_irq, s, 0));
 
     /*
-     * Статусні слова демукса INTC2: пріоритет 1, щоб перекрити нічийний
-     * простір (qy8.void, -1500), який досі віддавав звідти нуль.
+     * INTC2 demux status words: priority 1 overrides the unmapped space
+     * (qy8.void, -1500), which previously returned zero here.
      */
     qy8_int2_line_init(sysmem, &s->int2_du, "qy8.int2.du",
                        QY8_INT2_STATUS_DU);
@@ -2470,15 +2460,15 @@ static void qy8_init(MachineState *machine)
     }
 
     /*
-     * CPG MSTPCR: шість окремих чотирибайтових вікон із пріоритетом 1 над
-     * широким qy8.periph (-1000). Саме окремі вікна, а не одне на весь блок:
-     * так усе інше в CPG (FRQCR, MSTPSR) лишається як було й далі видно в
+     * CPG MSTPCR: six separate 4-byte windows with priority 1 over broad
+     * qy8.periph (-1000). Separate windows preserve the existing behavior
+     * for other CPG registers (FRQCR, MSTPSR), which remain visible in
      * `-d unimp`.
      */
     for (int i = 0; i < QY8_NUM_MSTP; i++) {
         char nm[32];
 
-        s->mstp[i].val = 0;         /* reset-значення невідоме — див. коментар */
+        s->mstp[i].val = 0;         /* reset value unknown; see comment */
         s->mstp[i].pa = qy8_mstp_regs[i].pa;
         s->mstp[i].name = qy8_mstp_regs[i].name;
         snprintf(nm, sizeof(nm), "qy8.cpg.%s", qy8_mstp_regs[i].name);
@@ -2489,14 +2479,14 @@ static void qy8_init(MachineState *machine)
     }
 
     /*
-     * --- SDHI0/SDHI1: контролери SD ---
+     * --- SDHI0/SDHI1: SD controllers ---
      *
-     * Обидва існують завжди, навіть коли жодного образу не подано: на платі
-     * це мікросхема SoC, а не картка. Порожній слот поводиться як порожній —
-     * команда не отримує відповіді й контролер виставляє CMDTIMEOUT.
+     * Both controllers always exist, even without an image: they are part of
+     * the SoC, not the card. An empty slot stays empty; commands receive no
+     * response and the controller sets CMDTIMEOUT.
      *
-     * Картку в слот вставляє `-drive if=sd,index=N,format=raw,file=...`
-     * (N = 0 для переднього слота, 1 для другого) або коротке `-sd файл`.
+     * Insert a card with `-drive if=sd,index=N,format=raw,file=...` (N = 0
+     * for the main slot, 1 for the second) or the short form `-sd FILE`.
      */
     for (i = 0; i < QY8_NUM_SDHI; i++) {
         DriveInfo *di = drive_get(IF_SD, 0, i);
@@ -2504,9 +2494,9 @@ static void qy8_init(MachineState *machine)
         s->sdhi[i] = qdev_new(TYPE_RENESAS_SDHI);
         qdev_prop_set_uint8(s->sdhi[i], "unit", i);
         /*
-         * Передача даних іде через HPB-DMAC: контролер каже йому «в буфері
-         * є блок», а читає DMAC сам, за адресою власного SD_BUF0 цього
-         * контролера (прив'язку каналу до неї тримає hpb_chan_module[]).
+         * Data transfers use HPB-DMAC: the controller signals that a block is
+         * ready, and DMAC reads it from this controller's SD_BUF0 address
+         * (hpb_chan_module[] maps the channel to that address).
          */
         object_property_set_link(OBJECT(s->sdhi[i]), "dmac", OBJECT(s->dmac),
                                  &error_fatal);
@@ -2528,9 +2518,10 @@ static void qy8_init(MachineState *machine)
                                    &error_fatal);
         }
         /*
-         * Чип плати читає card-detect із цих самих шин (див. qy8_bctl_read).
-         * Прив'язку робимо тут, а не при створенні bctl, бо контролери
-         * створюються пізніше; гість читає регістр уже після init машини.
+         * The board chip reads card-detect from these buses (see
+         * qy8_bctl_read). Bind them here, rather than when creating bctl,
+         * because the controllers are created later; the guest reads the
+         * register after machine initialization.
          */
         s->bctl.sd[i] = SD_BUS(qdev_get_child_bus(s->sdhi[i], "sd-bus"));
     }
@@ -2538,15 +2529,15 @@ static void qy8_init(MachineState *machine)
     /*
      * --- LBSC DMAC @0xFF801000 ---------------------------------------
      *
-     * Двигун, яким `Flash.dll` реально читає паралельну NOR: IOCTL
-     * `0x01112020` (`FlashReadToPhysMem`) не шле мікросхемі жодної команди
-     * CFI, а програмує сюди {SAR, DAR, TCR} і дає START. Без моделі запити
-     * ковтав широкий `qy8.periph`, призначення лишалося нульовим, а драйвер
-     * 5 секунд чекав переривання завершення, яке нізвідки взятися не могло.
+     * DMA engine used by `Flash.dll` to read parallel NOR: IOCTL `0x01112020`
+     * (`FlashReadToPhysMem`) sends no CFI commands to the chip; it programs
+     * {SAR, DAR, TCR} here and starts the transfer. Without the model,
+     * qy8.periph discarded the request and left the destination zero, while
+     * the driver waited 5 seconds for an interrupt that could never arrive.
      *
-     * Лінію GIC узято не з аналогії: OAL самої прошивки віддає драйверу
-     * IRQ 0x6F для `LogicalLoc = 0xFF801000`, а «логічний IRQ» OAL — це GIC
-     * INTID, тож SPI = 111 - 32 = 79 (докладно — clarion_lbdma.h).
+     * GIC line is taken from firmware, not analogy: its OAL assigns IRQ 0x6F
+     * for `LogicalLoc = 0xFF801000`. The OAL's logical IRQ is the GIC INTID,
+     * so SPI = 111 - 32 = 79 (see clarion_lbdma.h).
      */
     s->lbdma = qdev_new(TYPE_CLARION_LBDMA);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(s->lbdma), &error_fatal);
@@ -2557,16 +2548,15 @@ static void qy8_init(MachineState *machine)
     /*
      * --- CAN @0xFFFD1000 ---------------------------------------------
      *
-     * Контролер плати, до якого ходить `CAN.dll` (а через `CAN1:` —
-     * `AntiTheft.exe`). Модель знає тільки про власні режими контролера;
-     * шини авто (BCM, метр, HVAC) за нею немає — див. renesas_can.c.
-     * Лінію переривання не під'єднуємо: номер GIC SPI для CAN нічим не
-     * доведено, а модель поки нічого й не піднімає.
+     * Board controller accessed by `CAN.dll` and `AntiTheft.exe` through
+     * `CAN1:`. The model implements only the controller's own modes; it does
+     * not include vehicle buses (BCM, meter, HVAC). No interrupt is connected:
+     * the CAN GIC SPI number is unproven, and the model raises no interrupt.
      */
     /*
-     * QY8_CAN=off прибирає модель зовсім: блок знову падає в qy8.periph і
-     * `CAN.dll` знову впирається в таймаут. Це потрібно лише для порівняння
-     * «до/після», тому вимикач env, а не властивість машини.
+     * QY8_CAN=off removes the model, so the block falls through to qy8.periph
+     * and `CAN.dll` times out again. This switch is for before/after
+     * comparison only, so it is an environment variable, not a machine property.
      */
     if (g_strcmp0(getenv("QY8_CAN"), "off") != 0) {
         s->can = qdev_new(TYPE_RENESAS_CAN);
@@ -2577,15 +2567,13 @@ static void qy8_init(MachineState *machine)
     /*
      * --- PowerVR SGX @0xFCE00000 -------------------------------------
      *
-     * Щабель M1 карти docs/28-sgx-roadmap.md: блок отримує власне вікно й
-     * прилад замість широкого перехоплювача. Поведінково для гостя це НІЩО —
-     * читання так само віддають нулі, переривань немає, `ui32InitStatus`
-     * модель не торкається, тож `SGXInitialise` доходить до того самого
-     * таймауту. Уся користь у тому, що на `EUR_CR_EVENT_KICK2` модель друкує
-     * розбір видимого стану: регістри-носії адрес, повний обхід каталогу
-     * сторінок SGX і вміст об'єкта за коренем `PDS_EXEC_BASE + рег 0x0A68`.
-     * Чому саме так і чому M3 поки не роблять — clarion_sgx.c і
-     * docs/sgx/09-edm-boot-locator.md.
+     * The SGX block has its own window and device model instead of the broad
+     * interceptor. Guest-visible behavior is unchanged: reads still return
+     * zero, there are no interrupts, and `ui32InitStatus` is untouched, so
+     * `SGXInitialise` reaches the same timeout. On `EUR_CR_EVENT_KICK2`, the
+     * model reports visible state: address-carrying registers, a full walk of
+     * the SGX page directory, and the object at `PDS_EXEC_BASE + reg 0x0A68`.
+     * Rationale and deferred work are documented in clarion_sgx.c.
      */
     if (g_strcmp0(getenv("QY8_SGX"), "off") != 0) {
         s->sgx = qdev_new(TYPE_CLARION_SGX);
@@ -2593,11 +2581,11 @@ static void qy8_init(MachineState *machine)
         sysbus_mmio_map(SYS_BUS_DEVICE(s->sgx), 0, CLARION_SGX_BASE);
     }
 
-    /* --- решта периферії: поки лише лог доступів (-d unimp) --- */
+    /* --- remaining peripherals: log accesses only (-d unimp) --- */
     create_unimplemented_device("qy8.cs1",   QY8_CS1_BASE, QY8_CS1_SIZE);
     create_unimplemented_device("qy8.l2c",   QY8_L2C_BASE, 0x1000);
-    /* --- DBSC3: DDR3 controller, пріоритет вищий за qy8.periph (-1000) --- */
-    s->dbsc3.dbpdcnt3 = 0;      /* reset: offset 0x24 читається нулем */
+    /* --- DBSC3: DDR3 controller, above qy8.periph priority (-1000) --- */
+    s->dbsc3.dbpdcnt3 = 0;      /* reset: offset 0x24 reads as zero */
     memory_region_init_io(&s->dbsc3.mr, NULL, &qy8_dbsc3_ops, &s->dbsc3,
                           "qy8.dbsc3", QY8_DBSC3_SIZE);
     memory_region_add_subregion_overlap(sysmem, QY8_DBSC3_BASE,
@@ -2606,16 +2594,16 @@ static void qy8_init(MachineState *machine)
     create_unimplemented_device("qy8.cpg",   0xFFC80000, 0x1000);
     create_unimplemented_device("qy8.pfc",   0xFFFC0000, 0x1000);
     create_unimplemented_device("qy8.rst",   0xFFCC0000, 0x1000);
-    /* широкий перехоплювач: усе інше згори 0xF0000000 логується */
+    /* Broad interceptor: log everything else from 0xF0000000 upward. */
     /*
-     * Широкий перехоплювач: усе інше згори 0xF0000000 логується. Власна
-     * модель замість `unimplemented-device` — лише щоб QY8_UNIMP_PC=1
-     * додавало pc/lr/час викликача; гість бачить рівно те саме.
+     * Broad interceptor for other accesses from 0xF0000000 upward. This model
+     * replaces `unimplemented-device` only to let QY8_UNIMP_PC=1 add caller
+     * pc/lr/time; guest-visible behavior is identical.
      */
     /*
-     * QY8_UNIMP_PC=N — показувати pc/lr/час для перших N доступів до КОЖНОЇ
-     * адреси (порожнє або 1 = один раз). Далі рядок звичайний, тож ціна
-     * розгортання стану платиться один раз на адресу, а не на кожен доступ.
+     * QY8_UNIMP_PC=N traces pc/lr/time for the first N accesses to EACH
+     * address (empty or 1 means once). Later lines use the normal format, so
+     * state-unwind cost is paid once per address, not on every access.
      */
     {
         const char *e = getenv("QY8_UNIMP_PC");
@@ -2624,9 +2612,9 @@ static void qy8_init(MachineState *machine)
         s->periph.trace_pc = e ? (atoi(e) > 0 ? atoi(e) : 1) : 0;
         /*
          * QY8_UNIMP_PC_ALL="0xffe80000-0xffe81000,0xfff18000-0xfff19000" —
-         * для цих ФІЗИЧНИХ діапазонів контекст пишеться на кожному доступі,
-         * скільки б їх не було. Так вивчають один конкретний блок, не
-         * платячи за розгортання стану на гарячих адресах решти периферії.
+         * Always include context for accesses in these PHYSICAL ranges,
+         * regardless of count. This allows focused tracing of one block
+         * without unwinding state for hot addresses in other peripherals.
          */
         while (r && *r && s->periph.nranges < QY8_PERIPH_RANGES) {
             char *end;
@@ -2915,15 +2903,15 @@ static void qy8_machine_instance_init(Object *obj)
         "optional directory for renderer frame and draw dumps");
 
     /*
-     * За замовчуванням 5 = "NORM(RES)>>" — звичайний бут із повним
-     * налагоджувальним виводом; на живій платі це те саме, що заземлити
-     * TEST_B1 (docs/16). Стокове значення непаяної плати — 7 (тихий бут).
+     * Default 5 = "NORM(RES)>>", normal boot with full debug output; on the
+     * real board this matches grounding TEST_B1. The stock value on an
+     * unmodified board is 7 (quiet boot).
      */
     s->du_spi = QY8_DU_SPI;
     object_property_add_uint32_ptr(obj, "du-spi", &s->du_spi,
                                    OBJ_PROP_FLAG_READWRITE);
     object_property_set_description(obj, "du-spi",
-        "номер лінії GIC (SPI) для кадрового переривання DU");
+        "GIC line number (SPI) for the DU frame interrupt");
 
     /*
      * DU dot clock. 33333333 Hz is an assumed reference clock, not a
@@ -2934,7 +2922,7 @@ static void qy8_machine_instance_init(Object *obj)
     object_property_add_uint32_ptr(obj, "du-dotclk", &s->du_dotclk,
                                    OBJ_PROP_FLAG_READWRITE);
     object_property_set_description(obj, "du-dotclk",
-        "точкова частота DU в Гц (0 = кадровий такт вимкнено)");
+        "DU dot clock frequency in Hz (0 = frame clock disabled)");
 
     object_property_add_bool(obj, "reverse", qy8_reverse_get,
                              qy8_reverse_set);
@@ -2952,28 +2940,28 @@ static void qy8_machine_instance_init(Object *obj)
     object_property_add_uint8_ptr(obj, "dipsw", &s->dipsw,
                                   OBJ_PROP_FLAG_READWRITE);
     object_property_set_description(obj, "dipsw",
-        "режим буту з DIPSW контролера плати, 0..7 (5 = NORM(RES) з логом)");
+        "boot mode from board controller DIPSW, 0..7 (5 = NORM(RES) with log)");
 
     /*
-     * Супутній МК плати. Типово ввімкнений: на залізі він розпаяний, і без
-     * відповіді від нього ядро не проходить ініціалізацію лінку.
+     * Board companion MCU. Enabled by default because the chip is present on
+     * hardware and the kernel cannot initialize the link without its response.
      */
     s->micom_on = true;
     object_property_add_bool(obj, "micom", qy8_micom_get, qy8_micom_set);
     object_property_set_description(obj, "micom",
-        "вбудований супутній МК на SCIF4 (off — щоб причепити свій "
-        "відповідач через -serial)");
+        "built-in board companion MCU on SCIF4 (off to connect an external "
+        "responder through -serial)");
 
     /*
-     * МК панелі дисплея. Теж типово ввімкнений: на залізі він розпаяний, і
-     * без нього lcddrv не виставляє ACM-модуль 129.
+     * Display panel MCU. Enabled by default because it is present on hardware;
+     * without it, lcddrv does not signal ACM module 129.
      */
     s->dispmicom_on = true;
     object_property_add_bool(obj, "dispmicom", qy8_dispmicom_get,
                              qy8_dispmicom_set);
     object_property_set_description(obj, "dispmicom",
-        "вбудований МК панелі дисплея на SCIF1 (off — щоб причепити свій "
-        "відповідач через -serial)");
+        "built-in display panel MCU on SCIF1 (off to connect an external "
+        "responder through -serial)");
 
     s->gps_on = true;
     s->gps_lat = g_strdup("50.4501");
@@ -2999,14 +2987,14 @@ static void qy8_machine_instance_init(Object *obj)
     object_property_add_bool(obj, "i2c4-recorder", qy8_i2c4_recorder_get,
                              qy8_i2c4_recorder_set);
     object_property_set_description(obj, "i2c4-recorder",
-        "opt-in transaction recorder на I2C4 address 0x24");
+        "opt-in transaction recorder on I2C4 address 0x24");
 
     s->i2c_empty_on = false;
     object_property_add_bool(obj, "i2c-empty", qy8_i2c_empty_get,
                              qy8_i2c_empty_set);
     object_property_set_description(obj, "i2c-empty",
-        "opt-in діагностика: I2C0..I2C2 з порожньою шиною (NACK замість "
-        "3-секундного таймауту)");
+        "opt-in diagnostic mode: I2C0..I2C2 with empty buses (NACK instead "
+        "of a 3-second timeout)");
 
     s->tma460_on = true;
     object_property_add_bool(obj, "tma460", qy8_tma460_get,
@@ -3059,7 +3047,7 @@ static void qy8_machine_class_init(ObjectClass *oc, const void *data)
     mc->no_floppy = 1;
     mc->no_cdrom = 1;
     mc->no_parallel = 1;
-    /* RAM машина створює сама — за картою з OEMAddressTable */
+    /* Machine creates RAM itself, following the OEMAddressTable map. */
     mc->default_ram_id = NULL;
 }
 

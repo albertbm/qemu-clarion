@@ -1,54 +1,53 @@
 /*
- * Renesas SDHI — SD/MMC Host Interface (ядро TMIO) з R-Car Gen1 (R8A7778).
+ * Renesas SDHI, SD/MMC Host Interface (TMIO core) for R-Car Gen1 (R8A7778).
  *
- * На платі Clarion QY8XXX таких контролерів два:
+ * The Clarion QY8XXX board has two controllers:
  *
- *     0xFFE4C000  SDHI0  — передній слот, «Main Slot SD Card»  (DSK1)
- *     0xFFE4D000  SDHI1  — другий слот,  «Sub Slot SD Card»    (DSK11)
+ *     0xFFE4C000  SDHI0  - main slot, "Main Slot SD Card" (DSK1)
+ *     0xFFE4D000  SDHI1  - second slot, "Sub Slot SD Card" (DSK11)
  *
- * Імена слотів узято з реєстру самого пристрою
- * (SYSTEM\StorageManager\Profiles\SDProfile / SDProfile2), адреси — з
- * r8a7778.dtsi (mmc@ffe4c000, mmc@ffe4d000) і з живої траси QEMU, де до
- * них звертається `SDHC.dll` (vbase 0xefa20000).
+ * Slot names come from the device registry
+ * (SYSTEM\StorageManager\Profiles\SDProfile / SDProfile2); addresses come
+ * from r8a7778.dtsi (mmc@ffe4c000, mmc@ffe4d000) and live QEMU traces of
+ * `SDHC.dll` accesses (vbase 0xefa20000).
  *
- * --- Звідки взята семантика регістрів -------------------------------------
+ * --- Register semantics sources -----------------------------------------
  *
- * Не з даташита, а з коду драйвера `SDHC.dll` (дизасембльована секція 0,
- * VA 0xefa21000). Доведені точки:
+ * Derived from `SDHC.dll` (disassembled section 0, VA 0xefa21000), not a
+ * datasheet. Established points:
  *
  *   0xefa30dd4  WaitForSclkDivEn:  ldrh r3,[base+0x1e]; tst r3,#0x2000
- *               — дві спроби з паузою 1 мс, інакше помилка 0xFFFFFBB2
+ *               - retry twice with a 1 ms delay, otherwise error 0xFFFFFBB2
  *               (mvn r3,#0x400; eor r0,r3,#0x4d @0xefa30f54).
  *   0xefa30e20  Init: (rd16(0x20) & 0x0018) | 0x0305 -> 0x20,
  *               0x8b7f -> 0x22, 0xc007 -> 0x38, 0 -> 0xd8.
- *   0xefa30654  Reset: 0 -> 0xe0, пауза, 1 -> 0xe0.
- *   0xefa30f28  SetClock: після WaitForSclkDivEn править 0x24
- *               (біт 8 = SCLKEN, біти 7..0 = дільник; 0xFF = особливий).
- *   0xefa307f0  (rd16(0x28) & 0xFFF0) | TOP  — поле таймауту SD_OPTION;
- *   0xefa3081c  (rd16(0x28) & 0x00FF) | 0x8000 — ширина шини 1 біт.
- *   0xefa318d8  WaitEvent(mask32): опитує 0x1c (молодші 16) і 0x1e (старші
- *               16), знайдене гасить записом ~bits, причому в 0x1e завжди
- *               лишає 0x0800 — тобто цей біт апаратно завжди одиниця.
- *   0xefa31c00  Команда: 0x0a=лічильник блоків, 0x08=0x100 (SEC),
- *               0x26=довжина блоку, 0x04/0x06=аргумент, 0x00=SD_CMD
- *               (біти 5..0 індекс, 6 ACMD, 11 дані, 12 читання, 13 мульти).
- *   0xefa32340/0xefa32534  PIO через 0x30, по 16 бітів.
+ *   0xefa30654  Reset: 0 -> 0xe0, delay, 1 -> 0xe0.
+ *   0xefa30f28  SetClock: after WaitForSclkDivEn, updates 0x24
+ *               (bit 8 = SCLKEN, bits 7..0 = divider; 0xFF is special).
+ *   0xefa307f0  (rd16(0x28) & 0xFFF0) | TOP - SD_OPTION timeout field;
+ *   0xefa3081c  (rd16(0x28) & 0x00FF) | 0x8000 - 1-bit bus width.
+ *   0xefa318d8  WaitEvent(mask32): polls 0x1c (low 16) and 0x1e (high 16),
+ *               clears matched bits by writing ~bits, and always preserves
+ *               0x0800 in 0x1e, so this hardware bit is always set.
+ *   0xefa31c00  Command: 0x0a=block count, 0x08=0x100 (SEC), 0x26=block
+ *               length, 0x04/0x06=argument, 0x00=SD_CMD (bits 5..0 index,
+ *               6 ACMD, 11 data, 12 read, 13 multi).
+ *   0xefa32340/0xefa32534  PIO through 0x30, 16 bits at a time.
  *
- * --- Межа чесності --------------------------------------------------------
+ * --- Model scope ---------------------------------------------------------
  *
- * Контролер тут СПРАВЖНІЙ: він виконує команди через шину QEMU sd-bus, а не
- * підробляє успіх. Зокрема SD_INFO2.SCLKDIVEN не «завжди 1»: цей біт
- * виводиться зі стану контролера (немає незавершеної передачі), рівно як і
- * CMD_BUSY та DAT0. Порожній слот поводиться як порожній: команда не
- * отримує відповіді й контролер виставляє CMDTIMEOUT.
+ * This is a REAL controller model: commands use QEMU's sd-bus rather than
+ * faking success. SD_INFO2.SCLKDIVEN is not always 1; it follows controller
+ * state (no transfer in progress), as do CMD_BUSY and DAT0. An empty slot
+ * stays empty: commands receive no response and the controller sets CMDTIMEOUT.
  *
- * Reset-значення регістрів даташитом не підтверджені. Там, де драйвер
- * робить RMW, обрано безпечне значення, і це позначено біля масиву.
+ * Register reset values are not confirmed by a datasheet. Safe values are
+ * used where the driver performs RMW and are documented by the register array.
  *
- * Лінія переривання виведена з моделі, але плата її поки НЕ під'єднує:
- * номер GIC SPI для SDHI не встановлено жодним доказом, а помилкова лінія
- * дала б шторм. Драйвер це переживає — свою основну гілку очікування
- * (0xefa318d8, режим 1) він крутить опитуванням зі Sleep(10).
+ * The model exposes an interrupt line, but the board does NOT connect it yet:
+ * no evidence establishes the SDHI GIC SPI, and a wrong line could cause an
+ * interrupt storm. The driver tolerates this: its main wait path
+ * (0xefa318d8, mode 1) polls with Sleep(10).
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -73,7 +72,7 @@ DECLARE_INSTANCE_CHECKER(SDBus, RENESAS_SDHI_BUS, TYPE_RENESAS_SDHI_BUS)
 
 OBJECT_DECLARE_SIMPLE_TYPE(RenesasSDHIState, RENESAS_SDHI)
 
-/* --- регістри (16-бітні, як у TMIO) ----------------------------------- */
+/* --- registers (16-bit, as in TMIO) ----------------------------------- */
 
 #define SD_CMD              0x00
 #define SD_PORTSEL          0x02
@@ -81,7 +80,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(RenesasSDHIState, RENESAS_SDHI)
 #define SD_ARG1             0x06
 #define SD_STOP             0x08
 #define SD_SECCNT           0x0a
-#define SD_RSP0             0x0c    /* 0x0c..0x1a — вісім слів відповіді */
+#define SD_RSP0             0x0c    /* 0x0c..0x1a: eight response words */
 #define SD_RSP7             0x1a
 #define SD_INFO1            0x1c
 #define SD_INFO2            0x1e
@@ -116,16 +115,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(RenesasSDHIState, RENESAS_SDHI)
 #define STOP_STP            0x0001
 #define STOP_SEC            0x0100
 
-/* SD_INFO1 — біти, що гасяться записом нуля */
+/* SD_INFO1: bits cleared by writing zero */
 #define INFO1_RESPEND       0x0001
 #define INFO1_ACCEND        0x0004
 #define INFO1_REMOVE        0x0008
 #define INFO1_INSERT        0x0010
-#define INFO1_SIGSTATE      0x0020      /* рівень лінії CD, не подія */
+#define INFO1_SIGSTATE      0x0020      /* CD line level, not an event */
 #define INFO1_WRPROTECT     0x0080      /* set = writes allowed (TMIO) */
 #define INFO1_REMOVE_A      0x0100
 #define INFO1_INSERT_A      0x0200
-#define INFO1_SIGSTATE_A    0x0400      /* рівень, не подія */
+#define INFO1_SIGSTATE_A    0x0400      /* level, not an event */
 
 #define INFO1_W0C   (INFO1_RESPEND | INFO1_ACCEND | INFO1_REMOVE | \
                      INFO1_INSERT | INFO1_REMOVE_A | INFO1_INSERT_A)
@@ -139,11 +138,11 @@ OBJECT_DECLARE_SIMPLE_TYPE(RenesasSDHIState, RENESAS_SDHI)
 #define INFO2_RXOVERFLOW    0x0010
 #define INFO2_TXUNDERRUN    0x0020
 #define INFO2_CMDTIMEOUT    0x0040
-#define INFO2_DAT0          0x0080      /* рівень DAT0: 1 = картка вільна */
+#define INFO2_DAT0          0x0080      /* DAT0 level: 1 = card is idle */
 #define INFO2_RXRDY         0x0100
 #define INFO2_TXRQ          0x0200
-#define INFO2_ALWAYS        0x0800      /* апаратно завжди 1 (див. вище) */
-#define INFO2_SCLKDIVEN     0x2000      /* дільник такту можна міняти */
+#define INFO2_ALWAYS        0x0800      /* always 1 in hardware (see above) */
+#define INFO2_SCLKDIVEN     0x2000      /* clock divider can be changed */
 #define INFO2_CMD_BUSY      0x4000
 #define INFO2_ILL_ACCESS    0x8000
 
@@ -154,19 +153,19 @@ OBJECT_DECLARE_SIMPLE_TYPE(RenesasSDHIState, RENESAS_SDHI)
 #define INFO2_W0C       (INFO2_ERRORS | INFO2_RXRDY | INFO2_TXRQ | \
                          INFO2_ILL_ACCESS)
 /*
- * Джерела переривання — лише події. DAT0, ALWAYS, SCLKDIVEN і CMD_BUSY це
- * рівні: вони ніколи не піднімають лінію, хоч драйвер і лишає їх
- * незамаскованими (SD_INFO2_MASK = 0x8b7f гасить біт 11, але не 13/14).
+ * Only events generate interrupts. DAT0, ALWAYS, SCLKDIVEN and CMD_BUSY are
+ * levels; they never raise the line even though the driver leaves them
+ * unmasked (SD_INFO2_MASK = 0x8b7f masks bit 11 but not 13/14).
  */
 #define INFO2_IRQ       INFO2_W0C
 
 /* SD_CLK_CTRL */
 #define CLK_SCLKEN          0x0100
 
-/* SD_SOFT_RST: біт 0 = 0 тримає контролер у скиданні */
+/* SD_SOFT_RST: bit 0 = 0 holds the controller in reset */
 #define SOFT_RST_RELEASE    0x0001
 
-/* CC_EXT_MODE: біт 1 = передача даних через DMA, а не через SD_BUF0 */
+/* CC_EXT_MODE: bit 1 selects DMA instead of SD_BUF0 data transfers */
 #define CC_EXT_DMASDRW      0x0002
 
 #define SDHI_MAX_BLOCK      0x800
@@ -189,7 +188,7 @@ struct RenesasSDHIState {
     int64_t wire_started_ns;
     int64_t wire_deadline_ns;
 
-    uint8_t unit;               /* номер контролера, лише для трас */
+    uint8_t unit;               /* controller number, for traces only */
 
     /*
      * CC_EXT_MODE.DMASDRW uses HPB-DMAC for both transfers. It reads
@@ -197,7 +196,7 @@ struct RenesasSDHIState {
      * Both directions use the same FIFO path as PIO.
      */
     DeviceState *dmac;
-    uint64_t dma_buf_addr;      /* фізична адреса власного SD_BUF0 */
+    uint64_t dma_buf_addr;      /* physical address of this controller's SD_BUF0 */
     char *read_log_path;
     uint32_t read_sector;
     uint32_t read_index;
@@ -212,15 +211,15 @@ struct RenesasSDHIState {
     uint16_t sdio_mode, sdio_info1, sdio_info1_mask;
     uint16_t cc_ext_mode, soft_rst, host_mode, sdif_mode;
 
-    /* стан передачі даних (PIO через SD_BUF0) */
+    /* data transfer state (PIO through SD_BUF0) */
     uint8_t  buf[SDHI_MAX_BLOCK];
-    uint32_t blen;              /* довжина блоку, байтів */
-    uint32_t pos;               /* скільки байтів блоку вже пройшло */
-    uint32_t blocks;            /* скільки блоків лишилося, разом із цим */
+    uint32_t blen;              /* block length in bytes */
+    uint32_t pos;               /* bytes transferred in current block */
+    uint32_t blocks;            /* blocks remaining, including current */
     bool     reading, writing;
 };
 
-/* --- допоміжне -------------------------------------------------------- */
+/* --- helpers ----------------------------------------------------------- */
 
 static bool sdhi_idle(RenesasSDHIState *s)
 {
@@ -232,7 +231,7 @@ static bool sdhi_card_present(RenesasSDHIState *s)
     return sdbus_get_inserted(&s->sdbus);
 }
 
-/* SD_INFO1 з доданими рівнями ліній */
+/* SD_INFO1 with line levels added */
 static uint16_t sdhi_info1_live(RenesasSDHIState *s)
 {
     uint16_t v = s->info1 & INFO1_W0C;
@@ -246,15 +245,15 @@ static uint16_t sdhi_info1_live(RenesasSDHIState *s)
     return v;
 }
 
-/* SD_INFO2 з доданими рівнями */
+/* SD_INFO2 with levels added */
 static uint16_t sdhi_info2_live(RenesasSDHIState *s)
 {
     uint16_t v = (s->info2 & INFO2_W0C) | INFO2_ALWAYS;
 
     if (sdhi_idle(s)) {
         /*
-         * Незавершеної передачі немає — дільник такту можна міняти, шина
-         * не зайнята. Саме на цей біт чекає WaitForSclkDivEn.
+         * No transfer is in progress, so the clock divider can change and
+         * the bus is idle. WaitForSclkDivEn waits for this bit.
          */
         v |= INFO2_SCLKDIVEN;
         if (sdhi_card_present(s)) {
@@ -292,12 +291,12 @@ static void sdhi_abort_data(RenesasSDHIState *s)
     s->info2 &= ~(INFO2_RXRDY | INFO2_TXRQ);
 }
 
-/* --- команди ---------------------------------------------------------- */
+/* --- commands ---------------------------------------------------------- */
 
 /*
- * Драйвер майже завжди лишає RSPTP = 000 («автоматично»), тобто тип
- * відповіді визначає саме контролер за індексом команди. Тут — той самий
- * перелік команд без відповіді, що й у специфікації SD.
+ * The driver usually leaves RSPTP = 000 ("automatic"), so the controller
+ * selects response type from the command index. This is the SD specification's
+ * list of commands without a response.
  */
 static bool sdhi_cmd_has_response(unsigned idx)
 {
@@ -369,7 +368,7 @@ static void sdhi_fill_block(RenesasSDHIState *s)
     if (ready) {
         sdbus_read_data(&s->sdbus, s->buf, s->blen);
     } else {
-        /* картка даних не дає — це обрив передачі, а не тиша */
+        /* Card stopped supplying data: transfer error, not silence. */
         s->info2 |= INFO2_DATATIMEOUT;
     }
 
@@ -409,12 +408,11 @@ static void sdhi_fill_block(RenesasSDHIState *s)
 }
 
 /*
- * Запит DMA від контролера: «в буфері просто зараз є що віддати».
+ * DMA request from the controller: "data is ready in the buffer now".
  *
- * Це саме запит, а не дозвіл: DMAC питає його перед кожною одиницею
- * передачі й читає SD_BUF0 рівно доти, доки він істинний. Тому модель не
- * тримає жодного лічильника поза самим буфером і не може віддати байтів
- * більше, ніж картка справді дала.
+ * This is a request, not permission: DMAC queries it before each transfer
+ * unit and reads SD_BUF0 only while it is true. The model needs no separate
+ * counter and cannot return more bytes than the card supplied.
  */
 static bool sdhi_dma_ready(void *opaque)
 {
@@ -451,7 +449,7 @@ static void sdhi_start_data(RenesasSDHIState *s)
 {
     s->blen = s->size ? s->size : 512;
     if (s->blen > SDHI_MAX_BLOCK) {
-        qemu_log_mask(LOG_GUEST_ERROR, "renesas-sdhi: довжина блоку %u > %u\n",
+        qemu_log_mask(LOG_GUEST_ERROR, "renesas-sdhi: block length %u > %u\n",
                       s->blen, SDHI_MAX_BLOCK);
         s->blen = SDHI_MAX_BLOCK;
     }
@@ -463,13 +461,13 @@ static void sdhi_start_data(RenesasSDHIState *s)
 
     if ((s->cc_ext_mode & CC_EXT_DMASDRW) && !s->dmac) {
         /*
-         * DMA просять, а контролера DMA нам не під'єднали (машина без
-         * HPB-DMAC або властивість не задано). Мовчки вдавати успіх не
-         * можна: даних ніхто не перенесе. Драйвер свій PIO-шлях
-         * (0xefa32340) має завжди, тож далі йдемо ним.
+         * DMA was requested, but no DMA controller is connected (machine
+         * lacks HPB-DMAC or its property is unset). Do not silently fake
+         * success: no one would transfer the data. The driver always has a
+         * PIO path (0xefa32340), so continue through it.
          */
-        qemu_log_mask(LOG_UNIMP, "renesas-sdhi: передачу через DMA просять, "
-                      "але DMAC не під'єднано (CC_EXT_MODE=%#x)\n",
+        qemu_log_mask(LOG_UNIMP, "renesas-sdhi: DMA transfer requested, but "
+                      "no DMAC is connected (CC_EXT_MODE=%#x)\n",
                       s->cc_ext_mode);
     }
 
@@ -488,11 +486,10 @@ static void sdhi_start_data(RenesasSDHIState *s)
             sdhi_fill_block(s);
         }
         /*
-         * Блок уже в буфері, а канал DMAC на цій платі озброюють ПІСЛЯ
-         * команди (траса: DCR/DSAR/DDAR/DTCR -> CMD17 -> DCMDR.DMEN).
-         * Тож штовхаємо DMAC і на випадок зворотного порядку: якщо канал
-         * уже озброєно, він забере блок тут і зараз, якщо ні — забере на
-         * DMEN, спитавши sdhi_dma_ready().
+         * The block is buffered, but this board arms DMAC AFTER the command
+         * (trace: DCR/DSAR/DDAR/DTCR -> CMD17 -> DCMDR.DMEN). Kick DMAC for
+         * either order: an already armed channel consumes the block now;
+         * otherwise it will do so on DMEN after querying sdhi_dma_ready().
          */
         if (sdhi_dma_ready(s)) {
             clarion_hpbdma_module_poke(s->dmac, s->dma_buf_addr);
@@ -517,7 +514,7 @@ static void sdhi_execute_command(RenesasSDHIState *s)
 
     if (!(s->soft_rst & SOFT_RST_RELEASE)) {
         qemu_log_mask(LOG_GUEST_ERROR,
-                      "renesas-sdhi: CMD%u під час скидання\n", idx);
+                      "renesas-sdhi: CMD%u while in reset\n", idx);
         return;
     }
 
@@ -541,7 +538,7 @@ static void sdhi_execute_command(RenesasSDHIState *s)
                sdhi_cmd_has_response(idx);
 
     if (!sdhi_card_present(s)) {
-        /* порожній слот: на шині нікому відповідати */
+        /* Empty slot: no card is present to respond on the bus. */
         if (want_rsp) {
             s->info2 |= INFO2_CMDTIMEOUT;
         } else {
@@ -607,7 +604,7 @@ static void sdhi_send_command(RenesasSDHIState *s)
     sdhi_wire_wait(s, 1, 48 + response_bits, false);
 }
 
-/* --- порт даних ------------------------------------------------------- */
+/* --- data port --------------------------------------------------------- */
 
 static void sdhi_block_done(RenesasSDHIState *s)
 {
@@ -771,8 +768,8 @@ static uint64_t sdhi_read(void *opaque, hwaddr addr, unsigned size)
     case SD_HOST_MODE:      v = s->host_mode;       break;
     case SD_SDIF_MODE:      v = s->sdif_mode;       break;
     default:
-        qemu_log_mask(LOG_UNIMP, "renesas-sdhi: читання невідомого "
-                      "регістра +%#" HWADDR_PRIx "\n", addr);
+        qemu_log_mask(LOG_UNIMP, "renesas-sdhi: read from unknown "
+                      "register +%#" HWADDR_PRIx "\n", addr);
         v = 0;
         break;
     }
@@ -802,14 +799,14 @@ static void sdhi_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     case SD_STOP:
         s->stop = val;
         if (val & STOP_STP) {
-            /* примусова зупинка передачі */
+            /* force-stop transfer */
             sdhi_abort_data(s);
             sdhi_update_irq(s);
         }
         break;
     case SD_SECCNT:         s->seccnt = val;    break;
     case SD_INFO1:
-        /* запис нуля гасить біт, запис одиниці лишає як є */
+        /* writing zero clears the bit; writing one leaves it unchanged */
         s->info1 &= (val | ~INFO1_W0C);
         sdhi_update_irq(s);
         break;
@@ -859,7 +856,7 @@ static void sdhi_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     case SD_SOFT_RST:
         s->soft_rst = val;
         if (!(val & SOFT_RST_RELEASE)) {
-            /* контролер у скиданні: стан передачі й події зникають */
+            /* controller reset clears transfer state and events */
             sdhi_abort_data(s);
             s->info1 = 0;
             s->info2 = 0;
@@ -872,11 +869,11 @@ static void sdhi_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     case SD_ERR_STS1:
     case SD_ERR_STS2:
     case SD_VERSION:
-        qemu_log_mask(LOG_GUEST_ERROR, "renesas-sdhi: запис у регістр лише "
-                      "для читання +%#" HWADDR_PRIx "\n", addr);
+        qemu_log_mask(LOG_GUEST_ERROR, "renesas-sdhi: write to read-only "
+                      "register +%#" HWADDR_PRIx "\n", addr);
         break;
     default:
-        qemu_log_mask(LOG_UNIMP, "renesas-sdhi: запис у невідомий регістр "
+        qemu_log_mask(LOG_UNIMP, "renesas-sdhi: write to unknown register "
                       "+%#" HWADDR_PRIx " = %#" PRIx64 "\n", addr, val);
         break;
     }
@@ -887,9 +884,9 @@ static const MemoryRegionOps sdhi_ops = {
     .write = sdhi_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     /*
-     * Усі регістри 16-бітні, і драйвер ходить саме півсловами. Однобайтовий
-     * доступ приймаємо лише щоб випадкове звернення не дало помилку шини:
-     * QEMU складе його з нашого 16-бітного.
+     * All registers are 16-bit and the driver accesses them as halfwords.
+     * Accept byte accesses to avoid a bus error on accidental accesses;
+     * QEMU composes them from our 16-bit operations.
      */
     .valid.min_access_size = 1,
     .valid.max_access_size = 4,
@@ -897,7 +894,7 @@ static const MemoryRegionOps sdhi_ops = {
     .impl.max_access_size = 4,
 };
 
-/* --- зміна стану слота ------------------------------------------------ */
+/* --- slot state changes ------------------------------------------------ */
 
 static void sdhi_set_inserted(DeviceState *dev, bool inserted)
 {
@@ -945,18 +942,18 @@ static void sdhi_reset_hold(Object *obj, ResetType type)
     s->info1 = 0;
     s->info2 = 0;
     /*
-     * ⚠ Reset-значення масок даташитом не підтверджені. Обрано «усе
-     * замасковано»: це єдиний варіант, що не може дати помилкового
-     * переривання до того, як драйвер налаштує контролер. Драйвер усе одно
-     * приходить до свого значення: (0xffff & 0x0018) | 0x0305 = 0x031d
-     * (0xefa30e38), а SD_INFO2_MASK він пише цілим словом 0x8b7f.
+     * ⚠ Reset values for masks are not confirmed by a datasheet. Start with
+     * everything masked, the only choice that prevents spurious interrupts
+     * before driver setup. The driver later writes its expected value:
+     * (0xffff & 0x0018) | 0x0305 = 0x031d (0xefa30e38), and writes the full
+     * SD_INFO2_MASK word 0x8b7f.
      */
     s->info1_mask = 0xffff;
     s->info2_mask = 0xffff;
     /*
-     * ⚠ Так само невідомі reset-значення SD_CLK_CTRL, SD_OPTION і SD_SIZE.
-     * Нулі тут — не відтворення стану після подачі живлення; драйвер
-     * програмує всі три поля до першої передачі.
+     * ⚠ Reset values for SD_CLK_CTRL, SD_OPTION and SD_SIZE are also unknown.
+     * Zeros here do not reproduce power-on state; the driver programs all
+     * three fields before the first transfer.
      */
     s->clk_ctrl = 0;
     s->size = 0;
@@ -1050,13 +1047,13 @@ static void sdhi_realize(DeviceState *dev, Error **errp)
 
     if (s->dmac) {
         if (!s->dma_buf_addr) {
-            error_setg(errp, "renesas-sdhi: разом із dmac треба задати "
-                             "dma-buf-addr (фізична адреса SD_BUF0)");
+            error_setg(errp, "renesas-sdhi: dma-buf-addr (physical SD_BUF0 "
+                             "address) is required with dmac");
             return;
         }
         /*
-         * Реєструємо себе як модуль із власним буфером: DMAC питатиме
-         * sdhi_dma_ready() і сам читатиме SD_BUF0 за цією адресою.
+         * Register as a buffered module: DMAC queries sdhi_dma_ready() and
+         * reads SD_BUF0 at this address.
          */
         clarion_hpbdma_module_attach(s->dmac, s->dma_buf_addr,
                                      sdhi_dma_ready, s);
@@ -1067,8 +1064,8 @@ static const Property sdhi_properties[] = {
     DEFINE_PROP_UINT32("input-clock-hz", RenesasSDHIState, input_clock_hz, 0),
     DEFINE_PROP_UINT8("unit", RenesasSDHIState, unit, 0),
     /*
-     * Контролер DMA плати і фізична адреса власного SD_BUF0. Обидві
-     * необов'язкові: без них модель працює як раніше, лише через PIO.
+     * Board DMA controller and physical address of this SDHI's SD_BUF0.
+     * Both are optional; without them, the model uses PIO as before.
      */
     DEFINE_PROP_LINK("dmac", RenesasSDHIState, dmac, TYPE_DEVICE,
                      DeviceState *),

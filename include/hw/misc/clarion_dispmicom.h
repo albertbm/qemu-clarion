@@ -1,8 +1,8 @@
 /*
- * Display Micom — мікроконтролер панелі Clarion QY8XXX, лінк по SCIF1.
+ * Display Micom, the Clarion QY8XXX panel microcontroller, linked over SCIF1.
  *
- * Окремий вузол від супутнього МК плати (clarion_micom, SCIF4): інший дріт,
- * інший протокол, інший драйвер у гості (lcddrv.dll проти EdaDrv.dll).
+ * Separate from the board's companion MCU (clarion_micom, SCIF4): different
+ * link, protocol, and guest driver (lcddrv.dll vs. EdaDrv.dll).
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -16,9 +16,9 @@
 OBJECT_DECLARE_SIMPLE_TYPE(ClarionDispMicomState, CLARION_DISPMICOM)
 
 /*
- * Куди панель віддає байти. Повертає, скільки ПРИЙНЯТО: FIFO приймача SCIF
- * має 16 байтів, а кадр 0x24 разом з обгорткою — 20, тож решту модель
- * досилає, коли драйвер вичитає попереднє.
+ * Deliver bytes from the panel. Returns the number ACCEPTED: the SCIF RX FIFO
+ * holds 16 bytes, while a 0x24-byte frame plus its wrapper is 20, so the model
+ * sends the remainder after the driver drains the FIFO.
  */
 typedef int (*ClarionDispMicomSink)(void *opaque, const uint8_t *buf, int len);
 typedef void (*ClarionDispMicomCanKey)(void *opaque, uint8_t code, bool down);
@@ -29,7 +29,7 @@ void clarion_dispmicom_set_can_key_sink(DeviceState *dev,
                                         ClarionDispMicomCanKey fn,
                                         void *opaque);
 
-/* Байт від гостя (запис у SCFTDR того SCIF, до якого під'єднано панель). */
+/* Byte from the guest (write to SCFTDR of the SCIF connected to the panel). */
 void clarion_dispmicom_rx_byte(DeviceState *dev, uint8_t b);
 
 #endif

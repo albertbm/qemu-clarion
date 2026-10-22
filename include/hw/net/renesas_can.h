@@ -1,5 +1,5 @@
 /*
- * Renesas CAN controller (R-Car Gen1 / R8A7778) — модель для плати Clarion QY8.
+ * Renesas CAN controller (R-Car Gen1 / R8A7778) model for the Clarion QY8 board.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -9,9 +9,9 @@
 #define TYPE_RENESAS_CAN "renesas-can"
 
 /*
- * Вікно блока. Найбільша адреса, яку чіпає `CAN.dll`, — +0x858; у мапі
- * Linux (`struct rcar_can_regs`) останній регістр — MBSMR за +0x863.
- * Беремо круглу сторінку.
+ * Block window. The highest address accessed by `CAN.dll` is +0x858; in the
+ * Linux map (`struct rcar_can_regs`), the last register is MBSMR at +0x863.
+ * Use one aligned page.
  */
 #define RENESAS_CAN_SIZE 0x1000
 

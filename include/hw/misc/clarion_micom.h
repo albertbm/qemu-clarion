@@ -1,5 +1,5 @@
 /*
- * Micom — супутній мікроконтролер плати Clarion QY8XXX, лінк по SCIF4.
+ * Micom, the Clarion QY8XXX board's companion microcontroller, linked over SCIF4.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -13,17 +13,17 @@
 OBJECT_DECLARE_SIMPLE_TYPE(ClarionMicomState, CLARION_MICOM)
 
 /*
- * Куди micom віддає байти. Повертає, скільки з них ПРИЙНЯТО: приймач SCIF
- * має FIFO на 16 байтів, і довгий кадр (набір команд — 62 байти даних) не
- * влазить у нього цілком. Решту micom тримає в себе й досилає, коли DMA
- * звільнить місце — так само, як стримував би реальний лінк.
+ * Deliver bytes from the micom. Returns the number ACCEPTED: the SCIF RX FIFO
+ * holds 16 bytes, so a long frame (a command set has 62 data bytes) will not
+ * fit at once. The micom retains and sends the remainder when DMA frees space,
+ * as a real link would.
  */
 typedef int (*ClarionMicomSink)(void *opaque, const uint8_t *buf, int len);
 
 void clarion_micom_set_sink(DeviceState *dev, ClarionMicomSink fn,
                             void *opaque);
 
-/* Байт від гостя (запис у SCFTDR того SCIF, до якого під'єднано micom). */
+/* Byte from the guest (write to SCFTDR of the SCIF connected to the micom). */
 void clarion_micom_rx_byte(DeviceState *dev, uint8_t b);
 
 #endif

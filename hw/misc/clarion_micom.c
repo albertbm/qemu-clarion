@@ -1,39 +1,38 @@
 /*
- * Micom — супутній мікроконтролер плати Clarion QY8XXX.
+ * Micom, the Clarion QY8XXX board's companion microcontroller.
  *
- * На живій платі це окрема мікросхема, під'єднана до SCIF4 головного SoC.
- * Без відповіді від неї ядро WinCE не проходить ініціалізацію: диспетчер
- * пристроїв стоїть на лінку, і бут не доходить до GWES.
+ * On the real board this is a separate chip connected to the main SoC over
+ * SCIF4. Without its response, the WinCE kernel cannot initialize: the device
+ * manager waits on the link and boot does not reach GWES.
  *
- * Формат кадру знято з коду EdaDrv.dll (побудовник @0xef78f164), а не з
- * документації:
+ * The frame format was derived from EdaDrv.dll (builder @0xef78f164), not
+ * from documentation:
  *
- *     10 02 | LEN DATA... (стафінг: 10 -> 10 10) | 10 03 | BCC
- *     BCC = XOR усіх байтів після DLE STX, разом із хвостовими 10 03
- *     (цикл eor/uxtb @0xef78ee58)
+ *     10 02 | LEN DATA... (stuffing: 10 -> 10 10) | 10 03 | BCC
+ *     BCC = XOR of all bytes after DLE STX, including trailing 10 03
+ *     (eor/uxtb loop @0xef78ee58)
  *
- * Перевірка на кадрі самого ядра: 10 02 02 08 00 10 03 19,
+ * Verified against a frame from the kernel itself: 10 02 02 08 00 10 03 19,
  * XOR(02 08 00 10 03) = 0x19 ✔
  *
- * Розбір прийнятого кадру (клас-аксесор vtable @0xef783490): SetFrame
- * @0xef78e96c вимагає len(кадр) - 6 == кадр[2], кладе LEN у obj[0x18], а
- * DATA — у obj[0x1c]. Диспетчер @0xef78baa4 бере DATA[0] як код команди,
- * обробник 0x08 @0xef78bb04 — DATA[1] як підкод.
+ * Received-frame parsing (class accessor vtable @0xef783490): SetFrame
+ * @0xef78e96c requires len(frame) - 6 == frame[2], stores LEN in obj[0x18]
+ * and DATA in obj[0x1c]. Dispatcher @0xef78baa4 uses DATA[0] as the command
+ * code; handler 0x08 @0xef78bb04 uses DATA[1] as the subcode.
  *
- * Автомат рукостискання (docs/20-qemu-board.md, розділ «M3b-3»):
+ * Handshake sequence:
  *
- *     HU  -> 08 00              скидання (SendCmd08(0) @0xef78b528)  стан 1
- *     HU  <- 08 01              micom живий                          стан 2
- *     HU  <- 08 0a <коди>       набір команд micom                   стан 3
- *     HU  -> 08 0b              набір прийнято
+ *     HU  -> 08 00              reset (SendCmd08(0) @0xef78b528)  state 1
+ *     HU  <- 08 01              micom alive                       state 2
+ *     HU  <- 08 0a <codes>      micom command set                 state 3
+ *     HU  -> 08 0b              command set accepted
  *
- * ⚠ Межа чесності. Тут відтворено рівно те, що доведене кодом EdaDrv.dll:
- * кадрування, контрольна сума, автомат 1->2->3 і дві команди сімейства
- * 0x60, розібрані в тому ж джерелі. Усе інше отримує лише квитанцію
- * «<код> 00» — як і в tools/qy8_micom.py, з якого цю модель портовано.
- * Нерозібрані команди свідомо НЕ вигадуються: щоб експериментувати з ними,
- * micom вимикається (-M clarion-qy8,micom=off) і до SCIF4 чіпляється той
- * самий Python-відповідач через -serial.
+ * ⚠ Model scope: this implements only behavior established from EdaDrv.dll:
+ * framing, checksum, the 1->2->3 state machine, and two commands in the 0x60
+ * family decoded in the same source. Other commands receive only an ACK
+ * containing "<code> 00", as in the original host-side responder. Undecoded
+ * commands are deliberately not invented. To experiment with them, disable
+ * the micom (-M clarion-qy8,micom=off) and connect a serial responder to SCIF4.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -54,21 +53,21 @@
 #define MICOM_MAX_DATA      256
 
 /*
- * Пауза між кадрами. У Python-відповідачі це 50 мс хостового часу; тут —
- * віртуального, тому бут перестає залежати від завантаження машини.
- * Причина самої паузи та сама: приймач SCIF має FIFO на 16 байтів, і
- * драйвер мусить устигнути підтвердити попередній кадр.
+ * Gap between frames. The host-side responder uses 50 ms of wall time; here
+ * it is virtual time, so boot no longer depends on host load. The gap is still
+ * needed because the SCIF receiver has a 16-byte FIFO and the driver must ACK
+ * the previous frame before the next one arrives.
  */
 #define MICOM_GAP_NS        (50 * 1000 * 1000)
-/* Доливання решти довгого кадру, поки DMA звільняє FIFO. */
+/* Refill the remainder of a long frame as DMA frees the FIFO. */
 #define MICOM_FILL_NS       (1 * 1000 * 1000)
 
 typedef enum {
-    RX_IDLE,            /* чекаємо DLE */
-    RX_DLE,             /* бачили DLE поза кадром */
-    RX_BODY,            /* усередині кадру */
-    RX_BODY_DLE,        /* усередині кадру, бачили DLE */
-    RX_BCC,             /* наступний байт — контрольна сума */
+    RX_IDLE,            /* waiting for DLE */
+    RX_DLE,             /* saw DLE outside a frame */
+    RX_BODY,            /* inside a frame */
+    RX_BODY_DLE,        /* inside a frame, saw DLE */
+    RX_BCC,             /* next byte is the checksum */
 } MicomRxState;
 
 struct ClarionMicomState {
@@ -78,16 +77,16 @@ struct ClarionMicomState {
     void *sink_opaque;
 
     QEMUTimer *tx;
-    GQueue *frames;             /* черга GByteArray * — готові кадри */
-    GByteArray *cur;            /* кадр, який зараз віддаємо */
-    unsigned cur_off;           /* скільки з нього вже прийнято */
+    GQueue *frames;             /* queue of ready GByteArray * frames */
+    GByteArray *cur;            /* frame currently being delivered */
+    unsigned cur_off;           /* number of bytes already accepted */
 
     MicomRxState rx_state;
     uint8_t body[MICOM_MAX_DATA + 2];
     unsigned body_len;
     uint8_t bcc;
 
-    bool handshake_done;        /* бачили 08 0b від ядра */
+    bool handshake_done;        /* saw 08 0b from the kernel */
     bool cenet_audio_off;
     bool cenet_antitheft_release;
     bool cenet_antitheft_release_sent;
@@ -96,7 +95,7 @@ struct ClarionMicomState {
     uint8_t generic_reply_subcode;
 };
 
-/* --- побудова кадру ---------------------------------------------------- */
+/* --- frame construction ------------------------------------------------ */
 
 static GByteArray *micom_build(const uint8_t *data, unsigned len)
 {
@@ -107,7 +106,7 @@ static GByteArray *micom_build(const uint8_t *data, unsigned len)
     b = DLE; g_byte_array_append(f, &b, 1);
     b = STX; g_byte_array_append(f, &b, 1);
 
-    /* тіло = LEN + DATA, зі стафінгом DLE; BCC рахується по стафнутих байтах */
+    /* Body = LEN + DATA with DLE stuffing; BCC covers the stuffed bytes. */
     for (i = 0; i <= len; i++) {
         uint8_t v = (i == 0) ? (uint8_t)len : data[i - 1];
 
@@ -143,13 +142,13 @@ static void micom_queue_raw2(ClarionMicomState *s, uint8_t a, uint8_t b)
 
     g_byte_array_append(f, &a, 1);
     g_byte_array_append(f, &b, 1);
-    g_queue_push_head(s->frames, f);        /* квитанція йде поперед черги */
+    g_queue_push_head(s->frames, f);        /* ACK precedes queued frames */
     if (!s->cur) {
         micom_arm(s, MICOM_FILL_NS);
     }
 }
 
-/* --- віддавання байтів у SCIF ------------------------------------------ */
+/* --- deliver bytes to SCIF --------------------------------------------- */
 
 static void micom_tx_expire(void *opaque)
 {
@@ -176,20 +175,20 @@ static void micom_tx_expire(void *opaque)
         s->cur = NULL;
         s->cur_off = 0;
         if (!g_queue_is_empty(s->frames)) {
-            micom_arm(s, MICOM_GAP_NS);     /* пауза між кадрами */
+            micom_arm(s, MICOM_GAP_NS);     /* inter-frame gap */
         }
     } else {
-        micom_arm(s, MICOM_FILL_NS);        /* FIFO повний — доллємо згодом */
+        micom_arm(s, MICOM_FILL_NS);        /* FIFO full; refill later */
     }
 }
 
-/* --- обробка кадру від ядра -------------------------------------------- */
+/* --- process a frame from the kernel ----------------------------------- */
 
 /*
- * Набір команд, який micom оголошує кадром 08 0a. Перший байт списку — сам
- * підкод 0x0a: RegisterSupported @0xef78bc2c бере DATA+1 завдовжки N-1,
- * тож прапорець 0x0a виставляється заодно. Байт 0xff у списку — ознака
- * помилки, після нього розбір припиняється, тому список іде 0x01..0x3e.
+ * Command set announced by micom in frame 08 0a. The first list byte is the
+ * subcode 0x0a itself: RegisterSupported @0xef78bc2c reads DATA+1 for N-1
+ * bytes, so the 0x0a flag is set as well. Byte 0xff marks an error and stops
+ * parsing, so the list uses values 0x01..0x3e.
  */
 static void micom_send_cmd_set(ClarionMicomState *s)
 {
@@ -204,11 +203,11 @@ static void micom_send_cmd_set(ClarionMicomState *s)
     micom_queue(s, data, 2 + 0x3e);
 }
 
-/* CEdaCtl init @0xef787888: підписка на async-сімейство 0x3a, відповіді не
- * потребує (sender не створює waiter). */
+/* CEdaCtl init @0xef787888: subscribes to async family 0x3a; no response
+ * is required (the sender creates no waiter). */
 static const uint8_t cmd_60_3a[] = { 0x60, 0x0d, 0x3a, 0, 0, 0, 0xe3 };
-/* CEdaCtl init @0xef787930: RX-handler @0xef789ec0 вимагає DATA[0] = 0x10,
- * DATA[1] = 0x3f, статус у DATA[5]; 0 = успіх. */
+/* CEdaCtl init @0xef787930: RX handler @0xef789ec0 requires DATA[0] = 0x10,
+ * DATA[1] = 0x3f, with status in DATA[5]; 0 means success. */
 static const uint8_t cmd_60_3f[] = { 0x60, 0x0d, 0x3f, 0, 0, 0, 0x01 };
 static const uint8_t rsp_10_3f[] = { 0x10, 0x3f, 0, 0, 0, 0 };
 
@@ -259,10 +258,10 @@ static void micom_frame(ClarionMicomState *s)
     const char *action = "ack-only";
 
     if (s->body_len && s->body[0] != len) {
-        qemu_log_mask(LOG_GUEST_ERROR, "clarion-micom: LEN %u не збігається з "
-                      "довжиною DATA %u\n", s->body[0], len);
+        qemu_log_mask(LOG_GUEST_ERROR, "clarion-micom: LEN %u does not match "
+                      "DATA length %u\n", s->body[0], len);
     }
-    /* На кожен кадр — DLE ACK, як у живому лінку. */
+    /* Send a DLE ACK for every frame, as on the real link. */
     ack[0] = DLE;
     ack[1] = ACK;
     micom_queue_raw2(s, ack[0], ack[1]);
@@ -273,14 +272,14 @@ static void micom_frame(ClarionMicomState *s)
     cmd = data[0];
     sub = (len > 1) ? data[1] : 0;
 
-    if (cmd == 0x08 && sub == 0x00) {           /* скидання -> стан 2, 3 */
+    if (cmd == 0x08 && sub == 0x00) {           /* reset -> states 2, 3 */
         const uint8_t alive[] = { 0x08, 0x01 };
 
         action = "alive+command-set";
         s->handshake_done = false;
         micom_queue(s, alive, sizeof(alive));
         micom_send_cmd_set(s);
-    } else if (cmd == 0x08 && sub == 0x0b) {    /* набір прийнято */
+    } else if (cmd == 0x08 && sub == 0x0b) {    /* command set accepted */
         s->handshake_done = true;
         s->handshake_count++;
         if (s->cenet_audio_off) {
@@ -298,7 +297,7 @@ static void micom_frame(ClarionMicomState *s)
         }
     } else if (len == sizeof(cmd_60_3a) &&
                !memcmp(data, cmd_60_3a, sizeof(cmd_60_3a))) {
-        /* відповіді не потребує */
+        /* no response required */
         action = "ack-only-async";
     } else if (len == sizeof(cmd_60_3f) &&
                !memcmp(data, cmd_60_3f, sizeof(cmd_60_3f))) {
@@ -330,7 +329,7 @@ static void micom_frame(ClarionMicomState *s)
     }
 }
 
-/* --- розбір потоку від ядра -------------------------------------------- */
+/* --- parse the stream from the kernel --------------------------------- */
 
 void clarion_micom_rx_byte(DeviceState *dev, uint8_t b)
 {
@@ -349,9 +348,9 @@ void clarion_micom_rx_byte(DeviceState *dev, uint8_t b)
             s->bcc = 0;
             s->rx_state = RX_BODY;
         } else if (b == DLE) {
-            s->rx_state = RX_DLE;           /* 10 10 поза кадром — тримаємось */
+            s->rx_state = RX_DLE;           /* 10 10 outside a frame; stay */
         } else {
-            /* DLE ACK / DLE NAK від ядра — підтвердження наших кадрів */
+            /* DLE ACK / DLE NAK from the kernel acknowledge our frames */
             s->rx_state = RX_IDLE;
         }
         break;
@@ -367,7 +366,7 @@ void clarion_micom_rx_byte(DeviceState *dev, uint8_t b)
 
     case RX_BODY_DLE:
         s->bcc ^= b;
-        if (b == DLE) {                     /* стафінг: один літеральний 0x10 */
+        if (b == DLE) {                     /* stuffed literal 0x10 */
             if (s->body_len < sizeof(s->body)) {
                 s->body[s->body_len++] = DLE;
             }
@@ -375,14 +374,14 @@ void clarion_micom_rx_byte(DeviceState *dev, uint8_t b)
         } else if (b == ETX) {
             s->rx_state = RX_BCC;
         } else {
-            s->rx_state = RX_IDLE;          /* поламаний кадр — кидаємо */
+            s->rx_state = RX_IDLE;          /* malformed frame; discard */
         }
         break;
 
     case RX_BCC:
         if (b != s->bcc) {
-            qemu_log_mask(LOG_GUEST_ERROR, "clarion-micom: BCC %#x, чекали "
-                          "%#x — кадр усе одно обробляємо\n", b, s->bcc);
+            qemu_log_mask(LOG_GUEST_ERROR, "clarion-micom: BCC %#x, expected "
+                          "%#x; processing frame anyway\n", b, s->bcc);
         }
         micom_frame(s);
         s->rx_state = RX_IDLE;

@@ -1,40 +1,38 @@
 /*
  * Renesas R-Car Display Unit (Gen1, R8A7778/R8A7779) —
- * модель для плати Clarion QY8XXX.
+ * model for the Clarion QY8XXX board.
  *
- * Блок ототожнено не за схожістю адрес, а за магічними кодами регістрів:
- * прошивка кладе 0x66000001 у +0xe0 (DEFR5_CODE = 0x66 << 24), 0x77780010
- * у +0xe8 (DEFR6_CODE = 0x7778 << 16) і 0x77730011 у +0x20 (DEFR_CODE
- * 0x7773) — усе один-в-один із drivers/gpu/drm/renesas/rcar-du/rcar_du_regs.h.
- * Вузол у r8a7779.dtsi: display@fff80000 reg = <0xfff80000 0x40000>,
+ * The block is identified by its register magic values, not address
+ * similarity: firmware writes 0x66000001 to +0xe0 (DEFR5_CODE = 0x66 << 24),
+ * 0x77780010 to +0xe8 (DEFR6_CODE = 0x7778 << 16), and 0x77730011 to +0x20
+ * (DEFR_CODE 0x7773), matching drivers/gpu/drm/renesas/rcar-du/rcar_du_regs.h.
+ * Node in r8a7779.dtsi: display@fff80000 reg = <0xfff80000 0x40000>,
  * interrupts = <GIC_SPI 31>.
  *
- * Розкладка всередині блока (з rcar_du_regs.h і з того, як адресується
- * драйвер Linux — rcar_du_crtc.c / rcar_du_group.c / rcar_du_plane.c):
+ * Block layout (from rcar_du_regs.h and Linux driver accesses in
+ * rcar_du_crtc.c / rcar_du_group.c / rcar_du_plane.c):
  *
- *   +0x00000  канал 0: DSYSR..DEWR, DOOR/BPOR, DEFR5/DDLTR/DEFR6  (CRTC 0)
- *   +0x00100  площини 1..8 групи 0, крок PLANE_OFF = 0x100
- *   +0x01000  палітри CP1..CP4 групи 0 (по 256 слів)
- *   +0x0a100  «A»-площини групи 0
- *   +0x10000  ESCR02 / OTAR02 — регістри синхронізації каналу 0
+ *   +0x00000  channel 0: DSYSR..DEWR, DOOR/BPOR, DEFR5/DDLTR/DEFR6 (CRTC 0)
+ *   +0x00100  group 0 planes 1..8, stride PLANE_OFF = 0x100
+ *   +0x01000  group 0 palettes CP1..CP4 (256 words each)
+ *   +0x0a100  group 0 "A" planes
+ *   +0x10000  ESCR02 / OTAR02, channel 0 sync registers
  *   +0x11000  DORCR / DPTSR / DAPTSR, +0x11020 DS1PR, +0x11024 DS2PR
- *   +0x30000  канал 1: та сама мапа, що й у каналу 0 (DU1_REG_OFFSET)
- *   +0x31000  ESCR13 / OTAR13 — регістри синхронізації каналу 1
+ *   +0x30000  channel 1: same map as channel 0 (DU1_REG_OFFSET)
+ *   +0x31000  ESCR13 / OTAR13, channel 1 sync registers
  *
- * Завантажувач плати вмикає 800x480 (повний кадр 1055x524) на обох
- * каналах, DOOR = 0, DORCR = PG1T|DK1S|PG1D_DS1, DSYSR каналу 0 = DEN;
- * канал 1 лишається вимкненим. Площини пізніше програмує ddi_ncg.dll у
- * користувацькій частині WinCE. T132 зафіксував register programming P1/P2/P8,
- * а T133 перевірив діагностичне відображення інжектованих кадрів; це не
- * підтверджує поведінку фізичного QY8 DU чи реальний scanout.
+ * The board bootloader enables 800x480 (full frame 1055x524) on both channels,
+ * DOOR = 0, DORCR = PG1T|DK1S|PG1D_DS1, and channel 0 DSYSR = DEN; channel 1
+ * remains disabled. ddi_ncg.dll programs planes later in WinCE user mode.
+ * Guest programming of P1/P2/P8 and diagnostic rendering of injected frames
+ * have been observed, but do not establish physical QY8 DU behavior or scanout.
  *
- * ⚠ Межа чесності. Рендер площин, DPPR та програмування регістрів
- * реалізовані за rcar_du_regs.h і драйвером Linux. T133 також додав
- * діагностичні color-key та alpha правила за encoding Linux v6.6
- * (перемикач blend); ABIT_1 є inference. Ці результати перевірені лише у
- * QEMU diagnostic captures, а color key/alpha та решта відповідної DU
- * поведінки НЕ ПЕРЕВІРЕНІ на фізичному QY8 hardware. Де поведінка не
- * підтверджена апаратурою, це позначено коментарями біля реалізації.
+ * ⚠ Scope: plane rendering, DPPR and register programming follow
+ * rcar_du_regs.h and the Linux driver. Diagnostic color-key and alpha rules
+ * follow Linux v6.6 encoding (blend switch); ABIT_1 is inferred. These results
+ * were checked only in QEMU diagnostic captures. Color-key/alpha and related
+ * DU behavior have NOT been verified on physical QY8 hardware. Unverified
+ * behavior is marked near its implementation.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -53,7 +51,7 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 
-/* --- регістри (імена й зсуви — з rcar_du_regs.h) ---------------------- */
+/* --- registers (names and offsets from rcar_du_regs.h) ----------------- */
 
 #define DU0_REG_OFFSET      0x00000
 #define DU1_REG_OFFSET      0x30000
@@ -63,47 +61,47 @@
 #define DSYSR_DRES          (1 << 9)
 #define DSYSR_DEN           (1 << 8)
 
-#define DSSR                0x00008     /* статус, тільки читання */
-#define DSRCR               0x0000c     /* скидання бітів статусу */
-#define DIER                0x00010     /* дозвіл переривань */
+#define DSSR                0x00008     /* read-only status */
+#define DSRCR               0x0000c     /* clear status bits */
+#define DIER                0x00010     /* interrupt enable */
 
 /*
- * Біт 11 у DSSR/DIER — кадрова синхронізація (vertical blanking).
- * Іменування й номер біта — з rcar_du_regs.h (`DSSR_VBK`, `DIER_VBE`);
- * підтверджено з обох боків: драйвер HU пише в DIER рівно 0x800, а його
- * потік обробки переривання (ddi_ncg.dll+0x12e78) читає DSSR, перевіряє
- * `tst r3, #0x800` і скидає біт записом 0x800 у DSRCR.
+ * Bit 11 in DSSR/DIER is frame synchronization (vertical blanking). Names
+ * and bit number come from rcar_du_regs.h (`DSSR_VBK`, `DIER_VBE`) and match
+ * both sides: the HU driver writes 0x800 to DIER, while its interrupt handler
+ * (ddi_ncg.dll+0x12e78) reads DSSR, tests `tst r3, #0x800`, and clears it by
+ * writing 0x800 to DSRCR.
  */
 #define DSSR_VBK            (1 << 11)
 #define DIER_VBE            (1 << 11)
 
-#define HCR                 0x00050     /* повна ширина кадру - 1 */
-#define VCR                 0x00058     /* повна висота кадру - 1 */
+#define HCR                 0x00050     /* full frame width - 1 */
+#define VCR                 0x00058     /* full frame height - 1 */
 
-#define DPPR                0x00018     /* пріоритети й вибір площин */
+#define DPPR                0x00018     /* plane priority and selection */
 /*
- * Кожен нібл DPPR — один рівень пріоритету n = 1..8 (нібл n-1):
- *   DPE(n)    = 1 << (n*4 - 1)        — біт 3 нібла, «рівень увімкнено»
- *   DPS(n, p) = (p - 1) << (n-1)*4    — біти 2..0, номер площини 1..8
- * (rcar_du_regs.h). Завантажувач кладе 0x76543210 — усі вісім рівнів
- * розписані по площинах, але ЖОДНОГО DPE, тобто нічого не ввімкнено.
+ * Each DPPR nibble is priority level n = 1..8 (nibble n-1):
+ *   DPE(n)    = 1 << (n*4 - 1)        - nibble bit 3, "level enabled"
+ *   DPS(n, p) = (p - 1) << (n-1)*4    - bits 2..0, plane number 1..8
+ * (rcar_du_regs.h). The bootloader writes 0x76543210: all eight levels have
+ * plane assignments, but no DPE bits are set, so none is enabled.
  */
 #define DPPR_DPE(n)         (1u << ((n) * 4 - 1))
 #define DPPR_NIB(v, n)      (((v) >> (((n) - 1) * 4)) & 0xf)
 
-/* Генератор таймінгів */
+/* Timing generator */
 #define HDSR                0x00040
 #define HDER                0x00044
 #define VDSR                0x00048
 #define VDER                0x0004c
 
-/* Атрибути виводу. DOOR — колір, коли дисплей вимкнено; BPOR — колір
- * фонової площини під усіма площинами (rcar_du_crtc.c: «Set display off
- * and background to black»). Обидва — 8 біт на канал: (r<<18)|(g<<10)|(b<<2). */
+/* Output attributes. DOOR is the color when the display is off; BPOR is the
+ * background color under all planes (rcar_du_crtc.c: "Set display off and
+ * background to black"). Both use 8 bits per channel: (r<<18)|(g<<10)|(b<<2). */
 #define DOOR                0x00090
 #define BPOR                0x00098
 
-/* Площини групи: площина n (1..8) — це group + n * PLANE_OFF */
+/* Group planes: plane n (1..8) is at group + n * PLANE_OFF */
 #define PLANE_OFF           0x00100
 #define DU_NUM_PLANES       8
 
@@ -122,7 +120,7 @@
 #define PnMR_DDDF_16BPP     1
 #define PnMR_DDDF_ARGB      2
 #define PnMR_DDDF_YC        3
-#define PnMWR               0x004       /* крок рядка В ПІКСЕЛЯХ */
+#define PnMWR               0x004       /* row stride in PIXELS */
 #define PnDSXR              0x010
 #define PnDSYR              0x014
 #define PnDPXR              0x018
@@ -149,11 +147,11 @@
 #define PnDDCR4_EDF_RGB888  2
 #define PnDDCR4_EDF_RGB666  3
 
-/* Палітри групи */
+/* Group palettes */
 #define CP1_000R            0x01000
 #define CP_STRIDE           0x01000
 
-/* Керування подвійним виводом (регістри групи) */
+/* Dual-output control (group registers) */
 #define DORCR               0x11000
 #define DORCR_PG0D_MASK     (3 << 16)
 #define DORCR_PG0D_DS0      (0 << 16)
@@ -161,11 +159,11 @@
 #define DORCR_PG0D_FIX0     (2 << 16)
 #define DORCR_PG0D_DOOR     (3 << 16)
 #define DPTSR               0x11004
-#define DPTSR_PnTS(n)       (1 << (n))  /* n — 0-based індекс площини */
-#define DS1PR               0x11020     /* склад суперпозиції 0 */
-#define DS2PR               0x11024     /* склад суперпозиції 1 */
+#define DPTSR_PnTS(n)       (1 << (n))  /* n is a zero-based plane index */
+#define DS1PR               0x11020     /* composition of superposition 0 */
+#define DS2PR               0x11024     /* composition of superposition 1 */
 
-/* --- стан ------------------------------------------------------------- */
+/* --- state ------------------------------------------------------------- */
 
 OBJECT_DECLARE_SIMPLE_TYPE(ClarionDuState, CLARION_DU)
 
@@ -175,17 +173,17 @@ struct ClarionDuState {
     MemoryRegion iomem;
     QemuConsole *con;
 
-    uint32_t *reg;              /* увесь блок як масив слів */
+    uint32_t *reg;              /* entire block as an array of words */
     int cols, rows;
     bool invalidate;
 
     qemu_irq irq;               /* GIC_SPI 31 */
-    QEMUTimer *vbk;             /* кадровий такт */
-    uint32_t dotclk;            /* точкова частота, Гц (властивість) */
+    QEMUTimer *vbk;             /* frame clock */
+    uint32_t dotclk;            /* dot clock in Hz (property) */
     uint32_t panel_width;
     uint32_t panel_height;
 
-    /* щоб не засмічувати лог однаковими скаргами */
+    /* avoid repeating identical warnings in the log */
     bool warned_chan1;
     bool warned_yc;
     bool warned_swap;
@@ -205,7 +203,7 @@ static inline hwaddr du_chan_base(int ch)
     return ch ? DU1_REG_OFFSET : DU0_REG_OFFSET;
 }
 
-/* DOOR/BPOR/палітра -> 0x00RRGGBB */
+/* DOOR/BPOR/palette -> 0x00RRGGBB */
 static inline uint32_t du_color(uint32_t v)
 {
     return (((v >> 18) & 0xff) << 16) |
@@ -214,9 +212,8 @@ static inline uint32_t du_color(uint32_t v)
 }
 
 /*
- * Розмір кадру береться з генератора таймінгів, а не зашивається:
- * ширина = HDER - HDSR, висота = VDER - VDSR. Для цієї плати
- * завантажувач кладе 984-184 = 800 і 511-31 = 480.
+ * Derive frame size from the timing generator: width = HDER - HDSR and
+ * height = VDER - VDSR. The bootloader sets 984-184 = 800 and 511-31 = 480.
  */
 static bool du_geometry(ClarionDuState *s, int ch, int *w, int *h)
 {
@@ -238,7 +235,7 @@ static bool du_geometry(ClarionDuState *s, int ch, int *w, int *h)
     return true;
 }
 
-/* --- площини (НЕПЕРЕВІРЕНО: гість їх ще не програмує) ------------------ */
+/* --- planes (UNVERIFIED: the guest does not program them yet) ----------- */
 
 typedef enum {
     DU_FMT_PAL8,
@@ -256,11 +253,11 @@ static DuFormat du_plane_format(ClarionDuState *s, int plane, int *bpp)
     uint32_t edf = du_rd(s, pb + PnDDCR4) & PnDDCR4_EDF_MASK;
 
     /*
-     * PnMR.DDDF розрізняє 8bpp / «16 або 32 біти» / ARGB1555 / YC, а який
-     * саме з «16 або 32» — каже EDF у PnDDCR4 (rcar_du_kms.c, таблиця
+     * PnMR.DDDF distinguishes 8bpp / "16 or 32 bits" / ARGB1555 / YC; EDF
+     * in PnDDCR4 selects which of the 16/32-bit formats (rcar_du_kms.c table
      * rcar_du_format_infos: RGB565 = DDDF_16BPP + EDF_NONE, XRGB8888 =
      * DDDF_16BPP + EDF_RGB888, ARGB8888 = DDDF_16BPP + EDF_ARGB8888).
-     * Драйвер пише PnDDCR4 і на Gen1 теж — там gen < 3 іде в
+     * The driver also writes PnDDCR4 on Gen1: gen < 3 uses
      * rcar_du_plane_setup_format_gen2().
      */
     switch (pnmr & PnMR_DDDF_MASK) {
@@ -313,7 +310,7 @@ static uint32_t du_decode_pixel(ClarionDuState *s, DuFormat fmt,
                ((v & 0x1f) * 255 / 31);
     case DU_FMT_XRGB8888:
     case DU_FMT_ARGB8888:
-        /* слово в пам'яті мало-endian: 0xAARRGGBB */
+        /* Word in memory is little-endian: 0xAARRGGBB. */
         return p[0] | (p[1] << 8) | (p[2] << 16);
     default:
         return 0;
@@ -321,16 +318,15 @@ static uint32_t du_decode_pixel(ClarionDuState *s, DuFormat fmt,
 }
 
 /*
- * Список площин суперпозиції, знизу вгору.
+ * List planes in a superposition from bottom to top.
  *
- * Джерело — DS1PR (суперпозиція 0) / DS2PR (суперпозиція 1): драйвер
- * (rcar_du_crtc_update_planes) кладе туди по нібблу на площину, значення
- * = номер площини 1..8, 0 = порожньо; причому НИЖНІЙ нібл — найверхній
- * шар (prio рахується від кількості площин униз). Тому обхід від старшого
- * ніббла до молодшого і дає порядок «знизу вгору».
+ * Source is DS1PR (superposition 0) / DS2PR (superposition 1): the driver
+ * (rcar_du_crtc_update_planes) stores one nibble per plane, with values 1..8
+ * for a plane and 0 for empty. The LOWEST nibble is the topmost layer (priority
+ * counts down from the number of planes), so scanning high to low nibbles
+ * gives bottom-to-top order.
  *
- * Якщо DS1PR/DS2PR порожні, дивимося DPPR — саме ним користується рідний
- * драйвер плати ddi_ncg.dll (див. нижче).
+ * If DS1PR/DS2PR are empty, use DPPR, as the board's ddi_ncg.dll driver does.
  */
 static int du_plane_list(ClarionDuState *s, int sp, int *order)
 {
@@ -344,7 +340,7 @@ static int du_plane_list(ClarionDuState *s, int sp, int *order)
         if (plane < 1 || plane > DU_NUM_PLANES) {
             continue;
         }
-        /* DPTSR: 0 -> площина живить суперпозицію 0, 1 -> суперпозицію 1 */
+        /* DPTSR: 0 -> plane feeds superposition 0; 1 -> superposition 1 */
         if (!!(dptsr & DPTSR_PnTS(plane - 1)) != !!sp) {
             continue;
         }
@@ -352,18 +348,17 @@ static int du_plane_list(ClarionDuState *s, int sp, int *order)
     }
 
     /*
-     * Запасний шлях: DPPR.
+     * Fallback: DPPR.
      *
-     * Драйвер Linux цей регістр не чіпає, тому раніше ми його не тлумачили.
-     * Але ddi_ncg.dll (рідний драйвер плати) користується САМЕ ним: DS1PR і
-     * DS2PR він лишає нульовими, а в DPPR міняє 0x76543210 -> 0x76543218,
-     * тобто ставить DPE на рівні 1 з DPS = 0 -> площина 1. Виміряно на
-     * живому буті (docs/04-journal.md, запис «Перший кадр»); там же видно,
-     * що площину 1 він при цьому повністю програмує (800x480, ARGB1555,
-     * PnDSA0R = 0x10119400), і в тому буфері лежать ненульові пікселі.
+     * The Linux driver does not use this register, so it was not interpreted
+     * previously. The board's ddi_ncg.dll uses it: DS1PR and DS2PR stay zero,
+     * while DPPR changes 0x76543210 -> 0x76543218, setting DPE at level 1
+     * with DPS = 0 (plane 1). This was observed during live boot; plane 1 is
+     * fully programmed (800x480, ARGB1555, PnDSA0R = 0x10119400), and its
+     * buffer contains nonzero pixels.
      *
-     * Порядок обходу — той самий, що й для DS1PR: від старшого рівня до
-     * молодшого, тож молодший лягає зверху.
+     * Use the same order as DS1PR: scan from highest to lowest level so the
+     * lower level is drawn on top.
      */
     if (!n) {
         uint32_t dppr = du_rd(s, DPPR);
@@ -372,7 +367,7 @@ static int du_plane_list(ClarionDuState *s, int sp, int *order)
             int plane;
 
             if (!(dppr & DPPR_DPE(lvl))) {
-                continue;               /* рівень вимкнено */
+                continue;               /* level disabled */
             }
             plane = (int)(DPPR_NIB(dppr, lvl) & 7) + 1;
             if (!!(dptsr & DPTSR_PnTS(plane - 1)) != !!sp) {
@@ -384,7 +379,7 @@ static int du_plane_list(ClarionDuState *s, int sp, int *order)
     return n;
 }
 
-/* Малювання однієї площини поверх уже готового рядка кадру. */
+/* Draw one plane over an already rendered frame row. */
 static void du_draw_plane(ClarionDuState *s, int plane,
                           uint32_t *fb, int cols, int rows)
 {
@@ -396,7 +391,7 @@ static void du_draw_plane(ClarionDuState *s, int plane,
     uint32_t spim = pnmr & PnMR_SPIM_MASK;
     uint32_t alphar = du_rd(s, pb + PnALPHAR);
     uint32_t tc2 = du_rd(s, pb + PnTC2R);
-    uint32_t mwr = du_rd(s, pb + PnMWR);        /* крок рядка в пікселях */
+    uint32_t mwr = du_rd(s, pb + PnMWR);        /* row stride in pixels */
     int dsx = du_rd(s, pb + PnDSXR);
     int dsy = du_rd(s, pb + PnDSYR);
     int dpx = du_rd(s, pb + PnDPXR);
@@ -409,33 +404,33 @@ static void du_draw_plane(ClarionDuState *s, int plane,
     if (fmt == DU_FMT_UNSUPPORTED) {
         if (!s->warned_yc) {
             s->warned_yc = true;
-            qemu_log_mask(LOG_UNIMP, "clarion-du: площина %d у форматі YC/"
-                          "невідомому (PnMR %#x, PnDDCR4 %#x) — не малюємо\n",
+            qemu_log_mask(LOG_UNIMP, "clarion-du: plane %d has YC/unknown "
+                          "format (PnMR %#x, PnDDCR4 %#x); not rendering\n",
                           plane, du_rd(s, pb + PnMR), du_rd(s, pb + PnDDCR4));
         }
         return;
     }
-    /* Поля/режими нижче мають підтримку лише за Linux v6.6 driver encoding;
-     * поведінка кремнію QY8 цим не підтверджується. */
+    /* Fields/modes below are supported only by Linux v6.6 driver encoding;
+     * this does not verify QY8 silicon behavior. */
     if (!s->warned_du_semantics &&
         ((pnmr & (PnMR_TC | PnMR_WAE)) || spim == PnMR_SPIM_EOR ||
          ((pnmr & PnMR_DDDF_MASK) == PnMR_DDDF_8BPP) ||
          fmt == DU_FMT_XRGB8888 || fmt == DU_FMT_ARGB8888)) {
         s->warned_du_semantics = true;
-        qemu_log_mask(LOG_UNIMP, "clarion-du: частина семантики DU "
-                      "(TC/WAE/EOR, 8/32bpp key) не моделюється\n");
+        qemu_log_mask(LOG_UNIMP, "clarion-du: some DU semantics "
+                      "(TC/WAE/EOR, 8/32bpp key) are not modeled\n");
     }
     if (du_rd(s, pb + PnSWAPR) && !s->warned_swap) {
         s->warned_swap = true;
-        qemu_log_mask(LOG_UNIMP, "clarion-du: PnSWAPR площини %d = %#x — "
-                      "перестановку байтів не моделюємо\n",
+        qemu_log_mask(LOG_UNIMP, "clarion-du: plane %d PnSWAPR = %#x; "
+                      "byte swapping is not modeled\n",
                       plane, du_rd(s, pb + PnSWAPR));
     }
     if (!dsa || dsx <= 0 || dsy <= 0 || mwr == 0) {
         return;
     }
 
-    /* PnMR.CPSL обирає палітру CP1..CP4 групи */
+    /* PnMR.CPSL selects the group palette CP1..CP4. */
     palette = CP1_000R + ((du_rd(s, pb + PnMR) >> PnMR_CPSL_SHIFT) & 3)
               * CP_STRIDE;
 
@@ -450,11 +445,10 @@ static void du_draw_plane(ClarionDuState *s, int plane,
             continue;
         }
         /*
-         * НЕПЕРЕВІРЕНО. PnMWR — крок у пікселях, PnSPXR/PnSPYR — зсув у
-         * джерелі (піксель / растровий рядок). Драйвер Linux для 32bpp
-         * подвоює SPY «згідно з документацією R8A7790»; на повноекранній
-         * поверхні SPY = 0, тож тут беремо пряме тлумачення і лишаємо це
-         * питання відкритим до M3b.
+         * UNVERIFIED. PnMWR is a pixel stride; PnSPXR/PnSPYR are source
+         * offsets (pixel / scanline). The Linux driver doubles SPY for 32bpp
+         * "according to R8A7790 documentation"; SPY = 0 on a fullscreen plane,
+         * so use the direct interpretation and leave this question open.
          */
         src = dsa + (hwaddr)(spy + y) * mwr * bpp + (hwaddr)spx * bpp;
         if (address_space_read(&address_space_memory, src,
@@ -475,9 +469,8 @@ static void du_draw_plane(ClarionDuState *s, int plane,
 
             if (s->blend && !(pnmr & PnMR_SPIM_TP_OFF) &&
                 (fmt == DU_FMT_ARGB1555 || fmt == DU_FMT_RGB565)) {
-                /* За драйвером Linux v6.6; на фізичному QY8 hardware
-                 * не перевірено.
-                 * Чинність ключа в SPIM=ALP лишається окремим питанням. */
+                /* Follows Linux v6.6 driver; not verified on physical QY8
+                 * hardware. Key behavior with SPIM=ALP remains unresolved. */
                 uint16_t raw = pixel[0] | ((uint16_t)pixel[1] << 8);
                 uint16_t key_mask = fmt == DU_FMT_ARGB1555 ? 0x7fff : 0xffff;
                 if ((raw & key_mask) == (tc2 & key_mask)) {
@@ -487,9 +480,9 @@ static void du_draw_plane(ClarionDuState *s, int plane,
 
             if (s->blend && fmt == DU_FMT_ARGB1555 &&
                 spim == PnMR_SPIM_ALP) {
-                /* За драйвером Linux v6.6, на фізичному QY8 hardware не
-                 * перевірено: коефіцієнт PnALPHAR і ABIT_0; ABIT_1 —
-                 * симетрична inference. */
+                /* Follows Linux v6.6 driver, not verified on physical QY8:
+                 * PnALPHAR coefficient and ABIT_0; ABIT_1 is inferred by
+                 * symmetry. */
                 uint32_t abit = alphar & PnALPHAR_ABIT_MASK;
                 bool a_bit = !!(pixel[1] & 0x80);
                 bool blend_pixel =
@@ -513,7 +506,7 @@ static void du_draw_plane(ClarionDuState *s, int plane,
     }
 }
 
-/* --- вивід у вікно ---------------------------------------------------- */
+/* --- output to the display window ------------------------------------- */
 
 static bool clarion_du_gfx_update(void *opaque)
 {
@@ -525,7 +518,7 @@ static bool clarion_du_gfx_update(void *opaque)
     g_autofree uint32_t *fb = NULL;
     uint8_t *dest;
 
-    /* Поки завантажувач не поклав таймінги — показувати нічого. */
+    /* Nothing to display until the bootloader sets timing registers. */
     if (!du_geometry(s, 0, &w, &h)) {
         return true;
     }
@@ -539,17 +532,17 @@ static bool clarion_du_gfx_update(void *opaque)
     if (surface_bits_per_pixel(surface) != 32) {
         if (!s->warned_bpp) {
             s->warned_bpp = true;
-            qemu_log_mask(LOG_UNIMP, "clarion-du: поверхня %d біт на піксель — "
-                          "модель уміє лише 32\n",
+            qemu_log_mask(LOG_UNIMP, "clarion-du: surface uses %d bits per "
+                          "pixel; model supports only 32\n",
                           surface_bits_per_pixel(surface));
         }
         return true;
     }
 
     /*
-     * DORCR.PG0D каже, що саме виходить на DPAD0 — єдиний вихід, до якого
-     * на цій платі під'єднана панель: суперпозиція 0, суперпозиція 1,
-     * постійний нуль або колір DOOR.
+     * DORCR.PG0D selects the DPAD0 output, the only output connected to the
+     * panel on this board: superposition 0, superposition 1, constant zero,
+     * or the DOOR color.
      */
     dorcr = du_rd(s, DORCR);
     switch (dorcr & DORCR_PG0D_MASK) {
@@ -569,7 +562,7 @@ static bool clarion_du_gfx_update(void *opaque)
     }
 
     if (!(du_rd(s, du_chan_base(src_ch) + DSYSR) & DSYSR_DEN)) {
-        /* Дисплей вимкнено — на вихід іде колір DOOR (rcar_du_crtc.c). */
+        /* Display is off; output the DOOR color (rcar_du_crtc.c). */
         sp = -1;
     }
 
@@ -582,7 +575,7 @@ static bool clarion_du_gfx_update(void *opaque)
         nplanes = du_plane_list(s, sp, order);
     }
 
-    /* Без площин кадр — константа: перемальовуємо лише коли щось змінилось. */
+    /* Without planes, the frame is constant; redraw only when it changes. */
     if (!nplanes && !s->invalidate) {
         return true;
     }
@@ -630,21 +623,20 @@ static uint64_t clarion_du_read(void *opaque, hwaddr addr, unsigned size)
     ClarionDuState *s = opaque;
 
     /*
-     * DSSR (статус кадру: VBK, HBK, FRM, ...) читається нулем.
+     * DSSR (frame status: VBK, HBK, FRM, ...) reads as zero.
      *
-     * Завантажувач вмикає DIER = DIER_VBE, тобто переривання кадрової
-     * синхронізації (у r8a7779.dtsi це GIC_SPI 31). Щоб його генерувати,
-     * треба знати точкову частоту, а вона в DU не лежить: ESCR02 тут
-     * дорівнює 0, тобто DCLKSEL = DCLKIN — зовнішній такт, джерела на
-     * його частоту в нас немає. Вигадувати її ми не стали, тож ні
-     * лічильника кадрів, ні лінії переривання модель не має. Відкрите
-     * питання до M3b: чи чекає на VBK користувацька частина.
+     * The bootloader sets DIER = DIER_VBE, enabling frame-sync interrupts
+     * (GIC_SPI 31 in r8a7779.dtsi). Generating them requires the dot clock,
+     * which is not in the DU registers: ESCR02 is 0, so DCLKSEL = DCLKIN uses
+     * an external clock whose frequency is unknown. We do not guess it, so
+     * the model has neither a frame counter nor an interrupt line. Open
+     * question: does the user-mode driver wait for VBK?
      */
     if ((addr & 0xffff) == DSSR) {
         /*
-         * Лічильник читань статусу кадру. Потрібен, щоб відрізнити «драйвер
-         * узагалі не цікавиться кадровою синхронізацією» від «драйвер її
-         * чекає, а модель мовчить». DIER=VBK завантажувач вмикає на 917 мс.
+         * Count frame-status reads to distinguish "driver does not use frame
+         * sync" from "driver waits for it but the model is silent". The
+         * bootloader enables DIER=VBK at 917 ms.
          */
         static uint32_t dssr_reads;
         trace_clarion_du_dssr_read(
@@ -656,8 +648,8 @@ static uint64_t clarion_du_read(void *opaque, hwaddr addr, unsigned size)
 }
 
 /*
- * Ім'я регістра для журналу. Площини (`P1DSA0R` тощо) складаються на льоту:
- * площина n живе за group + n * PLANE_OFF, тож номер відновлюється діленням.
+ * Register name for logging. Plane names (`P1DSA0R`, etc.) are constructed
+ * dynamically: plane n is at group + n * PLANE_OFF, so derive n by division.
  */
 static const char *du_reg_name(hwaddr addr)
 {
@@ -718,12 +710,12 @@ static const char *du_reg_name(hwaddr addr)
     return buf;
 }
 
-/* --- кадрова синхронізація (VBK) -------------------------------------- */
+/* --- frame synchronization (VBK) --------------------------------------- */
 
 /*
- * Лінія переривання зведена, поки є хоч один дозволений і незнятий біт
- * статусу. Обробник у драйвері знімає біт записом у DSRCR — і лінія падає
- * сама, без окремого «ack» від моделі.
+ * The interrupt line stays asserted while any enabled status bit is set.
+ * The driver clears it by writing to DSRCR, which drops the line; the model
+ * needs no separate acknowledgment.
  */
 static void du_irq_update(ClarionDuState *s)
 {
@@ -731,14 +723,13 @@ static void du_irq_update(ClarionDuState *s)
 }
 
 /*
- * Період кадру береться з РЕГІСТРІВ, які запрограмував сам гість:
- * повний кадр = (HCR + 1) x (VCR + 1) точок. На HU це 1056 x 525.
+ * Derive frame period from the REGISTERS programmed by the guest:
+ * full frame = (HCR + 1) x (VCR + 1) pixels. On the HU this is 1056 x 525.
  *
- * Єдине число, якого немає в регістрах, — сама точкова частота: ESCR02
- * лишається 0, тобто DCLKSEL = DCLKIN, зовнішній такт від TCON
- * (PA 0xFFF18000). Його джерела ми не знаємо, тому це ВЛАСТИВІСТЬ машини
- * `dotclk` зі значенням за замовчуванням 33 333 333 Гц — опорний EXTAL
- * плат R-Car M1A. Для кадру 1056 x 525 це дає 60.1 Гц.
+ * The only unavailable value is the dot clock: ESCR02 remains 0, so
+ * DCLKSEL = DCLKIN, an external clock from TCON (PA 0xFFF18000). Its source
+ * frequency is unknown, so machine property `dotclk` defaults to 33,333,333
+ * Hz, the R-Car M1A reference EXTAL. For a 1056 x 525 frame this gives 60.1 Hz.
  */
 static void du_vbk_resched(ClarionDuState *s)
 {
@@ -769,26 +760,25 @@ static void clarion_du_write(void *opaque, hwaddr addr, uint64_t val,
     hwaddr off = addr & 0xffff;
 
     /*
-     * Журнал іде ПЕРЕД обробкою DSSR/DSRCR: інакше записи в DSRCR (скидання
-     * бітів статусу — саме те, що робить обробник переривання) губилися б у
-     * ранньому `return` і виглядали б як «їх не було».
+     * Log before processing DSSR/DSRCR: otherwise DSRCR writes (which clear
+     * status bits in the interrupt handler) would be lost to an early return
+     * and appear not to have occurred.
      */
     if (off == DSSR || off == DSRCR || s->reg[addr / 4] != (uint32_t)val) {
         /*
-         * Журнал змін регістрів — щоб бачити, КОЛИ саме змінюється картинка
-         * і який саме регістр за це відповідає. Пишемо лише справжні зміни:
-         * драйвер переписує ті самі значення щокадру, і без фільтра трас
-         * тоне в повторах. Час — віртуальний, у мілісекундах, той самий, за
-         * яким мітить рядки консоль гостя.
+         * Log register changes to identify when the image changes and which
+         * register caused it. Record only actual changes: the driver rewrites
+         * identical values each frame, which would otherwise flood the trace.
+         * Time is virtual milliseconds, matching guest console timestamps.
          */
         CPUState *cs = current_cpu;
         uint64_t pc = 0;
 
         /*
-         * PC гостя. У TCG він оновлюється на межах блоків трансляції, тож
-         * це адреса З ТОЧНІСТЮ ДО БЛОКУ, а не сама інструкція `str`. Для
-         * відповіді «який модуль пише» цього досить: бази модулів XIP
-         * рознесені на десятки кілобайтів.
+         * Guest PC. TCG updates it at translation-block boundaries, so this
+         * is accurate to the block, not the `str` instruction. That suffices
+         * to identify the writing module because XIP module bases are tens of
+         * kilobytes apart.
          */
         if (cs) {
             pc = CPU_GET_CLASS(cs)->get_pc(cs);
@@ -800,7 +790,7 @@ static void clarion_du_write(void *opaque, hwaddr addr, uint64_t val,
     }
 
     if (off == DSSR) {
-        return;                 /* статус — тільки читання */
+        return;                 /* status is read-only */
     }
     if (off == DSRCR) {
         s->reg[DSSR / 4] &= ~(uint32_t)val;
@@ -810,7 +800,7 @@ static void clarion_du_write(void *opaque, hwaddr addr, uint64_t val,
 
     s->reg[addr / 4] = val;
 
-    /* Усе, від чого залежить кадровий такт каналу 0. */
+    /* All registers affecting channel 0 frame timing. */
     if (addr == DSYSR || addr == DIER || addr == HCR || addr == VCR) {
         du_vbk_resched(s);
         if (addr == DIER) {
@@ -821,8 +811,8 @@ static void clarion_du_write(void *opaque, hwaddr addr, uint64_t val,
     if (addr == DU1_REG_OFFSET + DSYSR && (val & DSYSR_DEN) &&
         !s->warned_chan1) {
         s->warned_chan1 = true;
-        qemu_log_mask(LOG_UNIMP, "clarion-du: увімкнено канал 1 (DU1) — "
-                      "у вікно виводиться лише DPAD0\n");
+        qemu_log_mask(LOG_UNIMP, "clarion-du: channel 1 (DU1) enabled; "
+                      "only DPAD0 is displayed\n");
     }
 
     s->invalidate = true;
@@ -870,20 +860,19 @@ static const Property clarion_du_props[] = {
     /* Diagnostic renderer switch; Linux v6.6 field semantics are not QY8 verified. */
     DEFINE_PROP_BOOL("blend", ClarionDuState, blend, true),
     /*
-     * Точкова частота DCLKIN у герцах — період кадру = (HCR+1)*(VCR+1)/dotclk.
-     * У регістрах DU її немає: ESCR02 = 0, тобто такт зовнішній, від TCON
+     * DCLKIN dot clock in Hz; frame period = (HCR+1)*(VCR+1)/dotclk.
+     * DU registers do not contain it: ESCR02 = 0 selects the external TCON
      * (PA 0xFFF18000).
      *
-     * ⚠ Типово 0 — кадрове переривання НЕ генерується. Не тому, що модель
-     * неправильна, а тому, що НЕ ВСТАНОВЛЕНО, якою лінією GIC воно доходить
-     * до цієї прошивки: драйвер бере SYSINTR = 37 з власної константи, а
-     * перебір усіх 17 ліній, які OAL узагалі вмикає, не розбудив його
-     * потік обробки (docs/04-journal.md, 24.09). Поки лінія не відома,
-     * генерувати переривання означало б стукати в чужі двері.
+     * ⚠ Defaults to 0, so frame interrupts are NOT generated. The model is
+     * not known to be wrong; the GIC line used by this firmware is UNKNOWN.
+     * The driver uses hard-coded SYSINTR = 37, and probing all 17 lines
+     * enabled by the OAL did not wake its handler thread. Until the line is
+     * known, generating interrupts could target the wrong device.
      *
-     * Коли лінію знайдуть: `-global clarion-du.dotclk=33333333` (опорний
-     * EXTAL плат R-Car M1A; з кадром 1056 x 525 це 60.1 Гц) разом із
-     * `-M clarion-qy8,du-spi=<номер>`.
+     * Once identified, set `-global clarion-du.dotclk=33333333` (R-Car M1A
+     * reference EXTAL; 60.1 Hz for 1056 x 525) and
+     * `-M clarion-qy8,du-spi=<number>`.
      */
     DEFINE_PROP_UINT32("dotclk", ClarionDuState, dotclk, 0),
     DEFINE_PROP_UINT32("panel-width", ClarionDuState, panel_width, 0),

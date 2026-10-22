@@ -62,5 +62,5 @@ clarion_hpbdma_module_service(int ch, uint32_t addr, uint32_t sar, uint32_t dar,
 
 # clarion_lbdma.c
 clarion_lbdma_write(uint32_t off, uint64_t val) "+0x%03x <- 0x%08" PRIx64
-clarion_lbdma_run(int i, uint32_t sar, uint32_t dar, uint32_t tcr, uint32_t bytes) "набір%d SAR=%08x DAR=%08x TCR=%u -> %u Б"
-clarion_lbdma_start(uint32_t ctrl, uint32_t bytes) "START CTRL=%08x перенесено %u Б"
+clarion_lbdma_run(int i, uint32_t sar, uint32_t dar, uint32_t tcr, uint32_t bytes) "set%d SAR=%08x DAR=%08x TCR=%u -> %u bytes"
+clarion_lbdma_start(uint32_t ctrl, uint32_t bytes) "START CTRL=%08x transferred %u bytes"

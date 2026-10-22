@@ -1,5 +1,5 @@
 /*
- * LBSC DMAC (DMA-двигун читання паралельної NOR) плати Clarion QY8XXX.
+ * LBSC DMAC (parallel NOR read DMA engine) for the Clarion QY8XXX board.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -9,43 +9,43 @@
 #define TYPE_CLARION_LBDMA "clarion-lbdma"
 
 /*
- * База й розмір — із самої прошивки, а не з аналогії:
+ * Base and size come from the firmware, not from analogy:
  *
- *   Flash.dll CFlashDmacCtl::Init @0xEFA0E6C4 кладе в
- *   DEVICE_LOCATION.LogicalLoc значення 0x1000 - 0x800000 = 0xFF801000 і
- *   питає OAL IOCTL_HAL_REQUEST_IRQ саме для цієї адреси. Далі той самий
- *   блок мапиться MmMapIoSpace (єдиний виклик у Flash.dll) — гість бачить
- *   його за VA 0xD5BD0000.
+ *   Flash.dll CFlashDmacCtl::Init @0xEFA0E6C4 sets
+ *   DEVICE_LOCATION.LogicalLoc to 0x1000 - 0x800000 = 0xFF801000 and
+ *   requests an OAL IOCTL_HAL_REQUEST_IRQ for that address. The same block
+ *   is then mapped with MmMapIoSpace (the only call in Flash.dll); the guest
+ *   sees it at VA 0xD5BD0000.
  *
- * Найбільший зсув, який чіпає драйвер, — 0x418, тож вікна 0x800 досить.
+ * The largest offset accessed by the driver is 0x418, so a 0x800 window suffices.
  */
 #define CLARION_LBDMA_BASE      0xFF801000
 #define CLARION_LBDMA_SIZE      0x800
 
 /*
- * Лінія переривання. Не вгадана: OAL прошивки сам віддає її драйверу.
+ * Interrupt line. It is not inferred: the firmware OAL provides it to the driver.
  *
  *   KernelIoControl(IOCTL_HAL_REQUEST_IRQ, {LogicalLoc=0xFF801000}) -> 0x6F
  *   KernelIoControl(IOCTL_HAL_REQUEST_SYSINTR, 0x6F)                -> 0x13
  *
- * (заміряно probe-ом tools/qy8_flash_irq_probe.py репозиторію
- * nissan-can-explore). «Логічний IRQ» OAL — це GIC INTID: таблиця переходів
- * OEMInterruptHandler @0x8800B5A0 індексується `IAR & 0x3FF` мінус 0x3B, і
- * для INTID 111 (= 0x6F) дає case @0x8800BC14, який маскує рівно цю лінію в
- * GICD_ICENABLER3 і кличе демукс @0x8800D904 -> OALIntrTranslateIrq(0x6F).
- * Отже SPI = 111 - 32 = 79.
+ * (measured with a local diagnostic probe).
+ * The OAL's "logical IRQ" is the GIC INTID: the OEMInterruptHandler
+ * @0x8800B5A0 dispatch table is indexed by `IAR & 0x3FF` minus 0x3B. For
+ * INTID 111 (= 0x6F), it selects case @0x8800BC14, which masks this line in
+ * GICD_ICENABLER3 and calls demux @0x8800D904 -> OALIntrTranslateIrq(0x6F).
+ * Therefore SPI = 111 - 32 = 79.
  *
- * ⚠ Демукс цієї лінії, на відміну від DU й SDHI, НЕ читає жодного статусного
- * слова INTC2: він безумовно маскує джерело в 0xFE782040, знімає біт 0 у
- * 0xFF801418, розмасковує в 0xFE782044 і повертає SYSINTR. Тому окремого
- * вікна INTC2 для цього блока не потрібно.
+ * ⚠ Unlike DU and SDHI, this line's demux does NOT read an INTC2 status
+ * word: it unconditionally masks the source at 0xFE782040, clears bit 0 at
+ * 0xFF801418, unmasks at 0xFE782044, and returns SYSINTR. Therefore this
+ * block does not need a separate INTC2 window.
  */
 #define CLARION_LBDMA_SPI       79
 
-/* Три набори {SAR, DAR, TCR} у канальній сторінці (0x00..0x20). */
+/* Three {SAR, DAR, TCR} sets in the channel page (0x00..0x20). */
 #define CLARION_LBDMA_NDESC     3
 
-/* TCR рахує одиниці по 16 байтів: 0x200 Б -> 0x20. */
+/* TCR counts units of 16 bytes: 0x200 bytes -> 0x20. */
 #define CLARION_LBDMA_UNIT      16
 
 #endif /* HW_DMA_CLARION_LBDMA_H */

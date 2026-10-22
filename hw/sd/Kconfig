@@ -31,5 +31,5 @@ config AXIADO_SDHCI
 config RENESAS_SDHI
     bool
     select SD
-    # передача даних іде через HPB-DMAC плати (див. renesas_sdhi.c)
+    # Data transfers use the board's HPB-DMAC (see renesas_sdhi.c).
     select CLARION_HPBDMA

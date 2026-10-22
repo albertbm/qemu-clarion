@@ -1,47 +1,46 @@
 /*
- * Display Micom — мікроконтролер панелі Clarion QY8XXX.
+ * Display Micom, the Clarion QY8XXX panel microcontroller.
  *
- * На живій платі це окрема мікросхема в блоці дисплея, під'єднана до SCIF1
- * головного SoC. Це НЕ той самий вузол, що супутній МК плати на SCIF4
- * (hw/misc/clarion_micom.c): інший дріт, інший драйвер у гості і інший
- * формат тіла кадру. Без відповіді від панелі `lcddrv.dll` ніколи не
- * виставляє ACM-модуль 129, і DrawOi малює перший кадр аж після таймауту
- * очікування на 129.
+ * On the real board, this is a separate chip in the display unit, connected
+ * to the main SoC over SCIF1. It is distinct from the board's companion MCU
+ * on SCIF4 (hw/misc/clarion_micom.c): the link, guest driver, and frame body
+ * format differ. Without a panel response, `lcddrv.dll` never signals ACM
+ * module 129, and DrawOi renders its first frame only after the wait times out.
  *
- * Протокол знято з коду lcddrv.dll, а не з документації.
+ * The protocol was derived from lcddrv.dll, not documentation.
  *
- * Обрамлення (приймач CLcdDrv::StartReadData @0xEF717578, передавач
+ * Framing (receiver CLcdDrv::StartReadData @0xEF717578, transmitter
  * CLcdDrv_Send @0xEF71A5D0):
  *
- *     10 02 | DATA... (стафінг: 10 -> 10 10) | 10 03 | BCC
- *     BCC = XOR усіх байтів ПІСЛЯ 10 02, разом із хвостовими 10 03,
- *     рахований по стафнутих байтах (eor/uxtb @0xEF7177B8, @0xEF71A65C)
+ *     10 02 | DATA... (stuffing: 10 -> 10 10) | 10 03 | BCC
+ *     BCC = XOR of all bytes AFTER 10 02, including trailing 10 03,
+ *     computed over stuffed bytes (eor/uxtb @0xEF7177B8, @0xEF71A65C)
  *
- * ⚠ На відміну від лінку плати, тут НЕМАЄ байта LEN: тіло починається
- * одразу з коду команди. Перевірка на справжньому кадрі гостя, знятому з
+ * ⚠ Unlike the board link, there is NO LEN byte here: the body starts with
+ * the command code. Verified against a real guest frame captured from
  * WriteFile: 10 02 23 10 03 30, XOR(23 10 03) = 0x30 ✔
  *
- * Квитанції — два байти поза кадром: DLE ACK = 10 06, DLE NAK = 10 15
- * (StartSendData_AckNack @0xEF71A4A0 кладе 0x10 у [this+0x552] і сам код у
- * [this+0x553], далі WriteFile на 2 байти). Приймач гостя впізнає їх у
+ * ACKs are two bytes outside the frame: DLE ACK = 10 06, DLE NAK = 10 15
+ * (StartSendData_AckNack @0xEF71A4A0 stores 0x10 at [this+0x552] and the code
+ * at [this+0x553], then calls WriteFile for 2 bytes). The guest receiver
  * StartReadData @0xEF7176D8.
  *
- * Автомат запуску (CLcdDrv::RcvAnalysisData @0xEF718554, диспетчер за
+ * Startup sequence (CLcdDrv::RcvAnalysisData @0xEF718554, dispatcher for
  * DATA[0]):
  *
- *     HU  -> 23                 запит інформації панелі (лінк-проба)
- *     HU  <- 10 06              квитанція
- *     HU  <- 24 VV UU P[12]     версія, UnitID, PartNum
- *                               обробник @0xEF7185B0 кладе DATA[1] у
- *                               [this+0x374], DATA[2] у [this+0x375],
- *                               12 байтів DATA[3..14] у [this+0x376],
- *                               далі Event(this, 1) -> стан лінка 0
+ *     HU  -> 23                 panel information request (link probe)
+ *     HU  <- 10 06              ACK
+ *     HU  <- 24 VV UU P[12]     version, UnitID, PartNum
+ *                               handler @0xEF7185B0 stores DATA[1] at
+ *                               [this+0x374], DATA[2] at [this+0x375],
+ *                               and DATA[3..14] at [this+0x376],
+ *                               then Event(this, 1) -> link state 0
  *                               -> CLcdDrv_Send::LinkStart @0xEF71A6B0:
- *                                  m_LinkState := 1 і черга на кадр 0x25
- *     HU  -> 25                 «лінк піднято»
- *     HU  <- 10 06              квитанція
- *     HU  <- 40                 обробник @0xEF718674: якщо m_LinkState == 1,
- *                               ставить 2 і кличе
+ *                                  m_LinkState := 1 and queues frame 0x25
+ *     HU  -> 25                 link up
+ *     HU  <- 10 06              ACK
+ *     HU  <- 40                 handler @0xEF718674: if m_LinkState == 1,
+ *                               sets it to 2 and calls
  *                               CApi_ModuleInitializeComplete(129)
  *
  * Framing, ACKs and startup replies follow the guest lcddrv code. Ready
@@ -82,11 +81,11 @@ typedef struct DispFrame {
     bool wait_ack;
 } DispFrame;
 
-/* Коди, розібрані в lcddrv.dll. */
-#define CMD_INFO_REQ        0x23    /* HU -> панель: запит інформації */
-#define CMD_INFO_RSP        0x24    /* панель -> HU: версія/UnitID/PartNum */
-#define CMD_LINK_UP         0x25    /* HU -> панель: лінк піднято */
-#define CMD_READY           0x40    /* панель -> HU: готова; гість SET 129 */
+/* Command codes decoded from lcddrv.dll. */
+#define CMD_INFO_REQ        0x23    /* HU -> panel: information request */
+#define CMD_INFO_RSP        0x24    /* panel -> HU: version/UnitID/PartNum */
+#define CMD_LINK_UP         0x25    /* HU -> panel: link up */
+#define CMD_READY           0x40    /* panel -> HU: ready; guest signals 129 */
 #define CMD_SETTINGS        0x42
 #define CMD_REPORT          0x43
 #define CMD_KEEPALIVE       0x71
@@ -94,31 +93,31 @@ typedef struct DispFrame {
 #define CMD_PANEL_KEY       0x34
 
 /*
- * Пауза між кадрами — така сама, як у моделі МК плати: приймач SCIF має
- * FIFO на 16 байтів, і драйвер мусить устигнути забрати попередній кадр.
- * Час віртуальний, тож бут не залежить від завантаження хоста.
+ * Inter-frame gap, as in the board MCU model: the SCIF receiver has a 16-byte
+ * FIFO, and the driver must drain the previous frame. Virtual time keeps boot
+ * independent of host load.
  */
 #define DISP_GAP_NS         (20 * 1000 * 1000)
-/* Доливання решти кадру, поки драйвер звільняє FIFO. */
+/* Refill the rest of the frame as the driver frees the FIFO. */
 #define DISP_FILL_NS        (1 * 1000 * 1000)
 
 /*
- * СИНТЕТИЧНІ значення полів кадру 0x24. Гість їх не перевіряє (див. шапку),
- * а лише друкує. Обрано так, щоб у логу було видно, що це модель:
- *   Version 0x01, UnitID 0x01, PartNum "QEMUDISP001" (11 ASCII, як у
- *   форматі друку @0xEF7141F8), плюс дванадцятий байт, який гість копіює,
- *   але ніде не читає — 0x00.
+ * SYNTHETIC values for frame 0x24 fields. The guest does not validate them;
+ * it only prints them. These values make the model identifiable in logs:
+ * Version 0x01, UnitID 0x01, PartNum "QEMUDISP001" (11 ASCII bytes, matching
+ * print format @0xEF7141F8), followed by a twelfth byte that the guest copies
+ * but never reads: 0x00.
  */
 #define DISP_VERSION        0x01
 #define DISP_UNIT_ID        0x01
 static const char disp_partnum[11] = "QEMUDISP001";
 
 typedef enum {
-    RX_IDLE,            /* чекаємо DLE */
-    RX_DLE,             /* бачили DLE поза кадром */
-    RX_BODY,            /* усередині кадру */
-    RX_BODY_DLE,        /* усередині кадру, бачили DLE */
-    RX_BCC,             /* наступний байт — контрольна сума */
+    RX_IDLE,            /* waiting for DLE */
+    RX_DLE,             /* saw DLE outside a frame */
+    RX_BODY,            /* inside a frame */
+    RX_BODY_DLE,        /* inside a frame, saw DLE */
+    RX_BCC,             /* next byte is the checksum */
 } DispRxState;
 
 struct ClarionDispMicomState {
@@ -131,7 +130,7 @@ struct ClarionDispMicomState {
     GQueue *frames;             /* queued panel frames */
     DispFrame *cur;             /* frame currently being sent */
     DispFrame *awaiting_ack;    /* sent key frame awaiting DLE ACK */
-    unsigned cur_off;           /* скільки з нього вже прийнято */
+    unsigned cur_off;           /* number of bytes already accepted */
     unsigned ack_retries;
 
     DispRxState rx_state;
@@ -139,7 +138,7 @@ struct ClarionDispMicomState {
     unsigned body_len;
     uint8_t bcc;
 
-    bool linked;                /* бачили 0x25 від гостя */
+    bool linked;                /* saw 0x25 from the guest */
     bool touch_input;
     QemuInputHandlerState *input_handler;
     uint16_t touch_x;
@@ -162,7 +161,7 @@ static void disp_frame_free(DispFrame *frame)
     }
 }
 
-/* --- побудова кадру ---------------------------------------------------- */
+/* --- frame construction ------------------------------------------------ */
 
 static GByteArray *disp_build(const uint8_t *data, unsigned len)
 {
@@ -173,7 +172,7 @@ static GByteArray *disp_build(const uint8_t *data, unsigned len)
     b = DLE; g_byte_array_append(f, &b, 1);
     b = STX; g_byte_array_append(f, &b, 1);
 
-    /* тіло = сам DATA, без LEN; стафінг DLE, BCC по стафнутих байтах */
+    /* Body is DATA (no LEN); DLE stuffing, BCC over stuffed bytes. */
     for (i = 0; i < len; i++) {
         uint8_t v = data[i];
 
@@ -248,7 +247,7 @@ static void disp_queue_ack(ClarionDispMicomState *s, uint8_t code)
     }
 }
 
-/* --- віддавання байтів у SCIF ------------------------------------------ */
+/* --- deliver bytes to SCIF --------------------------------------------- */
 
 static void disp_tx_expire(void *opaque)
 {
@@ -319,10 +318,10 @@ static void disp_tx_expire(void *opaque)
         s->cur = NULL;
         s->cur_off = 0;
         if (!g_queue_is_empty(s->frames)) {
-            disp_arm(s, DISP_GAP_NS);       /* пауза між кадрами */
+            disp_arm(s, DISP_GAP_NS);       /* inter-frame gap */
         }
     } else {
-        disp_arm(s, DISP_FILL_NS);          /* FIFO повний — доллємо згодом */
+        disp_arm(s, DISP_FILL_NS);          /* FIFO full; refill later */
     }
 }
 
@@ -360,7 +359,7 @@ static void disp_guest_ack(ClarionDispMicomState *s, uint8_t code)
     }
 }
 
-/* --- обробка кадру від гостя ------------------------------------------- */
+/* --- process a frame from the guest ------------------------------------ */
 
 static void disp_send_info(ClarionDispMicomState *s)
 {
@@ -370,7 +369,7 @@ static void disp_send_info(ClarionDispMicomState *s)
     data[1] = DISP_VERSION;
     data[2] = DISP_UNIT_ID;
     memcpy(&data[3], disp_partnum, sizeof(disp_partnum));
-    data[3 + sizeof(disp_partnum)] = 0x00;  /* гість копіює, але не читає */
+    data[3 + sizeof(disp_partnum)] = 0x00;  /* guest copies but never reads */
     disp_queue(s, data, sizeof(data));
 }
 
@@ -380,7 +379,7 @@ static void disp_frame(ClarionDispMicomState *s)
 
     disp_trace("guest-tx", s->body, s->body_len);
 
-    /* На кожен кадр — DLE ACK, як у живому лінку. */
+    /* Send a DLE ACK for every frame, as on the real link. */
     disp_queue_ack(s, ACK);
 
     if (!s->body_len) {
@@ -425,7 +424,7 @@ static void disp_frame(ClarionDispMicomState *s)
         break;
 
     default:
-        /* Решта команд панелі не розібрана — лише квитанція, без вигадок. */
+        /* Other panel commands are undecoded; ACK only, without guessing. */
         break;
     }
 }
@@ -559,7 +558,7 @@ static const QemuInputHandler disp_key_handler = {
     .event = disp_key_event,
 };
 
-/* --- розбір потоку від гостя ------------------------------------------- */
+/* --- parse the stream from the guest ----------------------------------- */
 
 void clarion_dispmicom_rx_byte(DeviceState *dev, uint8_t b)
 {
@@ -578,13 +577,13 @@ void clarion_dispmicom_rx_byte(DeviceState *dev, uint8_t b)
             s->bcc = 0;
             s->rx_state = RX_BODY;
         } else if (b == DLE) {
-            s->rx_state = RX_DLE;           /* 10 10 поза кадром — тримаємось */
+            s->rx_state = RX_DLE;           /* 10 10 outside a frame; stay */
         } else {
             if (b == ACK || b == NAK) {
                 disp_trace("guest-tx", (const uint8_t[]){ DLE, b }, 2);
                 disp_guest_ack(s, b);
             }
-            /* DLE ACK / DLE NAK від гостя — підтвердження наших кадрів */
+            /* DLE ACK / DLE NAK from guest acknowledge our frames */
             s->rx_state = RX_IDLE;
         }
         break;
@@ -600,7 +599,7 @@ void clarion_dispmicom_rx_byte(DeviceState *dev, uint8_t b)
 
     case RX_BODY_DLE:
         s->bcc ^= b;
-        if (b == DLE) {                     /* стафінг: один літеральний 0x10 */
+        if (b == DLE) {                     /* stuffed literal 0x10 */
             if (s->body_len < sizeof(s->body)) {
                 s->body[s->body_len++] = DLE;
             }
@@ -608,14 +607,14 @@ void clarion_dispmicom_rx_byte(DeviceState *dev, uint8_t b)
         } else if (b == ETX) {
             s->rx_state = RX_BCC;
         } else {
-            s->rx_state = RX_IDLE;          /* поламаний кадр — кидаємо */
+            s->rx_state = RX_IDLE;          /* malformed frame; discard */
         }
         break;
 
     case RX_BCC:
         if (b != s->bcc) {
-            qemu_log_mask(LOG_GUEST_ERROR, "clarion-dispmicom: BCC %#x, чекали "
-                          "%#x — кадр відкинуто\n", b, s->bcc);
+            qemu_log_mask(LOG_GUEST_ERROR, "clarion-dispmicom: BCC %#x, "
+                          "expected %#x; frame discarded\n", b, s->bcc);
             disp_queue_ack(s, NAK);
         } else {
             disp_frame(s);

@@ -1,70 +1,67 @@
 /*
- * LBSC DMAC — DMA-двигун читання паралельної NOR плати Clarion QY8XXX
+ * LBSC DMAC, the parallel NOR read DMA engine for the Clarion QY8XXX board
  * (WinCE 7.0).
  *
- * Навіщо. `Flash.dll` не читає NOR послідовністю команд CFI. IOCTL
- * `0x01112020` (`CFlashMain::FlashReadToPhysMem`) обчислює фізичний зсув у
- * мікросхемі й доручає перенесення окремому двигуну: той сам читає масив NOR
- * і пише в ОЗП за фізичною адресою. Поки блок не змодельовано, запити
- * ковтає широкий перехоплювач плати, у призначенні лишаються нулі, а
- * `CFlashDmacCtl::Transfer` усе одно віддає TRUE — бо результат очікування
- * завершення там просто відкидається. Наслідок у гості: порожня версія NK2,
- * `Version Error` і, через 5-секундний таймаут очікування переривання,
- * гонка, що валить AppLaunch у `memcpy` з нульового джерела.
+ * Why this model is needed: `Flash.dll` does not read NOR with CFI commands.
+ * IOCTL `0x01112020` (`CFlashMain::FlashReadToPhysMem`) computes a physical
+ * chip offset and delegates the transfer to a DMA engine, which reads the NOR
+ * array and writes to RAM at a physical address. Without this model, the
+ * board's broad interceptor swallowed requests and left the destination zero.
+ * `CFlashDmacCtl::Transfer` still returned TRUE because it discards the wait
+ * result. The guest then saw an empty NK2 version, reported `Version Error`,
+ * and after a 5-second interrupt timeout hit a race that crashed AppLaunch
+ * in `memcpy` with a null source.
  *
- * Звідки взято мапу регістрів. Не з аналогії з чужим SoC, а з коду самого
- * драйвера (`Flash.dll`, vbase 0xEFA00000) і з живого прогону: драйвер
- * тримає масив ВКАЗІВНИКІВ на регістри, і цей масив знято з гостя
- * (probe tools/qy8_flash_dma_probe.py репозиторію nissan-can-explore,
- * структура @0xC483D310):
+ * Register map sources: the driver's own code (`Flash.dll`, vbase
+ * 0xEFA00000) and a live run. The driver keeps an array of pointers to
+ * registers; this array was captured from the guest (structure @0xC483D310):
  *
- *   +0x00 = 0            номер каналу       -> біт 1<<0 у 0x410/0x414/0x418
- *   +0x04 = 2            режим (гілка «не 1» у dmac_IsFinished)
- *   +0x10..+0x18 -> 0x00/0x04/0x08   набір 0 {SAR, DAR, TCR}
- *   +0x1c..+0x24 -> 0x0c/0x10/0x14   набір 1
- *   +0x28..+0x30 -> 0x18/0x1c/0x20   набір 2
- *   +0x38 -> 0x28        CTRL   (`CFlashDmacCtl::Transfer` пише 0x00203515)
- *   +0x3c -> 0x2c        START  (запис 1)
- *   +0x40 -> 0x30        STOP   (запис 1)
- *   +0x44 -> 0x34        STATUS (біт 0 = «зайнятий»)
- *   +0x5c -> 0x410       INTSTAT (читання, біт на канал)
- *   +0x68 -> 0x414       INTCLR  (запис 1 у біт каналу)
- *   +0x74 -> 0x418       INTMASK (дозвіл переривання, біт на канал)
+ *   +0x00 = 0            channel number     -> bit 1<<0 in 0x410/0x414/0x418
+ *   +0x04 = 2            mode ("not 1" branch in dmac_IsFinished)
+ *   +0x10..+0x18 -> 0x00/0x04/0x08   set 0 {SAR, DAR, TCR}
+ *   +0x1c..+0x24 -> 0x0c/0x10/0x14   set 1
+ *   +0x28..+0x30 -> 0x18/0x1c/0x20   set 2
+ *   +0x38 -> 0x28        CTRL   (`CFlashDmacCtl::Transfer` writes 0x00203515)
+ *   +0x3c -> 0x2c        START  (write 1)
+ *   +0x40 -> 0x30        STOP   (write 1)
+ *   +0x44 -> 0x34        STATUS (bit 0 = busy)
+ *   +0x5c -> 0x410       INTSTAT (read, one bit per channel)
+ *   +0x68 -> 0x414       INTCLR  (write 1 to channel bit)
+ *   +0x74 -> 0x418       INTMASK (interrupt enable, one bit per channel)
  *
- * Порядок, який виконує прошивка (перевірено `-d unimp` на чистому буті):
+ * Firmware sequence (verified with `-d unimp` on a clean boot):
  *
  *   SAR <- 0x00AC0000 ; DAR <- 0x70196000 ; TCR <- 0x20
  *   CTRL <- 0x00203515
  *   ResetEvent(m_hFlashInterEvent)
  *   INTMASK |= 1                      ; @0xEFA0F590
- *   START <- 1                        ; @0xEFA0F514, і лише тепер іде обмін
- *   WaitForSingleObject(подія, 5000)  ; @0xEFA0E9F0 FlashDmacIsFinish
- *   ... переривання -> демукс OAL знімає INTMASK біт 0, дає SYSINTR 0x13 ...
+ *   START <- 1                        ; @0xEFA0F514, transfer starts here
+ *   WaitForSingleObject(event, 5000)   ; @0xEFA0E9F0 FlashDmacIsFinish
+ *   ... interrupt -> OAL demux clears INTMASK bit 0, signals SYSINTR 0x13 ...
  *   InterruptDone
- *   STOP <- 1 ; чекати STATUS.біт0 == 0 (до 100 мс)   ; @0xEFA0E9AC
- *   перевірити INTSTAT.біт0, записати 1 у INTCLR      ; @0xEFA0F8D8
+ *   STOP <- 1 ; wait for STATUS.bit0 == 0 (up to 100 ms) ; @0xEFA0E9AC
+ *   check INTSTAT.bit0, write 1 to INTCLR                 ; @0xEFA0F8D8
  *
- * Саме тому модель піднімає переривання НА ЗАПИС У START, а не раніше:
- * дозвіл переривання гість виставляє між CTRL і START, і рівнева логіка
- * `INTSTAT & INTMASK` відтворює це без жодних припущень про порядок.
+ * Therefore the model raises the interrupt ON WRITE TO START, not earlier:
+ * the guest enables interrupts between CTRL and START, and level logic
+ * `INTSTAT & INTMASK` reproduces this without assumptions about ordering.
  *
- * Що модель робить. На запис 1 у START переносить `TCR * 16` байтів із
- * `SAR` у `DAR` через фізичний простір (тобто реальні байти NOR, які віддає
- * модель мікросхеми), просуває SAR/DAR і обнуляє TCR, знімає «зайнятий» і
- * виставляє біт каналу в INTSTAT. Жодних знань про блок 0x56, адресу
- * 0xAC0000, заголовок NK2 чи AppLaunch тут немає — лише те, що гість сам
- * поклав у регістри.
+ * On write 1 to START, transfer `TCR * 16` bytes from `SAR` to `DAR` through
+ * physical memory (the actual NOR bytes provided by the flash model), advance
+ * SAR/DAR, clear TCR and busy, and set the channel bit in INTSTAT. The model
+ * has no knowledge of block 0x56, address 0xAC0000, NK2 headers or AppLaunch;
+ * it uses only values written by the guest.
  *
- * Чого свідомо немає (джерела не кажуть — не вигадуємо):
- *   CTRL (0x28): значення 0x00203515 зберігається, але не тлумачиться —
- *       які там поля, з коду драйвера не видно (він пише константу);
- *   0x400/0x404/0x40c: драйвер тримає на них вказівники, але в режимі 2
- *       (наш) не читає жодного разу;
- *   набори 1 і 2: прошивка на шляху читання користується лише набором 0;
- *       модель обслуговує будь-який набір із ненульовим TCR, бо це поведінка
- *       контролера, а не здогад про призначення наборів;
- *   канали, крім 0: сторінок інших каналів гість не чіпає;
- *   реальна тривалість обміну — переносимо все за один такт.
+ * Deliberate omissions (sources are silent, so behavior is not invented):
+ *   CTRL (0x28): store 0x00203515 but do not interpret it; the driver writes
+ *       a constant, so its fields are unknown;
+ *   0x400/0x404/0x40c: the driver keeps pointers to these but never reads them
+ *       in mode 2 (used here);
+ *   sets 1 and 2: firmware uses only set 0 for reads. The model handles any
+ *       set with nonzero TCR as controller behavior, not an assumption about
+ *       set purpose;
+ *   channels other than 0: the guest does not access their pages;
+ *   transfer duration: the model transfers everything in one tick.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -78,7 +75,7 @@
 #include "qom/object.h"
 #include "trace.h"
 
-/* Зсуви канальної сторінки. */
+/* Channel page offsets. */
 #define LBDMA_SAR(i)        (0x00 + (i) * 0x0C)
 #define LBDMA_DAR(i)        (0x04 + (i) * 0x0C)
 #define LBDMA_TCR(i)        (0x08 + (i) * 0x0C)
@@ -93,8 +90,8 @@
 #define LBDMA_STATUS_BUSY   (1u << 0)
 
 /*
- * Сторінка 0xFF801000 — це канал 0: драйвер бере номер каналу з власної
- * структури (поле +0x00 = 0) і ним же індексує біти 0x410/0x414/0x418.
+ * Page 0xFF801000 is channel 0: the driver reads the channel number from its
+ * own structure (field +0x00 = 0) and uses it to index bits in 0x410/0x414/0x418.
  */
 #define LBDMA_CH            0
 #define LBDMA_CH_BIT        (1u << LBDMA_CH)
@@ -122,7 +119,7 @@ static void lbdma_update_irq(ClarionLbDmaState *s)
     qemu_set_irq(s->irq, (s->intstat & s->intmask) != 0);
 }
 
-/* Один набір {SAR, DAR, TCR}. Повертає перенесені байти. */
+/* Transfer one {SAR, DAR, TCR} set. Return the number of bytes transferred. */
 static uint32_t lbdma_run_desc(ClarionLbDmaState *s, int i)
 {
     uint8_t buf[256];
@@ -146,9 +143,9 @@ static uint32_t lbdma_run_desc(ClarionLbDmaState *s, int i)
     }
 
     /*
-     * Лічильник вичерпано, адреси просунуто — так поводиться контролер,
-     * і так гість не перенесе той самий набір удруге, якщо START прийде
-     * ще раз без переініціалізації.
+     * Count is exhausted and addresses advanced, matching controller
+     * behavior and preventing a second transfer if START is written again
+     * without reinitialization.
      */
     s->sar[i] += done;
     s->dar[i] += done;
@@ -167,8 +164,8 @@ static void lbdma_start(ClarionLbDmaState *s)
     trace_clarion_lbdma_start(s->ctrl, total);
 
     /*
-     * Обмін у моделі миттєвий, тож «зайнятий» ніколи не лишається піднятим:
-     * драйвер опитує STATUS.біт0 після STOP і чекає саме нуля.
+     * The model transfers instantly, so busy never remains set: after STOP,
+     * the driver polls STATUS.bit0 and expects zero.
      */
     s->status &= ~LBDMA_STATUS_BUSY;
     s->intstat |= LBDMA_CH_BIT;
@@ -204,10 +201,10 @@ static uint64_t lbdma_read(void *opaque, hwaddr addr, unsigned size)
     case LBDMA_START:
     case LBDMA_STOP:
     case LBDMA_INTCLR:
-        return 0;               /* лише на запис */
+        return 0;               /* write-only */
     default:
         qemu_log_mask(LOG_UNIMP,
-                      "clarion-lbdma: читання невідомого регістра +0x%03"
+                      "clarion-lbdma: read from unknown register +0x%03"
                       HWADDR_PRIx "\n", addr);
         return 0;
     }
@@ -259,10 +256,10 @@ static void lbdma_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         break;
     case LBDMA_STATUS:
     case LBDMA_INTSTAT:
-        break;                  /* лише на читання */
+        break;                  /* read-only */
     default:
         qemu_log_mask(LOG_UNIMP,
-                      "clarion-lbdma: запис невідомого регістра +0x%03"
+                      "clarion-lbdma: write to unknown register +0x%03"
                       HWADDR_PRIx " <- 0x%08" PRIx64 "\n", addr, val);
         break;
     }
