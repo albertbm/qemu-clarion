@@ -28,6 +28,9 @@ typedef struct ClarionBoardInfo {
 static const ClarionBoardInfo clarion_boards[] = {
     { "QY8652NB", "qy8652nb", "arm", "clarion-qy8", 1, NULL },
     { "QY8202NA", "qy8202na", "arm", "clarion-qy8", 1, NULL },
+    { "QY8602NB", "qy8602nb", "arm", "clarion-qy8", 1, NULL },
+    { "QY8600NE", "qy8600ne", "arm", "clarion-qy8", 1, NULL },
+    { "QY8202PB", "qy8202pb", "arm", "clarion-qy8", 1, NULL },
     { "QY7221NL", "qy7221nl", "sh4", "clarion-qy7", 1, "shift=2" },
 };
 

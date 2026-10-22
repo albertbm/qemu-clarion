@@ -1618,6 +1618,9 @@ typedef struct Qy8BoardProperties {
 static const Qy8BoardProperties qy8_board_properties[] = {
     { "qy8652nb", false },
     { "qy8202na", true },
+    { "qy8602nb", false },
+    { "qy8600ne", false },
+    { "qy8202pb", true },
 };
 
 struct Qy8MachineState {
@@ -1838,7 +1841,8 @@ static bool qy8_flash_model(MachineState *machine, hwaddr *prod_offset,
 
 static void qy8_resolve_board(Qy8MachineState *s, MachineState *machine)
 {
-    static const char hint[] = "choose one with board=qy8652nb|qy8202na";
+    static const char hint[] = "choose one with "
+        "board=qy8652nb|qy8602nb|qy8600ne|qy8202na|qy8202pb";
     const ClarionBoardInfo *detected = NULL;
     char model[CLARION_PROD_MODEL_LEN + 1] = "";
     uint8_t first[4] = { 0 };
@@ -2657,7 +2661,8 @@ static void qy8_board_set(Object *obj, const char *value, Error **errp)
     Qy8MachineState *s = QY8_MACHINE(obj);
 
     if (g_strcmp0(value, "auto") && !qy8_board_by_name(value)) {
-        error_setg(errp, "board must be auto, qy8652nb, or qy8202na");
+        error_setg(errp, "board must be auto, qy8652nb, qy8602nb, "
+                   "qy8600ne, qy8202na or qy8202pb");
         return;
     }
     g_free(s->board);
@@ -2940,7 +2945,8 @@ static void qy8_machine_instance_init(Object *obj)
     object_property_add_str(obj, "board", qy8_board_get, qy8_board_set);
     object_property_set_description(obj, "board",
         "board peripherals by unit model: auto (default, read from the "
-        "flash image), qy8652nb, or qy8202na");
+        "flash image), qy8652nb, qy8602nb, qy8600ne, qy8202na "
+        "or qy8202pb");
 
     s->dipsw = QY8_DIPSW_NORM_RES;
     object_property_add_uint8_ptr(obj, "dipsw", &s->dipsw,
