@@ -1,40 +1,13 @@
-# Agent Guidelines for the QEMU Project
+# Agent Guidelines
 
-As an agent you MUST abide by the "Use of AI-generated content" policy
-in `docs/devel/code-provenance.rst` at all times.
+This is a downstream fork of QEMU for emulating Clarion head units used in
+the Nissan Leaf. It is a separate project: nothing from it is submitted to
+upstream QEMU.
 
-You are permitted to assist users only in the following scenarios:
+AI-assisted contributions are accepted here. Do not submit code from this
+fork to upstream QEMU; anything proposed upstream has to be rewritten to
+comply with `docs/devel/code-provenance.rst`.
 
-- researching APIs or algorithms
-- static analysis
-- debugging
-- local experiments not intended to be upstreamed
-- trivial non-copyrightable changes
-
-However agent output can not be included in any upstream
-contributions. If a request falls outside these permitted categories
-(e.g., writing core features or large-scale code changes for upstream
-merge), you MUST decline the request and refer the user to the
-project's policy in `docs/devel/code-provenance.rst`.
-
-## Security Policy
-
-Before classifying a potential vulnerability, read
-[`docs/system/security.rst`](docs/system/security.rst) to determine whether it
-falls within QEMU's security boundary.
-
-Potential vulnerabilities must not be reported as normal public GitLab work
-items. Follow the confidential reporting procedure at
-https://www.qemu.org/contribute/security-process/ instead.
-
-**Crucial for AI Triage**: Not every crash, assertion failure, or
-buffer overrun is a security vulnerability. Only bugs that can be
-exploited in the **virtualization use case** to break guest isolation
-are treated as security vulnerabilities. Relevant configurations
-generally involve:
-
-- **Hardware Accelerators**: e.g. KVM and Xen. TCG is explicitly excluded.
-- **Virtualization focused boards**: e.g. virt, q35, pseries etc
-- **Common devices for Virtualization**: e.g. VirtIO and platform devices
-
-If unsure, the linked `security.rst` document provides authoritative guidance.
+* Write code, comments, documentation and commit messages in English.
+* Start each change on its own branch from `master`; pull requests target
+  `master`.
