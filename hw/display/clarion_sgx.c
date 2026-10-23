@@ -594,6 +594,7 @@ static bool sgx_b2_complete_cmd(ClarionSgxState *s, uint32_t pd,
     uint32_t cmdta_pa;
     uint32_t ready, ready_pa, list_dva = 0, pending, pending_pa;
     uint32_t dva, dva_pa, before, sync_pa, after;
+    ClarionSgxSyntheticWord *own = NULL;
     char chain[2048];
     size_t used = 0;
 
@@ -634,7 +635,8 @@ static bool sgx_b2_complete_cmd(ClarionSgxState *s, uint32_t pd,
         sgx_b2_skip(kick, "sync_unmapped", dva);
         return false;
     }
-    if (before != pending) {
+    /* word already ahead: the command is done; if behind, catch up to pending + 1 */
+    if (before != pending && (int32_t)(pending - before) < 0) {
         sgx_b2_skip(kick, "unexpected_complete", dva);
         return true;
     }
@@ -642,20 +644,28 @@ static bool sgx_b2_complete_cmd(ClarionSgxState *s, uint32_t pd,
         sgx_b2_skip(kick, "store_history_overflow", dva);
         return false;
     }
-    if (sgx_b2_prior_writer(s, sync_pa, 4)) {
+    for (unsigned i = 0; i < s->nb2_synthetic; i++) {
+        if (s->b2_synthetic[i].valid && s->b2_synthetic[i].pa == sync_pa) {
+            own = &s->b2_synthetic[i];
+        }
+    }
+    /* our own word may move on: each later TA on the same sync */
+    if (!own && sgx_b2_prior_writer(s, sync_pa, 4)) {
         sgx_b2_skip(kick, "prior_model_writer", dva);
         return false;
     }
-    if (s->nb2_synthetic >= SGX_B2_SYNTH_MAX) {
+    if (!own && s->nb2_synthetic >= SGX_B2_SYNTH_MAX) {
         sgx_b2_skip(kick, "synthetic_provenance_full", dva);
         return false;
     }
     after = pending + 1;
     sgx_phys_st32(sync_pa, after);
-    sgx_b2_record_store(s, dva, sync_pa, after, 4, true);
-    {
-        ClarionSgxSyntheticWord *sw = &s->b2_synthetic[s->nb2_synthetic++];
-        *sw = (ClarionSgxSyntheticWord) { dva, sync_pa, after, true };
+    if (own) {
+        own->value = after;
+    } else {
+        sgx_b2_record_store(s, dva, sync_pa, after, 4, true);
+        s->b2_synthetic[s->nb2_synthetic++] =
+            (ClarionSgxSyntheticWord) { dva, sync_pa, after, true };
     }
     s->nstores++;
     used += snprintf(chain + used, sizeof(chain) - used, "%s", prefix);
@@ -797,6 +807,14 @@ static void sgx_b2_dispatch(ClarionSgxState *s, uint32_t pd,
                      "{\"step\":\"ctl+4\",\"dva\":\"0x%08x\",\"pa\":\"0x%08x\",\"value\":\"0x%08x\"},",
                      ctl_dva + 4, ctl_pa, read_offset);
     if (!s->nullrender_all) {
+        /*
+         * Nothing advances ReadOffset (there is no microkernel), so it always
+         * points at the first command; take the newest, just before WriteOffset.
+         */
+        if (sgx_b2_read32(pd, ctl_dva, &write_offset, &ctl_wo_pa) &&
+            write_offset >= read_offset + SGX_B2_CMDTA_SIZE) {
+            read_offset = write_offset - SGX_B2_CMDTA_SIZE;
+        }
         if (read_offset > UINT32_MAX - base_dva) {
             sgx_b2_skip(kick, "cmdta_address_overflow", base_dva);
             return;
