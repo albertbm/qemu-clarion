@@ -51,13 +51,15 @@
  * * Bit 13 of the first mailbox halfword reads zero; it is the only bit the
  *   driver excludes from its memory test (mask 0xDFFF). In the Linux map this
  *   corresponds to reserved bit 29 of the 32-bit ID field.
- * * No interrupt is generated: no model event raises one, and the CAN GIC
- *   line number is unproven.
+ * * Receive is the only interrupt: ISR (+0x861) bit 0x02 while a mailbox has
+ *   RECREQ|NEWDATA and is enabled in MIER0/1; the line is ISR & IER (+0x860).
+ *   The GIC number comes from the OAL table, see clarion_qy8.c (QY8_CAN_SPI).
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
 #include "qemu/osdep.h"
+#include <stdarg.h>
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include "accel/tcg/cpu-loop.h"
@@ -65,9 +67,12 @@
 #include "hw/core/cpu.h"
 #include "qemu/module.h"
 #include "hw/core/sysbus.h"
+#include "hw/core/irq.h"
 #include "hw/net/renesas_can.h"
 #include "migration/vmstate.h"
 #include "qom/object.h"
+#include "qapi/error.h"
+#include "qemu/error-report.h"
 #include "trace.h"
 
 OBJECT_DECLARE_SIMPLE_TYPE(RenesasCANState, RENESAS_CAN)
@@ -100,7 +105,24 @@ OBJECT_DECLARE_SIMPLE_TYPE(RenesasCANState, RENESAS_CAN)
 /* Registers with behavior beyond storage (offsets from CAN_CTL_BASE). */
 #define CTL_OFF(x)      ((x) - CAN_CTL_BASE)
 #define CTL_MSSR        CTL_OFF(0x852)
+#define CTL_IER         CTL_OFF(0x860)
+#define CTL_ISR         CTL_OFF(0x861)
+/* the driver reads ISR bits 1|2 as "receive pending" (CAN.dll 0xEF658528, ZE0 062) */
+#define ISR_RX          0x02
+#define MKR_MIER1       0x2c    /* interrupt enable, mailboxes 32..63     */
+#define MKR_MIER0       0x3c    /* mailboxes 0..31                        */
 #define MSSR_SEST       0x80    /* 1 = no search result                   */
+
+/*
+ * MCTL (one byte per mailbox, CAN_CTL_BASE + mailbox index). No official
+ * description confirms the bits; this is the common layout across related
+ * Renesas blocks (H8S/SH/RX CAN, and the same MCTL[i]=0x40 reset write at
+ * 0xEF629308 above). NOT measured: an assumption for logging and for
+ * answering "transmit done" / "data received" without a bus.
+ */
+#define MCTL_TRMREQ     0x80    /* I: transmit request (set by guest)   */
+#define MCTL_RECREQ     0x40    /* I: mailbox set up for receive        */
+#define MCTL_DATA       0x01    /* I: "data ready": TX done and RX new  */
 
 enum {
     CAN_MODE_RESET,
@@ -108,10 +130,22 @@ enum {
     CAN_MODE_OPERATION,
 };
 
+/* one QY8_CANRX line: a frame repeated every period_ms */
+typedef struct CanRxReplay {
+    QEMUTimer *timer;
+    struct RenesasCANState *s;
+    uint32_t period_ms;
+    uint32_t id;
+    bool ext;
+    uint8_t dlc;
+    uint8_t data[8];
+} CanRxReplay;
+
 struct RenesasCANState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
+    qemu_irq irq;
 
     uint8_t mb[CAN_MB_SIZE];    /* mailbox memory                         */
     uint8_t mkr[CAN_MKR_SIZE];  /* masks/filters/interrupt enables        */
@@ -122,7 +156,16 @@ struct RenesasCANState {
 
     /* QY8_CAN_PC=1 adds caller pc/lr to each trace line. */
     bool trace_pc;
+
+    /* QY8_CANLOG=path: log every frame and each mode/filter change */
+    FILE *canlog;
+
+    /* QY8_CANRX=file: repeated receive frames, see can_load_rx_file */
+    CanRxReplay *replay;
+    int n_replay;
 };
+
+static void can_log(RenesasCANState *s, const char *fmt, ...) G_GNUC_PRINTF(2, 3);
 
 static const char *can_mode_name(uint8_t mode)
 {
@@ -184,6 +227,8 @@ static void can_ctlr_write(RenesasCANState *s, uint16_t ctlr)
     if (s->mode != old || s->sleep != oldsleep) {
         trace_renesas_can_mode(can_mode_name(old), can_mode_name(s->mode),
                                s->sleep, can_str(s));
+        can_log(s, "MODE %s -> %s sleep=%d", can_mode_name(old),
+               can_mode_name(s->mode), s->sleep);
     }
 }
 
@@ -242,6 +287,129 @@ static void can_ctx(RenesasCANState *s, char *buf, size_t len)
              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL));
 }
 
+static void can_log(RenesasCANState *s, const char *fmt, ...)
+{
+    va_list ap;
+
+    if (!s->canlog) {
+        return;
+    }
+    fprintf(s->canlog, "%" PRId64 " ", qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL));
+    va_start(ap, fmt);
+    vfprintf(s->canlog, fmt, ap);
+    va_end(ap);
+    fputc('\n', s->canlog);
+    fflush(s->canlog);
+}
+
+/*
+ * Mailbox layout (16 bytes), from the guest's self-test mask (0xEF6294BC
+ * above) and from what the driver writes itself: halfword +0x0 =
+ * IDE(15) RTR(14) 0(13) SID(12..2) EID17..16(1..0), +0x2 = EID15..0,
+ * +0x4 DLC, +0x6..+0xD data. Measured on ZE0 062: mailboxes 0..2 hold
+ * 0x1a04/0x1d1c/0x1ab0, i.e. 0x681/0x747/0x6AC, and the driver compares IDs
+ * as (h0 & 0x1ffc) == id << 2 (CAN.dll 0xEF6585FC).
+ */
+static void can_frame_decode(const uint8_t *mb, uint32_t *id, bool *ext,
+                             uint8_t *dlc, uint8_t data[8])
+{
+    uint16_t w0 = can_ld(mb, 2), w1 = can_ld(mb + 2, 2);
+
+    *ext = (w0 & 0x8000) != 0;
+    *id = (w0 >> 2) & 0x7ff;
+    if (*ext) {
+        *id = (*id << 18) | ((w0 & 3) << 16) | w1;
+    }
+    *dlc = mb[4] & 0xf;
+    memcpy(data, mb + 6, 8);
+}
+
+static void can_frame_encode(uint8_t *mb, uint32_t id, bool ext, uint8_t dlc,
+                             const uint8_t *data)
+{
+    if (ext) {
+        can_st(mb, 2, 0x8000 | ((id >> 18) & 0x7ff) << 2 | ((id >> 16) & 3));
+        can_st(mb + 2, 2, id & 0xffff);
+    } else {
+        can_st(mb, 2, (id & 0x7ff) << 2);
+    }
+    mb[4] = dlc & 0xf;
+    memcpy(mb + 6, data, 8);
+}
+
+static void can_log_frame(RenesasCANState *s, const char *tag, int mbidx,
+                          uint32_t id, bool ext, uint8_t dlc,
+                          const uint8_t *data)
+{
+    char hex[2 * 8 + 1];
+    int i;
+
+    for (i = 0; i < 8 && i < dlc; i++) {
+        snprintf(hex + 2 * i, 3, "%02x", data[i]);
+    }
+    hex[2 * MIN(dlc, 8)] = '\0';
+    can_log(s, "%s mb=%d id=0x%03x%s dlc=%u data=%s", tag, mbidx, id,
+           ext ? "x" : "", dlc, hex);
+}
+
+/*
+ * Put a frame in receive mailbox mbidx and set "data ready" (MCTL_DATA).
+ * Used by both the rx qom property and the QY8_CANRX repeat file.
+ */
+static uint8_t can_isr(RenesasCANState *s)
+{
+    uint32_t mier0 = can_ld(&s->mkr[MKR_MIER0], 4);
+    uint32_t mier1 = can_ld(&s->mkr[MKR_MIER1], 4);
+    int i;
+
+    for (i = 0; i < 64; i++) {
+        bool en = i < 32 ? mier0 & BIT(i) : mier1 & BIT(i - 32);
+
+        if (en && (s->ctl[i] & (MCTL_RECREQ | MCTL_DATA)) ==
+                  (MCTL_RECREQ | MCTL_DATA)) {
+            return ISR_RX;
+        }
+    }
+    return 0;
+}
+
+static void can_update_irq(RenesasCANState *s)
+{
+    qemu_set_irq(s->irq, can_isr(s) & s->ctl[CTL_IER]);
+}
+
+static void can_deliver_rx(RenesasCANState *s, int mbidx, uint32_t id,
+                           bool ext, uint8_t dlc, const uint8_t *data)
+{
+    can_frame_encode(&s->mb[mbidx * 16], id, ext, dlc, data);
+    s->ctl[mbidx] |= MCTL_DATA;
+    can_log_frame(s, "RX", mbidx, id, ext, dlc, data);
+    can_update_irq(s);
+}
+
+/* receive mailbox with the same ID; masks are not modelled (guest sets MKIVLR = ~0) */
+static int can_find_rx_mailbox(RenesasCANState *s, uint32_t id, bool ext)
+{
+    int i;
+
+    for (i = 0; i < 64; i++) {
+        if (!(s->ctl[i] & MCTL_RECREQ)) {
+            continue;
+        }
+        {
+            uint32_t cid;
+            bool cext;
+            uint8_t cdlc, cdata[8];
+
+            can_frame_decode(&s->mb[i * 16], &cid, &cext, &cdlc, cdata);
+            if (cid == id && cext == ext) {
+                return i;
+            }
+        }
+    }
+    return -1;
+}
+
 static uint64_t can_read(void *opaque, hwaddr addr, unsigned size)
 {
     RenesasCANState *s = opaque;
@@ -254,6 +422,8 @@ static uint64_t can_read(void *opaque, hwaddr addr, unsigned size)
         val = can_ld(&s->mkr[addr - CAN_MKR_BASE], size);
     } else if (addr == CAN_STR && size == 2) {
         val = can_str(s);
+    } else if (addr == CAN_CTL_BASE + CTL_ISR && size == 1) {
+        val = can_isr(s);
     } else if (addr >= CAN_CTL_BASE && addr < CAN_CTL_BASE + CAN_CTL_SIZE) {
         val = can_ld(&s->ctl[addr - CAN_CTL_BASE], size);
     } else {
@@ -296,6 +466,8 @@ static void can_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     }
     if (addr >= CAN_MKR_BASE && addr < CAN_MKR_BASE + CAN_MKR_SIZE) {
         can_st(&s->mkr[addr - CAN_MKR_BASE], size, val);
+        can_log(s, "FILTER +0x%03" HWADDR_PRIx " = 0x%" PRIx64, addr, val);
+        can_update_irq(s);
         return;
     }
     if (addr == CAN_STR && size == 2) {
@@ -305,9 +477,49 @@ static void can_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         return;
     }
     if (addr >= CAN_CTL_BASE && addr < CAN_CTL_BASE + CAN_CTL_SIZE) {
-        can_st(&s->ctl[addr - CAN_CTL_BASE], size, val);
-        if (addr <= CAN_CTLR && addr + size > CAN_CTLR) {
-            can_ctlr_write(s, can_ld(&s->ctl[CTL_OFF(CAN_CTLR)], 2));
+        /*
+         * MCTL[0..63] sit in the first 64 bytes of this block. Keep the old
+         * value: a 0->1 edge on TRMREQ/RECREQ is the "guest did something"
+         * event, which we complete at once since there is no bus.
+         */
+        hwaddr base = addr - CAN_CTL_BASE;
+
+        if (base < 64) {
+            unsigned i;
+
+            for (i = 0; i < size && base + i < 64; i++) {
+                unsigned mbidx = base + i;
+                uint8_t old = s->ctl[mbidx];
+                uint8_t nv = val >> (8 * i);
+
+                s->ctl[mbidx] = nv;
+                if ((nv & MCTL_TRMREQ) && !(old & MCTL_TRMREQ)) {
+                    uint32_t id;
+                    bool ext;
+                    uint8_t dlc, data[8];
+
+                    can_frame_decode(&s->mb[mbidx * 16], &id, &ext, &dlc,
+                                     data);
+                    can_log_frame(s, "TX", mbidx, id, ext, dlc, data);
+                    /* "sent" at once: TRMREQ cleared, data ready */
+                    s->ctl[mbidx] = (s->ctl[mbidx] & ~MCTL_TRMREQ) |
+                                    MCTL_DATA;
+                }
+                if ((nv & MCTL_RECREQ) && !(old & MCTL_RECREQ)) {
+                    can_log(s, "RXCFG mb=%u", mbidx);
+                }
+            }
+            can_update_irq(s);
+        } else {
+            can_st(&s->ctl[base], size, val);
+            if (addr <= CAN_CTLR && addr + size > CAN_CTLR) {
+                can_ctlr_write(s, can_ld(&s->ctl[CTL_OFF(CAN_CTLR)], 2));
+            }
+            can_update_irq(s);
+            if (addr <= 0x846 && addr + size > 0x844) {
+                can_log(s, "BCR = 0x%04x",
+                       (unsigned)can_ld(&s->ctl[CTL_OFF(0x844)], 2));
+            }
         }
         return;
     }
@@ -342,14 +554,156 @@ static void can_reset_hold(Object *obj, ResetType type)
     s->ctl[CTL_MSSR] = MSSR_SEST;
 }
 
+/*
+ * "ID#DATA" in hex, e.g. "5c5#0102030405060708". An ID > 0x7FF is taken as
+ * extended (29 bits), the same split can_frame_decode uses.
+ */
+static bool can_parse_frame(const char *str, uint32_t *id, bool *ext,
+                            uint8_t *dlc, uint8_t data[8])
+{
+    const char *hashp = strchr(str, '#');
+    char idbuf[16];
+    size_t idlen, i;
+
+    if (!hashp || hashp - str >= (ptrdiff_t)sizeof(idbuf)) {
+        return false;
+    }
+    idlen = hashp - str;
+    memcpy(idbuf, str, idlen);
+    idbuf[idlen] = '\0';
+    *id = strtoul(idbuf, NULL, 16);
+    *ext = *id > 0x7ff;
+
+    hashp++;
+    *dlc = 0;
+    memset(data, 0, 8);
+    for (i = 0; i * 2 + 1 < strlen(hashp) + 1 && *dlc < 8; i++) {
+        char byte[3] = { hashp[i * 2], hashp[i * 2 + 1], '\0' };
+
+        if (!byte[0] || !byte[1]) {
+            break;
+        }
+        data[*dlc] = strtoul(byte, NULL, 16);
+        (*dlc)++;
+    }
+    return true;
+}
+
+static void can_inject(RenesasCANState *s, uint32_t id, bool ext,
+                       uint8_t dlc, const uint8_t *data)
+{
+    int mbidx = can_find_rx_mailbox(s, id, ext);
+
+    if (mbidx < 0) {
+        can_log(s, "RX id=0x%03x%s dropped: no receive mailbox has this ID",
+               id, ext ? "x" : "");
+        return;
+    }
+    can_deliver_rx(s, mbidx, id, ext, dlc, data);
+}
+
+static void can_rx_set(Object *obj, const char *value, Error **errp)
+{
+    RenesasCANState *s = RENESAS_CAN(obj);
+    uint32_t id;
+    bool ext;
+    uint8_t dlc, data[8];
+
+    if (!can_parse_frame(value, &id, &ext, &dlc, data)) {
+        error_setg(errp, "renesas-can: rx needs \"ID#DATA\" in hex");
+        return;
+    }
+    can_inject(s, id, ext, dlc, data);
+}
+
+static char *can_rx_get(Object *obj, Error **errp)
+{
+    return g_strdup("");
+}
+
+static void can_replay_tick(void *opaque)
+{
+    CanRxReplay *r = opaque;
+
+    can_inject(r->s, r->id, r->ext, r->dlc, r->data);
+    timer_mod(r->timer,
+             qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + r->period_ms);
+}
+
+/*
+ * QY8_CANRX=file: one frame per line, "period_ms ID#DATA". Blank lines and
+ * lines starting with # are skipped.
+ */
+static void can_load_rx_file(RenesasCANState *s, const char *path)
+{
+    gchar *contents;
+    gsize len;
+    GError *gerr = NULL;
+    gchar **lines;
+    int i, n;
+
+    if (!g_file_get_contents(path, &contents, &len, &gerr)) {
+        warn_report("QY8_CANRX: %s", gerr->message);
+        g_error_free(gerr);
+        return;
+    }
+    lines = g_strsplit(contents, "\n", 0);
+    g_free(contents);
+
+    for (n = 0; lines[n]; n++) {
+        /* just counting */
+    }
+    s->replay = g_new0(CanRxReplay, n);
+    s->n_replay = 0;
+
+    for (i = 0; lines[i]; i++) {
+        gchar *line = g_strstrip(lines[i]);
+        unsigned period;
+        char iddata[64];
+        CanRxReplay *r;
+
+        if (!*line || *line == '#') {
+            continue;
+        }
+        if (sscanf(line, "%u %63s", &period, iddata) != 2) {
+            warn_report("QY8_CANRX: bad line %s", line);
+            continue;
+        }
+        r = &s->replay[s->n_replay];
+        if (!can_parse_frame(iddata, &r->id, &r->ext, &r->dlc, r->data)) {
+            warn_report("QY8_CANRX: bad frame %s", iddata);
+            continue;
+        }
+        r->s = s;
+        r->period_ms = period;
+        r->timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, can_replay_tick, r);
+        timer_mod(r->timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + period);
+        s->n_replay++;
+    }
+    g_strfreev(lines);
+}
+
 static void can_init(Object *obj)
 {
     RenesasCANState *s = RENESAS_CAN(obj);
+    const char *canlog = getenv("QY8_CANLOG");
+    const char *canrx = getenv("QY8_CANRX");
 
     s->trace_pc = getenv("QY8_CAN_PC") != NULL;
+    if (canlog) {
+        s->canlog = fopen(canlog, "a");
+        if (!s->canlog) {
+            warn_report("QY8_CANLOG: %s: %s", canlog, strerror(errno));
+        }
+    }
+    if (canrx) {
+        can_load_rx_file(s, canrx);
+    }
+    object_property_add_str(obj, "rx", can_rx_get, can_rx_set);
     memory_region_init_io(&s->iomem, obj, &can_ops, s, "renesas-can",
                           RENESAS_CAN_SIZE);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
+    sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->irq);
 }
 
 static const VMStateDescription vmstate_renesas_can = {

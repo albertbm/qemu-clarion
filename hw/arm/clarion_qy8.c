@@ -218,6 +218,8 @@ static int qy8_scif_chr_index(int scif)
  * for command completion only through the ISR.
  */
 #define QY8_CAN_BASE        0xFFFD1000
+/* OAL: 0xFFFD1800 -> IRQ 115 (nk.exe QY8202NA @0x880127c4), GIC ID 115 = SPI 83 */
+#define QY8_CAN_SPI         83
 #define QY8_SDHI_BASE       0xFFE4C000
 #define QY8_SDHI_STRIDE     0x1000
 #define QY8_NUM_SDHI        2
@@ -2565,6 +2567,8 @@ static void qy8_init(MachineState *machine)
         s->can = qdev_new(TYPE_RENESAS_CAN);
         sysbus_realize_and_unref(SYS_BUS_DEVICE(s->can), &error_fatal);
         sysbus_mmio_map(SYS_BUS_DEVICE(s->can), 0, QY8_CAN_BASE);
+        sysbus_connect_irq(SYS_BUS_DEVICE(s->can), 0,
+                           qdev_get_gpio_in(s->gic, QY8_CAN_SPI));
     }
 
     /*
