@@ -429,6 +429,28 @@ static void format_message(uint32_t fmt_addr, ArgIter *args, GString *message)
     }
 }
 
+/*
+ * NKDbgPrintfW forwards to NKvDbgPrintfW a few instructions after its entry.
+ * Skip calls returning that close to a hooked entry so each message is
+ * printed once.
+ */
+#define NESTED_CALL_WINDOW 0x40
+
+static bool called_from_hook(uint32_t lr)
+{
+    GHashTableIter iter;
+    gpointer key;
+
+    lr &= ~1u;
+    g_hash_table_iter_init(&iter, symbols);
+    while (g_hash_table_iter_next(&iter, &key, NULL)) {
+        if (lr - GPOINTER_TO_UINT(key) < NESTED_CALL_WINDOW) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void print_debug(unsigned int vcpu_index, void *userdata)
 {
     DbgSymbol *sym = userdata;
@@ -440,6 +462,9 @@ static void print_debug(unsigned int vcpu_index, void *userdata)
     }
     sp = read_reg(reg_sp);
     lr = read_reg(reg_lr);
+    if (called_from_hook(lr)) {
+        return;
+    }
     if (!strcmp(sym->name, "OutputDebugStringW")) {
         char text[512];
         read_wide(args[0], text, sizeof(text));
