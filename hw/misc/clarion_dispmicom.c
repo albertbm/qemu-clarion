@@ -95,6 +95,8 @@ typedef struct DispFrame {
 #define CMD_KEY             CMD_PANEL_KEY
 #define KEY_PRESSED         0x80
 #define CMD_ROTARY          0x35
+/* VOL push (power): kepdrv takes a bare 37 as key id f0, VK 05, pressed */
+#define CMD_POWER           0x37
 
 /*
  * Inter-frame gap, as in the board MCU model: the SCIF receiver has a 16-byte
@@ -160,6 +162,10 @@ struct ClarionDispMicomState {
     uint8_t key_held;
 
     bool panel_jpn;             /* code table: false = row (0x10180201), true = jpn (0x10180202) */
+
+    QEMUTimer *combo;           /* diag combo: MAP x3, POWER x2, MAP x1 */
+    unsigned combo_step;
+    uint32_t combo_gap_ms;      /* qom "combo-gap-ms", default below */
 };
 
 static void disp_frame_free(DispFrame *frame)
@@ -571,6 +577,66 @@ static void disp_rotary(ClarionDispMicomState *s, int vol, int tune)
     disp_queue(s, (const uint8_t[]){ CMD_ROTARY, a, b }, 3);
 }
 
+#define COMBO_GAP_MS_DEFAULT 80
+/* kepdrv drops every other key until its POWER release timer (~300 ms) runs out */
+#define COMBO_POWER_HOLD_MS 400
+
+/* diag menu: on the Audio screen, MAP press/release x3, POWER x2, MAP x1 */
+typedef enum { COMBO_MAP_DOWN, COMBO_MAP_UP, COMBO_POWER } ComboAction;
+
+static const ComboAction combo_steps[] = {
+    COMBO_MAP_DOWN, COMBO_MAP_UP,
+    COMBO_MAP_DOWN, COMBO_MAP_UP,
+    COMBO_MAP_DOWN, COMBO_MAP_UP,
+    COMBO_POWER,
+    COMBO_POWER,
+    COMBO_MAP_DOWN, COMBO_MAP_UP,
+};
+
+static void disp_combo_fire(void *opaque)
+{
+    ClarionDispMicomState *s = opaque;
+    uint8_t map = s->panel_jpn ? 0x32 : 0x00;
+
+    if (s->combo_step >= ARRAY_SIZE(combo_steps)) {
+        return;
+    }
+    switch (combo_steps[s->combo_step]) {
+    case COMBO_MAP_DOWN:
+        disp_queue(s, (const uint8_t[]){ CMD_KEY, map | KEY_PRESSED }, 2);
+        break;
+    case COMBO_MAP_UP:
+        disp_queue(s, (const uint8_t[]){ CMD_KEY, map }, 2);
+        break;
+    case COMBO_POWER:
+        disp_queue(s, (const uint8_t[]){ CMD_POWER }, 1);
+        break;
+    }
+    uint32_t gap = s->combo_gap_ms;
+    if (combo_steps[s->combo_step] == COMBO_POWER) {
+        gap = MAX(gap, COMBO_POWER_HOLD_MS);
+    }
+    s->combo_step++;
+    if (s->combo_step < ARRAY_SIZE(combo_steps)) {
+        timer_mod(s->combo, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  (int64_t)gap * 1000000);
+    }
+}
+
+/* (re)start the sequence from the top, cutting off a run already in flight */
+static void disp_combo_start(ClarionDispMicomState *s)
+{
+    timer_del(s->combo);
+    s->combo_step = 0;
+    disp_combo_fire(s);
+}
+
+/* qom-set combo=1 (any value): run the sequence now, from the top */
+static void disp_set_combo(Object *obj, const char *value, Error **errp)
+{
+    disp_combo_start(CLARION_DISPMICOM(obj));
+}
+
 /* the touch controller owns the pointer buttons, so the wheel arrives here */
 static ClarionDispMicomState *disp_panel;
 
@@ -647,6 +713,16 @@ static bool disp_knob_key(ClarionDispMicomState *s, QemuInputEvent *evt)
     case KEY_MINUS:
         if (evt->key.down) {
             disp_rotary(s, evt->key.key == KEY_EQUAL ? 1 : -1, 0);
+        }
+        return true;
+    case KEY_F10:
+        if (evt->key.down) {
+            disp_queue(s, (const uint8_t[]){ CMD_POWER }, 1);
+        }
+        return true;
+    case KEY_F12:
+        if (evt->key.down) {
+            disp_combo_start(s);
         }
         return true;
     }
@@ -883,6 +959,8 @@ static void clarion_dispmicom_reset_hold(Object *obj, ResetType type)
     s->linked = false;
     s->key_down_mask = 0;
     timer_del(s->key_up);
+    timer_del(s->combo);
+    s->combo_step = 0;
 }
 
 static void clarion_dispmicom_realize(DeviceState *dev, Error **errp)
@@ -903,6 +981,7 @@ static void clarion_dispmicom_realize(DeviceState *dev, Error **errp)
         qemu_input_handler_activate(s->input_handler);
     }
     s->key_up = timer_new_ns(QEMU_CLOCK_VIRTUAL, disp_key_up, s);
+    s->combo = timer_new_ns(QEMU_CLOCK_VIRTUAL, disp_combo_fire, s);
     disp_panel = s;
 }
 
@@ -940,6 +1019,8 @@ static const Property clarion_dispmicom_props[] = {
     DEFINE_PROP_BOOL("key-input", ClarionDispMicomState, key_input, false),
     DEFINE_PROP_BOOL("can-key-input", ClarionDispMicomState, can_key_input,
                      false),
+    DEFINE_PROP_UINT32("combo-gap-ms", ClarionDispMicomState, combo_gap_ms,
+                       COMBO_GAP_MS_DEFAULT),
 };
 
 static void clarion_dispmicom_class_init(ObjectClass *klass, const void *data)
@@ -956,6 +1037,7 @@ static void clarion_dispmicom_class_init(ObjectClass *klass, const void *data)
     object_class_property_add_str(klass, "frame", NULL, disp_set_frame);
     object_class_property_add_str(klass, "panel", disp_panel_get,
                                   disp_panel_set);
+    object_class_property_add_str(klass, "combo", NULL, disp_set_combo);
 }
 
 static const TypeInfo clarion_dispmicom_types[] = {
