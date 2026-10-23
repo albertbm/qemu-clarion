@@ -6,12 +6,15 @@ Layout:
   NOR image and starts the matching engine.
 - `libexec/qemu-system-arm`: engine for QY8 units.
 - `libexec/qemu-system-sh4`: engine for the QY7221NL.
-- `lib/`: bundled shared libraries.
+- `lib/`: debug-print plugin and bundled shared libraries.
 
 Usage:
 
     ./qemu-clarion NOR [SD]
+    ./qemu-clarion --dbgprint guest.log NOR [SD]
     ./qemu-clarion --help
+
+`--dbgprint FILE` records Windows CE debug output while the guest runs.
 
 On macOS, remove the quarantine attribute first (the binaries are only
 ad-hoc signed):

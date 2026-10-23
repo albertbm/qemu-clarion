@@ -1,6 +1,7 @@
 contrib_plugins = [
 'bbv.c',
 'cache.c',
+'clarion-dbgprint.c',
 'cflow.c',
 'drcov.c',
 'execlog.c',

@@ -48,7 +48,7 @@ jobs:
               --disable-werror --enable-plugins --disable-docs $extra
 
       - name: Build
-        run: ninja -C build-pkg qemu-system-arm qemu-system-sh4 qemu-clarion
+        run: ninja -C build-pkg qemu-system-arm qemu-system-sh4 qemu-clarion contrib-plugins
 
       - name: Package
         id: pkg
@@ -68,6 +68,8 @@ jobs:
           cd smoke/qemu-clarion-*
           # The launcher prints usage and exits non-zero without arguments.
           ./qemu-clarion 2>&1 | grep -i usage
+          test -f lib/libclarion-dbgprint.so || \
+              test -f lib/libclarion-dbgprint.dylib
           libexec/qemu-system-arm -M help | grep clarion
           libexec/qemu-system-sh4 -M help | grep clarion
           # No shared library may be resolved outside the archive.
@@ -76,7 +78,7 @@ jobs:
               exit 1
             fi
           else
-            ldd libexec/* | grep -v "$PWD" | grep '=> /' | grep -vE 'lib(c|m|dl|pthread|rt|util|resolv)\.so' && exit 1
+            ldd libexec/* lib/libclarion-dbgprint.so | grep -v "$PWD" | grep '=> /' | grep -vE 'lib(c|m|dl|pthread|rt|util|resolv)\.so' && exit 1
             true
           fi
 

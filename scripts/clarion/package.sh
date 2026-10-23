@@ -10,7 +10,7 @@
 # Result: OUT_DIR/qemu-clarion-TAG-OS-ARCH.tar.gz containing
 #   qemu-clarion            launcher
 #   libexec/qemu-system-*   emulation engines
-#   lib/                    bundled shared libraries
+#   lib/                    debug-print plugin and bundled shared libraries
 #   README.md COPYING
 # The clarion machines load no data files at run time, so there is no share/.
 
@@ -35,17 +35,24 @@ os=$(uname -s | tr '[:upper:]' '[:lower:]')
 arch=$(uname -m)
 [ "$arch" = aarch64 ] && arch=arm64
 name=qemu-clarion-$tag-$os-$arch
-stage=$(mktemp -d)
+stage=$(mktemp -d "${TMPDIR:-/tmp}/qemu-clarion.XXXXXX")
 trap 'rm -rf "$stage"' EXIT
 root=$stage/$name
 
 mkdir -p "$root/libexec" "$root/lib"
 cp "$build/qemu-clarion" "$root/"
 cp "$build/qemu-system-arm" "$build/qemu-system-sh4" "$root/libexec/"
+case $os in
+darwin) plugin_ext=dylib ;;
+linux) plugin_ext=so ;;
+esac
+cp "$build/contrib/plugins/libclarion-dbgprint.$plugin_ext" \
+    "$root/lib/"
 cp "$src/COPYING" "$root/"
 cp "$src/docs/clarion/README-release.md" "$root/README.md"
 
-binaries=("$root/qemu-clarion" "$root"/libexec/qemu-system-*)
+binaries=("$root/qemu-clarion" "$root"/libexec/qemu-system-* \
+          "$root/lib/libclarion-dbgprint.$plugin_ext")
 
 bundle_macos() {
     local queue=("${binaries[@]}") file dep real base

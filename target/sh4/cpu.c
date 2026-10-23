@@ -345,7 +345,7 @@ static void superh_cpu_class_init(ObjectClass *oc, const void *data)
 #endif
     cc->disas_set_info = superh_cpu_disas_set_info;
 
-    cc->gdb_num_core_regs = 59;
+    cc->gdb_core_xml_file = "sh4-core.xml";
     cc->tcg_ops = &superh_tcg_ops;
 }
 

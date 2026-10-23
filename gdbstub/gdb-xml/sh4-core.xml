@@ -1,0 +1,63 @@
+<?xml version="1.0"?>
+<!DOCTYPE feature SYSTEM "gdb-target.dtd">
+<feature name="org.gnu.gdb.sh.core">
+  <reg name="r0" bitsize="32" regnum="0"/>
+  <reg name="r1" bitsize="32"/>
+  <reg name="r2" bitsize="32"/>
+  <reg name="r3" bitsize="32"/>
+  <reg name="r4" bitsize="32"/>
+  <reg name="r5" bitsize="32"/>
+  <reg name="r6" bitsize="32"/>
+  <reg name="r7" bitsize="32"/>
+  <reg name="r8" bitsize="32"/>
+  <reg name="r9" bitsize="32"/>
+  <reg name="r10" bitsize="32"/>
+  <reg name="r11" bitsize="32"/>
+  <reg name="r12" bitsize="32"/>
+  <reg name="r13" bitsize="32"/>
+  <reg name="r14" bitsize="32"/>
+  <reg name="r15" bitsize="32"/>
+  <reg name="pc" bitsize="32" type="code_ptr"/>
+  <reg name="pr" bitsize="32" type="code_ptr"/>
+  <reg name="gbr" bitsize="32"/>
+  <reg name="vbr" bitsize="32" type="code_ptr"/>
+  <reg name="mach" bitsize="32"/>
+  <reg name="macl" bitsize="32"/>
+  <reg name="sr" bitsize="32"/>
+  <reg name="fpul" bitsize="32"/>
+  <reg name="fpscr" bitsize="32"/>
+  <reg name="fr0" bitsize="32" type="ieee_single"/>
+  <reg name="fr1" bitsize="32" type="ieee_single"/>
+  <reg name="fr2" bitsize="32" type="ieee_single"/>
+  <reg name="fr3" bitsize="32" type="ieee_single"/>
+  <reg name="fr4" bitsize="32" type="ieee_single"/>
+  <reg name="fr5" bitsize="32" type="ieee_single"/>
+  <reg name="fr6" bitsize="32" type="ieee_single"/>
+  <reg name="fr7" bitsize="32" type="ieee_single"/>
+  <reg name="fr8" bitsize="32" type="ieee_single"/>
+  <reg name="fr9" bitsize="32" type="ieee_single"/>
+  <reg name="fr10" bitsize="32" type="ieee_single"/>
+  <reg name="fr11" bitsize="32" type="ieee_single"/>
+  <reg name="fr12" bitsize="32" type="ieee_single"/>
+  <reg name="fr13" bitsize="32" type="ieee_single"/>
+  <reg name="fr14" bitsize="32" type="ieee_single"/>
+  <reg name="fr15" bitsize="32" type="ieee_single"/>
+  <reg name="ssr" bitsize="32"/>
+  <reg name="spc" bitsize="32" type="code_ptr"/>
+  <reg name="r0_bank0" bitsize="32"/>
+  <reg name="r1_bank0" bitsize="32"/>
+  <reg name="r2_bank0" bitsize="32"/>
+  <reg name="r3_bank0" bitsize="32"/>
+  <reg name="r4_bank0" bitsize="32"/>
+  <reg name="r5_bank0" bitsize="32"/>
+  <reg name="r6_bank0" bitsize="32"/>
+  <reg name="r7_bank0" bitsize="32"/>
+  <reg name="r0_bank1" bitsize="32"/>
+  <reg name="r1_bank1" bitsize="32"/>
+  <reg name="r2_bank1" bitsize="32"/>
+  <reg name="r3_bank1" bitsize="32"/>
+  <reg name="r4_bank1" bitsize="32"/>
+  <reg name="r5_bank1" bitsize="32"/>
+  <reg name="r6_bank1" bitsize="32"/>
+  <reg name="r7_bank1" bitsize="32"/>
+</feature>

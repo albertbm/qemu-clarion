@@ -143,3 +143,23 @@ Other tested codes remain unnamed unless a visible result matched a control
 on the panel photo. `0x12` and `0x47` remove a route overlay in the tested
 state, but that does not identify a physical control. The Clarif30 evidence
 records all tested VKeys and screenshots.
+
+## Guest debug output
+
+The `--dbgprint FILE` launcher option enables the bundled
+`clarion-dbgprint` plugin. It prints calls to `NKDbgPrintfW`,
+`NKvDbgPrintfW`, and `OutputDebugStringW` as `DBG <return-address> <text>`.
+It reads SH-4 arguments from R4-R7 and the stack after the 16-byte home area.
+The SH-4 GDB register XML exposes the active banked registers to the plugin
+register API. The plugin scans every kernel XIP region in NOR and SD itself;
+the SD card can contain multiple copies with different export addresses.
+
+```sh
+build-release/qemu-clarion --read-only --dbgprint guest-debug.log NOR SD
+```
+
+The launcher finds the plugin in the release package or build tree. XIP
+exports have fixed virtual addresses, so no runtime module-load adjustment is
+needed. For manual use, `-plugin PATH,image=NOR[,image=SD],out=FILE` performs
+the same scan; `syms=FILE` remains available as a fallback for explicit
+address lists.

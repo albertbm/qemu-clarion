@@ -53,9 +53,32 @@ static gboolean read_model(const char *path,
 static void usage(const char *program)
 {
     fprintf(stderr,
-            "usage: %s [-n] [--read-only] [--headless] NOR [SD] "
+            "usage: %s [-n] [--read-only] [--headless] "
+            "[--dbgprint FILE] NOR [SD] "
             "[QEMU arguments...]\n",
             program);
+}
+
+static char *find_dbgprint_plugin(const char *directory)
+{
+#ifdef CONFIG_DARWIN
+    const char *extension = "dylib";
+#else
+    const char *extension = "so";
+#endif
+    char *path = g_strdup_printf("%s/lib/libclarion-dbgprint.%s",
+                                 directory, extension);
+    if (g_file_test(path, G_FILE_TEST_IS_REGULAR)) {
+        return path;
+    }
+    g_free(path);
+    path = g_strdup_printf("%s/contrib/plugins/libclarion-dbgprint.%s",
+                           directory, extension);
+    if (g_file_test(path, G_FILE_TEST_IS_REGULAR)) {
+        return path;
+    }
+    g_free(path);
+    return NULL;
 }
 
 static char *drive_argument(const char *path, const char *interface,
@@ -116,6 +139,7 @@ int main(int argc, char **argv)
     gboolean dry_run = FALSE;
     gboolean read_only = FALSE;
     gboolean headless = FALSE;
+    const char *dbgprint = NULL;
     int first_arg = 1;
     const char *flash;
     const char *sd = NULL;
@@ -135,6 +159,12 @@ int main(int argc, char **argv)
             read_only = TRUE;
         } else if (!strcmp(argv[first_arg], "--headless")) {
             headless = TRUE;
+        } else if (!strcmp(argv[first_arg], "--dbgprint")) {
+            if (first_arg + 1 >= argc) {
+                usage(argv[0]);
+                return 2;
+            }
+            dbgprint = argv[++first_arg];
         } else {
             break;
         }
@@ -212,6 +242,25 @@ int main(int argc, char **argv)
         !has_argument(argc - first_arg, argv + first_arg, "-icount")) {
         args[arg_count++] = (char *)"-icount";
         args[arg_count++] = (char *)board->icount;
+    }
+    if (dbgprint) {
+        g_autofree char *plugin_path = find_dbgprint_plugin(directory);
+        g_autofree char *plugin_arg = NULL;
+        GString *plugin;
+        if (!plugin_path) {
+            fprintf(stderr, "qemu-clarion: cannot find "
+                    "libclarion-dbgprint plugin beside %s\n", argv[0]);
+            return 1;
+        }
+        plugin = g_string_new(plugin_path);
+        g_string_append_printf(plugin, ",image=%s", flash);
+        if (sd) {
+            g_string_append_printf(plugin, ",image=%s", sd);
+        }
+        g_string_append_printf(plugin, ",out=%s", dbgprint);
+        plugin_arg = g_string_free(plugin, FALSE);
+        args[arg_count++] = (char *)"-plugin";
+        args[arg_count++] = g_steal_pointer(&plugin_arg);
     }
     for (int i = first_arg; i < argc; i++) {
         args[arg_count++] = argv[i];
