@@ -84,6 +84,7 @@ clarion-qy8: unit model QY8202NA (PROD block at 0x40000), board qy8202na (auto)
 |---|---|---|---|
 | `QY8652NB` | `qy8652nb` | TMA460 at `0x24` | found in the 2018+ Leaf (ZE1) |
 | `QY8602NB` | `qy8602nb` | TMA460 at `0x24` | found in the 2018+ Leaf (ZE1), European market |
+| `QY8605NB` | `qy8602nb` | TMA460 at `0x24` | found in the 2018+ Leaf (ZE1), Japanese market |
 | `QY8600NE` | `qy8600ne` | TMA460 at `0x24` | found in the 2018+ Leaf (ZE1), US market |
 | `QY8202NA` | `qy8202na` | TMA616 at `0x67` | found in the 2014-2017 Leaf (ZE0) |
 | `QY8202PB` | `qy8202pb` | TMA616 at `0x67` | found in the e-NV200 (ME0) |

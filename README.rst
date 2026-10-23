@@ -28,13 +28,13 @@ No firmware is included. You supply dumps taken from your own unit.
      - ``clarion-qy8``
      - ``qemu-system-arm``
      - boots to the consent screen
-   * - QY8602NB, QY8600NE
+   * - QY8602NB, QY8600NE, QY8605NB
      - ARM (Renesas R-Car)
      - ``clarion-qy8``
      - ``qemu-system-arm``
-     - 2018+ Leaf (ZE1), European and US units; recognised from the
-       ``PROD`` block, same board as QY8652NB (TMA460 touch). Not yet run by
-       the maintainer
+     - 2018+ Leaf (ZE1), European, US and Japanese units; recognised from
+       the ``PROD`` block, same board as QY8652NB (TMA460 touch). Not yet
+       run by the maintainer
    * - QY8202PB
      - ARM (Renesas R-Car)
      - ``clarion-qy8``
