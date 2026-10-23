@@ -1,8 +1,8 @@
 /*
  * Print Windows CE debug strings emitted by Clarion guests.
  *
- * Load with -plugin libclarion-dbgprint.dylib,syms=FILE[,out=FILE]. The
- * symbol file contains one "address name" pair per line.
+ * Load with -plugin libclarion-dbgprint.dylib,image=FILE[,out=FILE]. Image
+ * paths may be repeated. A syms=FILE option can supply symbols manually.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -12,6 +12,12 @@
 #include <inttypes.h>
 #include <glib.h>
 #include <qemu-plugin.h>
+
+#define E32_EXP 0x24
+
+static const char *wanted[] = {
+    "NKDbgPrintfW", "NKvDbgPrintfW", "OutputDebugStringW"
+};
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
@@ -27,6 +33,255 @@ static GMutex output_lock;
 static struct qemu_plugin_register *reg_arg[4];
 static struct qemu_plugin_register *reg_sp;
 static struct qemu_plugin_register *reg_lr;
+
+typedef struct {
+    const guint8 *data;
+    gsize size;
+    gsize base;
+    uint32_t physfirst;
+    gsize romhdr;
+    uint32_t count;
+} Xip;
+
+typedef struct {
+    uint32_t rva;
+    uint32_t size;
+    uint32_t dataptr;
+    bool compressed;
+} XipSection;
+
+static bool image_u16(const guint8 *data, gsize size, gsize off,
+                      uint16_t *value)
+{
+    if (off > size || size - off < 2) {
+        return false;
+    }
+    *value = data[off] | ((uint16_t)data[off + 1] << 8);
+    return true;
+}
+
+static bool image_u32(const guint8 *data, gsize size, gsize off,
+                      uint32_t *value)
+{
+    if (off > size || size - off < 4) {
+        return false;
+    }
+    *value = data[off] | ((uint32_t)data[off + 1] << 8) |
+             ((uint32_t)data[off + 2] << 16) |
+             ((uint32_t)data[off + 3] << 24);
+    return true;
+}
+
+static bool xip_file_offset(const Xip *xip, uint32_t va, gsize *offset)
+{
+    uint64_t off = (uint64_t)va - xip->physfirst + xip->base;
+    if (off >= xip->size) {
+        return false;
+    }
+    *offset = off;
+    return true;
+}
+
+static bool xip_rva_offset(const Xip *xip, const XipSection *sections,
+                           size_t nsections, uint32_t rva, size_t length,
+                           gsize *offset)
+{
+    for (size_t i = 0; i < nsections; i++) {
+        uint64_t end = (uint64_t)rva + length;
+        uint64_t sec_end = (uint64_t)sections[i].rva + sections[i].size;
+        if (rva >= sections[i].rva && end <= sec_end &&
+            !sections[i].compressed) {
+            uint64_t dataptr = (uint64_t)sections[i].dataptr +
+                               rva - sections[i].rva;
+            if (dataptr > UINT32_MAX ||
+                !xip_file_offset(xip, dataptr, offset) ||
+                length > xip->size - *offset) {
+                return false;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool coredll_exports(const Xip *xip, uint32_t addresses[3])
+{
+    gsize toc = xip->romhdr + 0x54;
+    for (uint32_t i = 0; i < xip->count; i++) {
+        uint32_t name_va, e32_va, o32_va;
+        gsize name_off, e32, o32;
+        char *name;
+        uint16_t nsections;
+        XipSection *sections;
+        uint32_t vbase, exp_rva;
+        gsize exp;
+        uint32_t nfunc, nname, funcs_rva, names_rva, ords_rva;
+        gsize funcs, names, ords;
+        char **export_names;
+        bool found[3] = { false, false, false };
+        bool valid = false;
+
+        if (!image_u32(xip->data, xip->size, toc + i * 0x20 + 0x10,
+                       &name_va) ||
+            !xip_file_offset(xip, name_va, &name_off)) {
+            continue;
+        }
+        name = g_strndup((const char *)xip->data + name_off,
+                         strnlen((const char *)xip->data + name_off,
+                                 xip->size - name_off));
+        if (g_ascii_strcasecmp(name, "coredll.dll")) {
+            g_free(name);
+            continue;
+        }
+        g_free(name);
+        if (!image_u32(xip->data, xip->size, toc + i * 0x20 + 0x14,
+                       &e32_va) ||
+            !image_u32(xip->data, xip->size, toc + i * 0x20 + 0x18,
+                       &o32_va) ||
+            !xip_file_offset(xip, e32_va, &e32) ||
+            !xip_file_offset(xip, o32_va, &o32) ||
+            !image_u16(xip->data, xip->size, e32, &nsections) ||
+            nsections > 96 || o32 > xip->size ||
+            (size_t)nsections > (xip->size - o32) / 0x18 ||
+            !image_u32(xip->data, xip->size, e32 + 8, &vbase) ||
+            !image_u32(xip->data, xip->size, e32 + E32_EXP, &exp_rva)) {
+            continue;
+        }
+        sections = g_new0(XipSection, nsections);
+        for (uint16_t j = 0; j < nsections; j++) {
+            uint32_t vsize, rva, psize, dataptr, flags;
+            gsize sec = o32 + (gsize)j * 0x18;
+            if (!image_u32(xip->data, xip->size, sec, &vsize) ||
+                !image_u32(xip->data, xip->size, sec + 4, &rva) ||
+                !image_u32(xip->data, xip->size, sec + 8, &psize) ||
+                !image_u32(xip->data, xip->size, sec + 12, &dataptr) ||
+                !image_u32(xip->data, xip->size, sec + 20, &flags)) {
+                goto section_done;
+            }
+            sections[j] = (XipSection){ rva, psize, dataptr,
+                                        !!(flags & 0x2000) };
+        }
+        if (!xip_rva_offset(xip, sections, nsections, exp_rva, 40, &exp) ||
+            !image_u32(xip->data, xip->size, exp + 20, &nfunc) ||
+            !image_u32(xip->data, xip->size, exp + 24, &nname) ||
+            !image_u32(xip->data, xip->size, exp + 28, &funcs_rva) ||
+            !image_u32(xip->data, xip->size, exp + 32, &names_rva) ||
+            !image_u32(xip->data, xip->size, exp + 36, &ords_rva) ||
+            nfunc > 100000 || nname > 100000 ||
+            !xip_rva_offset(xip, sections, nsections, funcs_rva,
+                            (size_t)nfunc * 4, &funcs) ||
+            !xip_rva_offset(xip, sections, nsections, names_rva,
+                            (size_t)nname * 4, &names) ||
+            !xip_rva_offset(xip, sections, nsections, ords_rva,
+                            (size_t)nname * 2, &ords)) {
+            goto section_done;
+        }
+        export_names = g_new0(char *, nfunc);
+        for (uint32_t j = 0; j < nname; j++) {
+            uint32_t nrva;
+            uint16_t ordinal;
+            gsize noff;
+            if (!image_u32(xip->data, xip->size, names + (gsize)j * 4,
+                           &nrva) ||
+                !image_u16(xip->data, xip->size, ords + (gsize)j * 2,
+                           &ordinal) || ordinal >= nfunc ||
+                !xip_rva_offset(xip, sections, nsections, nrva, 1, &noff)) {
+                continue;
+            }
+            export_names[ordinal] = g_strndup(
+                (const char *)xip->data + noff,
+                strnlen((const char *)xip->data + noff,
+                        xip->size - noff));
+        }
+        for (uint32_t j = 0; j < nfunc; j++) {
+            uint32_t rva;
+            if (!export_names[j] ||
+                !image_u32(xip->data, xip->size, funcs + (gsize)j * 4,
+                           &rva) || !rva) {
+                continue;
+            }
+            for (size_t k = 0; k < G_N_ELEMENTS(wanted); k++) {
+                if (!strcmp(export_names[j], wanted[k])) {
+                    addresses[k] = vbase + rva;
+                    found[k] = true;
+                }
+            }
+        }
+        valid = found[0] && found[1] && found[2];
+        for (uint32_t j = 0; j < nfunc; j++) {
+            g_free(export_names[j]);
+        }
+        g_free(export_names);
+section_done:
+        g_free(sections);
+        if (valid) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool load_image_symbols(const char *path)
+{
+    g_autoptr(GError) error = NULL;
+    g_autoptr(GMappedFile) mapped = NULL;
+    const gchar *contents;
+    gsize size;
+    bool loaded = false;
+    mapped = g_mapped_file_new(path, FALSE, &error);
+    if (!mapped) {
+        fprintf(stderr, "clarion-dbgprint: cannot map image %s: %s\n", path,
+                error->message);
+        return false;
+    }
+    contents = g_mapped_file_get_contents(mapped);
+    size = g_mapped_file_get_length(mapped);
+    for (gsize marker = 0; marker + 4 <= size; marker++) {
+        Xip xip;
+        uint32_t romhdr_va, physfirst32, count, physlast;
+        bool valid = false;
+        if (memcmp(contents + marker, "ECEC", 4) || marker < 0x40) {
+            continue;
+        }
+        xip = (Xip){ (const guint8 *)contents, size, marker - 0x40, 0,
+                     0, 0 };
+        if (!image_u32(xip.data, size, xip.base + 0x44, &romhdr_va)) {
+            continue;
+        }
+        for (uint64_t physfirst = 0x80000000; physfirst < 0x90000000;
+             physfirst += 0x10000) {
+            int64_t rh = (int64_t)(uint64_t)romhdr_va - physfirst + xip.base;
+            if (rh < 0 || (uint64_t)rh > size || size - rh < 0x100 ||
+                !image_u32(xip.data, size, rh + 8, &physfirst32) ||
+                physfirst32 != physfirst ||
+                !image_u32(xip.data, size, rh + 0x10, &count) ||
+                !count || count >= 2000 ||
+                !image_u32(xip.data, size, rh + 0xc, &physlast) ||
+                physfirst >= physlast) {
+                continue;
+            }
+            xip.physfirst = physfirst;
+            xip.romhdr = rh;
+            xip.count = count;
+            valid = true;
+            break;
+        }
+        if (valid) {
+            uint32_t addresses[3] = { 0 };
+            if (coredll_exports(&xip, addresses)) {
+                for (size_t i = 0; i < G_N_ELEMENTS(wanted); i++) {
+                    DbgSymbol *sym = g_new0(DbgSymbol, 1);
+                    sym->addr = addresses[i];
+                    sym->name = g_strdup(wanted[i]);
+                    g_hash_table_replace(symbols,
+                                         GUINT_TO_POINTER(addresses[i]), sym);
+                }
+                loaded = true;
+            }
+        }
+    }
+    return loaded;
+}
 
 static void free_symbol(gpointer value)
 {
@@ -273,6 +528,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
 {
     g_autofree char *sym_path = NULL;
     g_autofree char *out_path = NULL;
+    GPtrArray *images = g_ptr_array_new_with_free_func(g_free);
     if (!strcmp(info->target_name, "arm")) {
         arm_target = true;
     } else if (!strcmp(info->target_name, "sh4")) {
@@ -293,22 +549,44 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
         } else if (!strcmp(option[0], "out")) {
             g_free(out_path);
             out_path = g_strdup(option[1]);
+        } else if (!strcmp(option[0], "image")) {
+            g_ptr_array_add(images, g_strdup(option[1]));
         } else {
             fprintf(stderr, "clarion-dbgprint: unknown option %s\n", option[0]);
             return -1;
         }
     }
-    if (!sym_path) {
-        fprintf(stderr, "clarion-dbgprint: requires syms=FILE\n");
+    if (!sym_path && !images->len) {
+        fprintf(stderr, "clarion-dbgprint: requires image=FILE or syms=FILE\n");
         return -1;
     }
     symbols =
         g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, free_symbol);
-    if (!load_symbols(sym_path)) {
+    if ((sym_path && !load_symbols(sym_path))) {
         fprintf(stderr, "clarion-dbgprint: cannot load symbols from %s\n",
                 sym_path);
         return -1;
     }
+    for (guint i = 0; i < images->len; i++) {
+        load_image_symbols(g_ptr_array_index(images, i));
+    }
+    if (!g_hash_table_size(symbols)) {
+        fprintf(stderr, "clarion-dbgprint: no debug-print exports found; "
+                "guest will continue without debug output\n");
+        g_ptr_array_free(images, TRUE);
+        return 0;
+    }
+    {
+        GHashTableIter iter;
+        gpointer value;
+        g_hash_table_iter_init(&iter, symbols);
+        while (g_hash_table_iter_next(&iter, NULL, &value)) {
+            DbgSymbol *sym = value;
+            fprintf(stderr, "clarion-dbgprint: %s at %08" PRIx32 "\n",
+                    sym->name, sym->addr);
+        }
+    }
+    g_ptr_array_free(images, TRUE);
     output = out_path ? fopen(out_path, "w") : stderr;
     if (!output) {
         fprintf(stderr, "clarion-dbgprint: cannot open output file\n");

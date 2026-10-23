@@ -99,7 +99,7 @@ starts QEMU. You never pass ``-M`` or ``-drive`` yourself.
 
 .. code-block:: shell
 
-  qemu-clarion [-n] [--read-only] [--headless] NOR [SD] [QEMU arguments...]
+  qemu-clarion [-n] [--read-only] [--headless] [--dbgprint FILE] NOR [SD] [QEMU arguments...]
 
 .. code-block:: shell
 
@@ -107,6 +107,7 @@ starts QEMU. You never pass ``-M`` or ``-drive`` yourself.
   build-release/qemu-clarion flash.bin map-card.img             # NOR and SD card
   build-release/qemu-clarion --read-only flash.bin map-card.img # leave both files untouched
   build-release/qemu-clarion --headless flash.bin               # no window
+  build-release/qemu-clarion --dbgprint guest.log flash.bin     # capture guest debug output
   build-release/qemu-clarion -n flash.bin map-card.img          # print the QEMU command and exit
 
 .. list-table::
@@ -125,6 +126,8 @@ starts QEMU. You never pass ``-M`` or ``-drive`` yourself.
        storage and the files do not change
    * - ``--headless``
      - run without a display window (``-nographic``)
+   * - ``--dbgprint FILE``
+     - record Windows CE debug output in FILE using the bundled plugin
    * - ``-n``
      - print the command line that would be run
    * - anything after the images

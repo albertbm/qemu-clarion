@@ -325,18 +325,19 @@ the guest is not redrawn after that.
 
 ## Guest debug output
 
-The `clarion-dbgprint` plugin prints calls to `NKDbgPrintfW`,
+The `--dbgprint FILE` launcher option enables the bundled
+`clarion-dbgprint` plugin. It prints calls to `NKDbgPrintfW`,
 `NKvDbgPrintfW`, and `OutputDebugStringW` as `DBG <return-address> <text>`.
 ARM arguments are read from R0-R3 and then the stack. Wide `%s`, narrow
-`%S`, integer, pointer, and character conversions are supported.
-
-Generate symbols from the NOR kernel XIP and pass the plugin to the launcher:
+`%S`, integer, pointer, and character conversions are supported. The plugin
+scans the NOR image for kernel XIP exports when it starts.
 
 ```sh
-python3 scripts/clarion/dbgprint-syms.py NOR > dbgprint.syms
-build-release/qemu-clarion --read-only NOR \
-  -plugin build-release/contrib/plugins/libclarion-dbgprint.dylib,syms=dbgprint.syms,out=guest-debug.log
+build-release/qemu-clarion --read-only --dbgprint guest-debug.log NOR
 ```
 
-The XIP export addresses are fixed virtual addresses and do not require
-runtime relocation. Omit `out=...` to write to standard error.
+The launcher finds the plugin in the release package or build tree. XIP
+export addresses are fixed virtual addresses and do not require runtime
+relocation. For manual use, `-plugin PATH,image=NOR,out=FILE` performs the
+same scan; `syms=FILE` remains available as a fallback for explicit address
+lists.

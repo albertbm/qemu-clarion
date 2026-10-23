@@ -146,21 +146,20 @@ records all tested VKeys and screenshots.
 
 ## Guest debug output
 
-The `clarion-dbgprint` plugin prints calls to `NKDbgPrintfW`,
+The `--dbgprint FILE` launcher option enables the bundled
+`clarion-dbgprint` plugin. It prints calls to `NKDbgPrintfW`,
 `NKvDbgPrintfW`, and `OutputDebugStringW` as `DBG <return-address> <text>`.
 It reads SH-4 arguments from R4-R7 and the stack after the 16-byte home area.
 The SH-4 GDB register XML exposes the active banked registers to the plugin
-register API.
-
-Generate symbols from every kernel XIP region in the SD image and NOR image.
-The SD card can contain several XIP copies with different export addresses;
-including each unique address avoids guessing which copy is active:
+register API. The plugin scans every kernel XIP region in NOR and SD itself;
+the SD card can contain multiple copies with different export addresses.
 
 ```sh
-python3 scripts/clarion/dbgprint-syms.py NOR SD > dbgprint.syms
-build-release/qemu-clarion --read-only NOR SD \
-  -plugin build-release/contrib/plugins/libclarion-dbgprint.dylib,syms=dbgprint.syms,out=guest-debug.log
+build-release/qemu-clarion --read-only --dbgprint guest-debug.log NOR SD
 ```
 
-XIP exports have fixed virtual addresses, so no runtime module-load adjustment
-is needed. Omit `out=...` to write to standard error.
+The launcher finds the plugin in the release package or build tree. XIP
+exports have fixed virtual addresses, so no runtime module-load adjustment is
+needed. For manual use, `-plugin PATH,image=NOR[,image=SD],out=FILE` performs
+the same scan; `syms=FILE` remains available as a fallback for explicit
+address lists.
